@@ -1,7 +1,7 @@
 // Tokin AutoPedido - popup logic (100% local, sin servidor, sin OAuth)
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
 import { getMemory, setMapping, clearMemory } from "../core/memory.js";
-import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
+import { getAllowedUsers, isAllowed } from "../core/access.js";
 (function () {
   "use strict";
 
@@ -112,7 +112,7 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
       );
       return;
     }
-    if (isAllowed(email, state.allowed.emails)) {
+    if (await isAllowed(email, state.allowed.hashes)) {
       setBadge("ok", "Autorizado");
       return;
     }
@@ -468,7 +468,7 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
       }
       return out;
     },
-    ocrPdfPage: async (b64, pageNum, scale) => {
+    renderPdfPage: async (b64, pageNum, scale) => {
       const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       const pdfjs = window.pdfjsLib;
       pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
@@ -479,6 +479,43 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
       canvas.width = vp.width;
       canvas.height = vp.height;
       await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      return canvas.toDataURL("image/png");
+    },
+    ocrPdfPage: async (b64, pageNum, scale, proc, rotation) => {
+      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const pdfjs = window.pdfjsLib;
+      pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      const page = await pdf.getPage(pageNum);
+      const vp = page.getViewport({ scale, rotation: rotation || 0 });
+      const canvas = document.createElement("canvas");
+      canvas.width = vp.width;
+      canvas.height = vp.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      if (proc) {
+        const ctx = canvas.getContext("2d");
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = img.data;
+        if (proc === "gray") {
+          for (let i = 0; i < d.length; i += 4) {
+            const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+            d[i] = d[i + 1] = d[i + 2] = y;
+          }
+        } else if (proc === "bw") {
+          let sum = 0, n = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+            n++;
+          }
+          const th = sum / n;
+          for (let i = 0; i < d.length; i += 4) {
+            const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+            const v = y < th ? 0 : 255;
+            d[i] = d[i + 1] = d[i + 2] = v;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+      }
       let worker = null;
       try {
         worker = await window.Tesseract.createWorker({
@@ -491,7 +528,7 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
         await worker.loadLanguage("spa");
         await worker.initialize("spa");
         const { data: d } = await worker.recognize(canvas.toDataURL("image/png"));
-        return { w: vp.width, h: vp.height, len: (d.text || "").length, sample: (d.text || "").slice(0, 300) };
+        return { w: vp.width, h: vp.height, len: (d.text || "").length, sample: (d.text || "").slice(0, 400) };
       } finally {
         if (worker) { try { await worker.terminate(); } catch (e) {} }
       }

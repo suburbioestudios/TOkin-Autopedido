@@ -1,10 +1,10 @@
-// Control de acceso por lista remota de emails (allowed_users.json en el repo).
-// La lista vive en el repo publico y se cachea en chrome.storage.local.
-// Sin internet y sin cache -> denegar (fallback seguro, no permisivo).
+// Control de acceso por lista remota de hashes SHA-256 de emails (tokin-users).
+// La lista vive en un repo publico separado y se cachea en chrome.storage.local.
+// Los emails en claro nunca salen de la PC: solo se envía el hash del email de sesión.
 
-export const REPO = {
+const REPO = {
   owner: "suburbioestudios",
-  repo: "TOkin-Autopedido",
+  repo: "tokin-users",
   branch: "main",
   path: "allowed_users.json",
 };
@@ -13,8 +13,9 @@ const RAW_URL = `https://raw.githubusercontent.com/${REPO.owner}/${REPO.repo}/${
 const CACHE_KEY = "tokin_allowed_cache";
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 h
 
-function extractEmails(data) {
+function extractHashes(data) {
   if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.allowed_hashes)) return data.allowed_hashes;
   if (data && Array.isArray(data.allowed_emails)) return data.allowed_emails;
   return [];
 }
@@ -23,7 +24,7 @@ async function getAllowedUsers(force) {
   if (!force) {
     const cached = await chrome.storage.local.get(CACHE_KEY);
     if (cached[CACHE_KEY] && Date.now() - cached[CACHE_KEY].ts < CACHE_TTL) {
-      return { ok: true, emails: cached[CACHE_KEY].emails, cached: true };
+      return { ok: true, hashes: cached[CACHE_KEY].hashes, cached: true };
     }
   }
   try {
@@ -33,37 +34,45 @@ async function getAllowedUsers(force) {
     clearTimeout(t);
     if (res.ok) {
       const data = await res.json();
-      const emails = extractEmails(data);
+      const hashes = extractHashes(data);
       await chrome.storage.local.set({
-        [CACHE_KEY]: { emails, ts: Date.now() },
+        [CACHE_KEY]: { hashes, ts: Date.now() },
       });
-      return { ok: true, emails, cached: false };
+      return { ok: true, hashes, cached: false };
     }
     throw new Error("HTTP " + res.status);
   } catch (e) {
     const cached = await chrome.storage.local.get(CACHE_KEY);
-    if (cached[CACHE_KEY] && Array.isArray(cached[CACHE_KEY].emails)) {
+    if (cached[CACHE_KEY] && Array.isArray(cached[CACHE_KEY].hashes)) {
       return {
         ok: true,
-        emails: cached[CACHE_KEY].emails,
+        hashes: cached[CACHE_KEY].hashes,
         cached: true,
         warning: "Sin internet: usando lista guardada.",
       };
     }
     return {
       ok: false,
-      emails: [],
+      hashes: [],
       error: "Sin internet y sin lista guardada. Acceso denegado.",
     };
   }
 }
 
-function isAllowed(email, emails) {
+async function hashEmail(email) {
   const e = String(email || "").trim().toLowerCase();
-  return (
-    e !== "" &&
-    emails.map((x) => String(x || "").trim().toLowerCase()).includes(e)
-  );
+  const data = new TextEncoder().encode(e);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(buf);
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return hex;
 }
 
-export { getAllowedUsers, isAllowed, RAW_URL };
+async function isAllowed(email, hashes) {
+  if (!email || !Array.isArray(hashes) || !hashes.length) return false;
+  const h = await hashEmail(email);
+  return hashes.map((x) => String(x || "").trim().toLowerCase()).includes(h);
+}
+
+export { getAllowedUsers, isAllowed, hashEmail, RAW_URL };
