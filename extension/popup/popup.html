@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+  <title>Tokin AutoPedido</title>
+</head>
+<body>
+  <header>
+    <h1>Tokin AutoPedido</h1>
+    <span id="access-badge" class="badge" title="Estado de la lista de usuarios">…</span>
+  </header>
+
+  <section id="access-screen" class="screen hidden">
+    <h2>Acceso restringido</h2>
+    <p id="access-msg">Esta herramienta está habilitada solo para usuarios autorizados.</p>
+  </section>
+
+  <section id="main-screen" class="screen">
+    <div id="dropzone">
+      <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.pdf,.docx,.doc" hidden>
+      <p>Arrastrá un <b>Excel / PDF / DOCX</b> con el pedido</p>
+      <p class="hint">o <a id="browse-link" href="#">elegí un archivo</a></p>
+      <p id="file-name" class="hint"></p>
+    </div>
+
+    <div id="doc-info" class="hidden">
+      <p id="doc-summary" class="hint"></p>
+      <div class="row">
+        <button id="btn-map" class="primary">1 · Generar mapeo</button>
+        <button id="btn-fill" class="primary" disabled>2 · Rellenar</button>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="tabs">
+      <button data-tab="extracted" class="tab active">Extraído</button>
+      <button data-tab="mapping" class="tab">Mapeo</button>
+      <button data-tab="items" class="tab">Líneas</button>
+    </div>
+
+    <div id="tab-extracted" class="tabpanel active">
+      <pre id="extracted-content" class="scroll"></pre>
+    </div>
+
+    <div id="tab-mapping" class="tabpanel">
+      <p id="map-hint" class="hint">Paso 1: cargá el documento. Paso 2: click en «Generar mapeo».</p>
+      <div id="mapping-list"></div>
+      <div class="row" id="memory-row" hidden>
+        <button id="btn-remember">Recordar mapeo</button>
+        <button id="btn-clear-memory">Olvidar</button>
+      </div>
+    </div>
+
+    <div id="tab-items" class="tabpanel">
+      <div class="row">
+        <button id="btn-copy-items">Copiar líneas</button>
+        <button id="btn-copy-all">Copiar todo</button>
+      </div>
+      <div id="items-table" class="scroll"></div>
+      <p class="hint">Pegá el código SKU|CANT en el buscador de productos del store para armar el pedido.</p>
+    </div>
+  </section>
+
+  <footer>
+    <button id="btn-settings">Ajustes</button>
+    <span id="user-info" class="hint"></span>
+  </footer>
+
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="overlay-box">
+      <h2>Ajustes</h2>
+      <p class="hint">La lista de usuarios autorizados se lee del repo público
+        <b id="cfg-list-source"></b> y se cachea 24&nbsp;h en tu PC.</p>
+      <label>Emails autorizados (solo lectura)</label>
+      <textarea id="cfg-allowed" rows="3" readonly placeholder="Cargando…"></textarea>
+      <p class="hint" id="cfg-session"></p>
+      <p class="hint">Para agregar/quitar colegas, el administrador edita el archivo
+        <code>allowed_users.json</code> directamente en el repo (GitHub → editar → commit).</p>
+      <div class="row">
+        <a id="btn-open-repo" class="link-btn" href="#" target="_blank" rel="noopener">Editar lista en GitHub</a>
+        <button id="btn-refresh-list">Refrescar</button>
+        <button id="btn-close-settings">Cerrar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../lib/xlsx.full.min.js"></script>
+  <script src="../lib/mammoth.browser.min.js"></script>
+  <script src="../lib/pdf.min.js"></script>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
