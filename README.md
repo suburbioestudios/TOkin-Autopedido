@@ -9,15 +9,11 @@ formulario de pedido de `tokintienda.com.ar/store` a partir de un archivo
 Excel/CSV/PDF/DOCX. Funciona 100% en el navegador: los datos del pedido nunca
 salen de la PC del usuario.
 
-## Lista de usuarios (`allowed_users.json`)
+## Lista de usuarios
 
-- La extensión lee este archivo desde
-  `raw.githubusercontent.com/suburbioestudios/TOkin-Autopedido/main/allowed_users.json`
-  y cachea la lista 24 h en cada PC.
+- La extensión lee la base de datos exclusiva y cachea la lista 24 h en cada PC.
 - Solo los emails listados pueden usar la herramienta. Sin internet y sin copia
   guardada, el acceso se deniega.
-- **Para agregar/quitar colegas**: editar este archivo (ícono de edición → commit
-  en `main`). La extensión solo lee; no sube datos.
 
 ## Instalación de la extensión
 
