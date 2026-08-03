@@ -76,7 +76,10 @@ export const SYNONYM_GROUPS = {
     "descuento 1", "descuento 2",
   ],
   marca: ["marca", "fabrica", "fabricante", "linea", "rubro"],
-  medida: ["unidad de medida", "um", "medida", "presentacion", "formato"],
+  medida: [
+    "unidad de medida", "um", "medida", "presentacion", "formato", "unidad",
+    "bulto", "bultos", "display", "disp", "envase",
+  ],
 };
 
 // Conceptos especiales para detectar lineas de pedido.

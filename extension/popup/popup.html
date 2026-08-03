@@ -59,7 +59,7 @@
         <button id="btn-copy-all">Copiar todo</button>
       </div>
       <div id="items-table" class="scroll"></div>
-      <p class="hint">Pegá el código SKU|CANT en el buscador de productos del store para armar el pedido.</p>
+      <p class="hint">Pegá el código SKU|CANT|CATEGORÍA en el buscador de productos del store para armar el pedido.</p>
     </div>
   </section>
 
@@ -71,16 +71,10 @@
   <div id="settings-overlay" class="overlay hidden">
     <div class="overlay-box">
       <h2>Ajustes</h2>
-      <p class="hint">La lista de usuarios autorizados se lee del repo público
-        <b id="cfg-list-source"></b> y se cachea 24&nbsp;h en tu PC.</p>
-      <label>Emails autorizados (solo lectura)</label>
-      <textarea id="cfg-allowed" rows="3" readonly placeholder="Cargando…"></textarea>
+      <p class="hint">Todo el procesamiento del pedido se hace en tu PC, nada sale de tu equipo.</p>
       <p class="hint" id="cfg-session"></p>
-      <p class="hint">Para agregar/quitar colegas, el administrador edita el archivo
-        <code>allowed_users.json</code> directamente en el repo (GitHub → editar → commit).</p>
       <div class="row">
-        <a id="btn-open-repo" class="link-btn" href="#" target="_blank" rel="noopener">Editar lista en GitHub</a>
-        <button id="btn-refresh-list">Refrescar</button>
+        <button id="btn-refresh-list">Refrescar acceso</button>
         <button id="btn-close-settings">Cerrar</button>
       </div>
     </div>
@@ -89,6 +83,7 @@
   <script src="../lib/xlsx.full.min.js"></script>
   <script src="../lib/mammoth.browser.min.js"></script>
   <script src="../lib/pdf.min.js"></script>
+  <script src="../lib/tesseract/tesseract.min.js"></script>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

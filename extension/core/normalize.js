@@ -57,6 +57,27 @@ export function is_numeric(v) {
   return /^-?\d+(\.\d+)?$/.test(v);
 }
 
+// "24 B" -> {num:24, unit:"B"}, "6 D" -> {num:6, unit:"D"}, "24" -> {num:24, unit:""}
+export function parse_qty(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  const m = s.match(/^(\d+(?:[.,]\d+)?)\s*([A-Za-z]*)$/);
+  if (!m) return null;
+  const num = parseFloat(m[1].replace(",", "."));
+  if (isNaN(num)) return null;
+  return { num, unit: m[2].toUpperCase() };
+}
+
+// Columna de unidad (B/D) -> categoria del store: "bulto" | "display".
+export function medida_categoria(unit) {
+  if (unit == null) return "";
+  const k = normalize(unit);
+  if (!k) return "";
+  if (/^b(ulto)?s?$/.test(k)) return "bulto";
+  if (/^d(isplay|isp)?s?$/.test(k)) return "display";
+  return k;
+}
+
 // ---------------- sinonimia -> concepto ----------------
 
 const _CONCEPT_BY_TOKEN = {};

@@ -7,8 +7,10 @@ import {
   date_iso,
   phone_clean,
   is_numeric,
+  parse_qty,
   match_concept,
   looks_like_value,
+  medida_categoria,
 } from "./normalize.js";
 
 function lib(name) {
@@ -177,7 +179,55 @@ function _docx_to_tables(html) {
 
 // ------------------------------------------------------- extraccion pdf
 
-function _pdf_text(data) {
+function _text_items_to_lines(tc) {
+  const byY = {};
+  for (const item of tc.items) {
+    if (!item.str) continue;
+    const y = Math.round(item.transform[5]);
+    const x = Math.round(item.transform[4]);
+    (byY[y] = byY[y] || []).push({ x, str: item.str });
+  }
+  const ys = Object.keys(byY).map(Number).sort((a, b) => a - b);
+  let text = "";
+  for (const y of ys) {
+    byY[y].sort((a, b) => a.x - b.x);
+    text += byY[y].map((l) => l.str).join(" ") + "\n";
+  }
+  return text;
+}
+
+async function _ocr_worker() {
+  const Tesseract = lib("Tesseract");
+  if (!Tesseract) throw new Error("tesseract.min.js no está cargado.");
+  let base = "lib/tesseract/";
+  if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL) {
+    base = chrome.runtime.getURL("lib/tesseract/");
+  }
+  // worker clásico cargado desde su propia URL chrome-extension:// (sin blob:
+  // CSP de MV3 no permite blob:). importScripts mismo-origen del worker sí funciona.
+  const worker = await Tesseract.createWorker({
+    workerBlobURL: false,
+    workerPath: base + "worker.min.js",
+    corePath: base + "tesseract-core.wasm.js",
+    langPath: base + "lang/",
+    logger: () => {},
+  });
+  await worker.loadLanguage("spa");
+  await worker.initialize("spa");
+  return worker;
+}
+
+async function _ocr_page(worker, page) {
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  const { data } = await worker.recognize(canvas.toDataURL("image/png"));
+  return data.text || "";
+}
+
+async function _pdf_text(data) {
   const pdfjs = lib("pdfjsLib");
   if (!pdfjs) throw new Error("pdf.min.js no está cargado.");
   if (!pdfjs.GlobalWorkerOptions.workerSrc && typeof chrome !== "undefined") {
@@ -185,27 +235,35 @@ function _pdf_text(data) {
       pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
     } catch (e) {}
   }
-  return pdfjs.getDocument({ data }).promise.then(async (pdf) => {
-    let text = "";
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      const byY = {};
-      for (const item of tc.items) {
-        if (!item.str) continue;
-        const y = Math.round(item.transform[5]);
-        const x = Math.round(item.transform[4]);
-        (byY[y] = byY[y] || []).push({ x, str: item.str });
-      }
-      const ys = Object.keys(byY).map(Number).sort((a, b) => a - b);
-      for (const y of ys) {
-        byY[y].sort((a, b) => a.x - b.x);
-        text += byY[y].map((l) => l.str).join(" ") + "\n";
-      }
-      text += "\n";
+  const pdf = await pdfjs.getDocument({ data }).promise;
+  let text = "";
+  let needOcr = false;
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const tc = await page.getTextContent();
+    if (tc.items.length > 0) {
+      text += _text_items_to_lines(tc) + "\n";
+    } else {
+      needOcr = true;
     }
-    return text;
-  });
+  }
+  if (needOcr) {
+    const worker = await _ocr_worker();
+    try {
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        if (tc.items.length > 0) {
+          text += _text_items_to_lines(tc) + "\n";
+        } else {
+          text += (await _ocr_page(worker, page)) + "\n";
+        }
+      }
+    } finally {
+      try { await worker.terminate(); } catch (e) {}
+    }
+  }
+  return text;
 }
 
 // ------------------------------------------------------------- lineas
@@ -291,7 +349,9 @@ function _is_line_row(values, idxSku, idxProd, idxQty, idxPrice, idxImport) {
   const get = (idx) =>
     idx != null && values[idx] != null && String(values[idx]).trim() !== "";
   const hasProd = (idxProd != null && get(idxProd)) || (idxSku != null && get(idxSku));
-  const hasQty = idxQty != null && values[idxQty] != null && is_numeric(values[idxQty]);
+  const hasQty =
+    (idxQty != null && values[idxQty] != null &&
+      (is_numeric(values[idxQty]) || parse_qty(values[idxQty]) !== null));
   const hasPrice =
     (idxPrice != null && values[idxPrice] != null && is_numeric(values[idxPrice])) ||
     (idxImport != null && values[idxImport] != null && is_numeric(values[idxImport]));
@@ -328,17 +388,28 @@ function _build_table_obj(sheet, rows, headerIdx) {
 
   const idxSku = _col_for(headers, new Set(["sku"]));
   const idxProd = _col_for(headers, new Set(["producto"]));
-  const idxQty = _col_for(headers, new Set(["cantidad", "medida"]));
+  const idxMed = _col_for(headers, new Set(["medida"]));
+  const idxQty = _col_for(headers, new Set(["cantidad"])) ?? idxMed;
   const idxPrice = _col_for(headers, new Set(["precio"]));
   const idxImport = _col_for(headers, new Set(["importe"]));
 
   const lineItems = [];
   for (const row of dataRows) {
     if (_is_line_row(row, idxSku, idxProd, idxQty, idxPrice, idxImport)) {
+      const cantidad = idxQty != null && idxQty < row.length ? String(row[idxQty]).trim() : "";
+      let unidad = "";
+      if (idxMed != null && idxMed < row.length && idxMed !== idxQty && String(row[idxMed]).trim()) {
+        unidad = String(row[idxMed]).trim();
+      } else {
+        const q = parse_qty(cantidad);
+        if (q && q.unit) unidad = q.unit;
+      }
       lineItems.push({
         sku: idxSku != null && idxSku < row.length ? clean_value(row[idxSku]) : "",
         producto: idxProd != null && idxProd < row.length ? String(row[idxProd]).trim() : "",
-        cantidad: idxQty != null && idxQty < row.length ? String(row[idxQty]).trim() : "",
+        cantidad,
+        unidad,
+        categoria: medida_categoria(unidad),
         precio: idxPrice != null && idxPrice < row.length ? String(row[idxPrice]).trim() : "",
         importe: idxImport != null && idxImport < row.length ? String(row[idxImport]).trim() : "",
       });
@@ -350,7 +421,7 @@ function _build_table_obj(sheet, rows, headerIdx) {
     headers,
     rows: rowDicts,
     line_items: lineItems,
-    col_indexes: { sku: idxSku, producto: idxProd, cantidad: idxQty, precio: idxPrice, importe: idxImport },
+    col_indexes: { sku: idxSku, producto: idxProd, cantidad: idxQty, precio: idxPrice, importe: idxImport, medida: idxMed },
   };
 }
 

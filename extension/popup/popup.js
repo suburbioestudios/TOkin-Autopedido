@@ -64,9 +64,6 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
   // ------------------------------------------------------------- init
 
   async function init() {
-    $("#cfg-list-source").textContent = "TOkin-Autopedido/allowed_users.json";
-    $("#btn-open-repo").href = `https://github.com/${RAW_URL.split("/").slice(3, 5).join("/")}/blob/main/allowed_users.json`;
-
     const tab = await getActiveTab();
     const tabId = tab && tab.id;
 
@@ -120,8 +117,8 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
       return;
     }
     showAccess(
-      "Tu usuario (" + email + ") no está en la lista de emails autorizados del repo. " +
-      "El administrador debe agregarlo en allowed_users.json del repo público."
+      "Tu usuario (" + email + ") no está en la lista de emails autorizados. " +
+      "Contactá al administrador para habilitar el acceso."
     );
   }
 
@@ -302,7 +299,9 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
         .map((it) => [it.sku, it.producto, it.cantidad, it.precio].join("\t"))
         .join("\n");
     }
-    return items.map((it) => (it.sku || it.producto) + "\t" + (it.cantidad || "")).join("\n");
+    return items
+      .map((it) => (it.sku || it.producto) + "\t" + (it.cantidad || "") + "\t" + (it.categoria || it.unidad || ""))
+      .join("\n");
   }
 
   function renderItems() {
@@ -312,10 +311,10 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
       box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
       return;
     }
-    let html = "<table><tr><th>SKU</th><th>Producto</th><th>Cant</th><th>Precio</th></tr>";
+    let html = "<table><tr><th>SKU</th><th>Producto</th><th>Cant</th><th>Categoría</th><th>Precio</th></tr>";
     items.forEach((it) => {
       html += "<tr><td>" + esc(it.sku) + "</td><td>" + esc(it.producto) + "</td><td>" + esc(it.cantidad) +
-        "</td><td>" + esc(it.precio) + "</td></tr>";
+        "</td><td>" + esc(it.categoria || it.unidad || "") + "</td><td>" + esc(it.precio) + "</td></tr>";
     });
     html += "</table>";
     box.innerHTML = html;
@@ -378,10 +377,8 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
       const access = await getAllowedUsers(true);
       state.allowed = access;
       if (access.ok) {
-        $("#cfg-allowed").value = access.emails.join(", ");
         setBadge("ok", "Lista OK", access.warning || "");
       } else {
-        $("#cfg-allowed").value = "";
         setBadge("err", "Lista no disponible", access.error || "");
       }
       $("#settings-overlay").classList.remove("hidden");
@@ -393,12 +390,11 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
       const access = await getAllowedUsers(true);
       state.allowed = access;
       if (access.ok) {
-        $("#cfg-allowed").value = access.emails.join(", ");
         setBadge("ok", "Lista OK", access.warning || "");
-        setStatus("Lista de usuarios actualizada.", "ok");
+        setStatus("Acceso actualizado.", "ok");
       } else {
         setBadge("err", "Lista no disponible", access.error || "");
-        setStatus(access.error || "No se pudo refrescar la lista.", "err");
+        setStatus(access.error || "No se pudo actualizar el acceso.", "err");
       }
     });
   }
@@ -430,5 +426,112 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
   window.__TOKIN_CORE__ = {
     parseDocument, mapFields, summarize,
     getAllowedUsers, isAllowed,
+    ocrProbe: async () => {
+      const out = { steps: [], tesseract: !!window.Tesseract };
+      if (!window.Tesseract) return out;
+      const base = chrome.runtime.getURL("lib/tesseract/");
+      let worker = null;
+      try {
+        out.steps.push("createWorker");
+        worker = await window.Tesseract.createWorker({
+          workerBlobURL: false,
+          workerPath: base + "worker.min.js",
+          corePath: base + "tesseract-core.wasm.js",
+          langPath: base + "lang/",
+          logger: () => {},
+        });
+        out.steps.push("created");
+        out.steps.push("loadLanguage");
+        await worker.loadLanguage("spa");
+        out.steps.push("language_ok");
+        out.steps.push("initialize");
+        await worker.initialize("spa");
+        out.steps.push("init_ok");
+      } catch (e) {
+        out.error = String((e && e.stack) || e);
+      } finally {
+        if (worker) { try { await worker.terminate(); } catch (e) {} }
+      }
+      return out;
+    },
+    pdfInfo: async (b64) => {
+      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const pdfjs = window.pdfjsLib;
+      pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      const out = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const v = page.getViewport({ scale: 1 });
+        const tc = await page.getTextContent();
+        out.push({ page: i, w: Math.round(v.width), h: Math.round(v.height), items: tc.items.length });
+      }
+      return out;
+    },
+    ocrPdfPage: async (b64, pageNum, scale) => {
+      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const pdfjs = window.pdfjsLib;
+      pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      const page = await pdf.getPage(pageNum);
+      const vp = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = vp.width;
+      canvas.height = vp.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      let worker = null;
+      try {
+        worker = await window.Tesseract.createWorker({
+          workerBlobURL: false,
+          workerPath: chrome.runtime.getURL("lib/tesseract/worker.min.js"),
+          corePath: chrome.runtime.getURL("lib/tesseract/tesseract-core.wasm.js"),
+          langPath: chrome.runtime.getURL("lib/tesseract/lang/"),
+          logger: () => {},
+        });
+        await worker.loadLanguage("spa");
+        await worker.initialize("spa");
+        const { data: d } = await worker.recognize(canvas.toDataURL("image/png"));
+        return { w: vp.width, h: vp.height, len: (d.text || "").length, sample: (d.text || "").slice(0, 300) };
+      } finally {
+        if (worker) { try { await worker.terminate(); } catch (e) {} }
+      }
+    },
+    ocrAllPages: async (b64) => {
+      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const pdfjs = window.pdfjsLib;
+      pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      const out = [];
+      let worker = null;
+      try {
+        worker = await window.Tesseract.createWorker({
+          workerBlobURL: false,
+          workerPath: chrome.runtime.getURL("lib/tesseract/worker.min.js"),
+          corePath: chrome.runtime.getURL("lib/tesseract/tesseract-core.wasm.js"),
+          langPath: chrome.runtime.getURL("lib/tesseract/lang/"),
+          logger: () => {},
+        });
+        await worker.loadLanguage("spa");
+        await worker.initialize("spa");
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const vp = page.getViewport({ scale: 2 });
+          const canvas = document.createElement("canvas");
+          canvas.width = vp.width;
+          canvas.height = vp.height;
+          console.log("ocrAllPages render page", i);
+          await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+          console.log("ocrAllPages recognize page", i);
+          const { data: d } = await worker.recognize(canvas.toDataURL("image/png"));
+          out.push({ page: i, len: (d.text || "").length });
+          canvas.width = 0;
+          canvas.height = 0;
+          console.log("ocrAllPages done page", i, "len", (d.text || "").length);
+        }
+      } finally {
+        if (worker) { try { await worker.terminate(); } catch (e) {} }
+      }
+      return out;
+    },
   };
 }
