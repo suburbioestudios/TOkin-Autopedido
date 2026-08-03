@@ -2,7 +2,6 @@
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
 import { getMemory, setMapping, clearMemory } from "../core/memory.js";
 import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
-
 (function () {
   "use strict";
 
@@ -428,5 +427,8 @@ import { getAllowedUsers, isAllowed, RAW_URL } from "../core/access.js";
 
 // Hook de depuracion para tests automatizados (solo con ?debug=1).
 if (new URLSearchParams(location.search).get("debug") === "1") {
-  window.__TOKIN_CORE__ = { parseDocument, mapFields, summarize };
+  window.__TOKIN_CORE__ = {
+    parseDocument, mapFields, summarize,
+    getAllowedUsers, isAllowed,
+  };
 }
