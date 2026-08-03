@@ -311,13 +311,63 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
       return;
     }
-    let html = "<table><tr><th>SKU</th><th>Producto</th><th>Cant</th><th>Categoría</th><th>Precio</th></tr>";
-    items.forEach((it) => {
-      html += "<tr><td>" + esc(it.sku) + "</td><td>" + esc(it.producto) + "</td><td>" + esc(it.cantidad) +
-        "</td><td>" + esc(it.categoria || it.unidad || "") + "</td><td>" + esc(it.precio) + "</td></tr>";
+    let html = '<table><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr>';
+    items.forEach((it, i) => {
+      const unidad = it.categoria || it.unidad || "";
+      html +=
+        "<tr>" +
+        '<td class="mono">' + (i + 1) + "</td>" +
+        '<td>' + esc(it.producto) + "</td>" +
+        '<td>' + esc(it.cantidad) + "</td>" +
+        "<td>" + esc(unidad) + "</td>" +
+        "</tr>";
     });
     html += "</table>";
     box.innerHTML = html;
+  }
+
+  function buildCartItems() {
+    return ((state.doc && state.doc.line_items) || [])
+      .map((it) => ({
+        producto: it.producto || "",
+        cantidad: it.cantidad || "",
+        unidad: it.categoria || it.unidad || "",
+        sku: it.sku || "",
+      }))
+      .filter((it) => (it.producto || it.sku || "").trim());
+  }
+
+  async function armarCarrito() {
+    const tab = await getActiveTab();
+    if (!tab || !tab.id) {
+      setStatus("No hay pestaña activa.", "err");
+      return;
+    }
+    const items = buildCartItems();
+    if (!items.length) {
+      setStatus("No hay líneas de pedido para cargar.", "warn");
+      return;
+    }
+    $("#btn-cart").disabled = true;
+    setStatus("Armando carrito en el store (" + items.length + " líneas)…", "ok");
+    const out = await askTab(tab.id, { type: "ADD_TO_CART", items });
+    $("#btn-cart").disabled = false;
+    if (!out || !out.ok) {
+      setStatus((out && out.message) || "El store no respondió.", "err");
+      return;
+    }
+    const res = out.results || [];
+    const ok = res.filter((r) => r.ok).length;
+    const rows = res
+      .map((r) => {
+        const cls = r.ok ? "ok" : "err";
+        return '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
+      })
+      .join("");
+    $("#cart-results").innerHTML =
+      '<p class="hint">Agregados al carrito: ' + ok + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>" +
+      rows;
+    setStatus("Pedido procesado: " + ok + " de " + res.length + " en el carrito.", ok === res.length ? "ok" : "warn");
   }
 
   async function copyText(text, msg) {
@@ -392,6 +442,18 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       if (access.ok) {
         setBadge("ok", "Lista OK", access.warning || "");
         setStatus("Acceso actualizado.", "ok");
+        const email = state.session && state.session.email;
+        if (email) {
+          if (await isAllowed(email, state.allowed.hashes)) {
+            $("#access-screen").classList.add("hidden");
+            $("#main-screen").classList.remove("hidden");
+            setBadge("ok", "Autorizado");
+            setStatus("Acceso habilitado. Podés usar la herramienta.", "ok");
+          } else {
+            setBadge("err", "No autorizado");
+            setStatus("Tu usuario aún no está en la lista.", "err");
+          }
+        }
       } else {
         setBadge("err", "Lista no disponible", access.error || "");
         setStatus(access.error || "No se pudo actualizar el acceso.", "err");
@@ -407,9 +469,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     $("#btn-copy-items").addEventListener("click", () =>
       copyText(itemsText(false), "Líneas copiadas (SKU|CANT).")
     );
-    $("#btn-copy-all").addEventListener("click", () =>
-      copyText(itemsText(true), "Detalle completo copiado.")
-    );
+    $("#btn-cart").addEventListener("click", armarCarrito);
     $("#btn-remember").addEventListener("click", rememberMapping);
     $("#btn-clear-memory").addEventListener("click", clearMemory);
   }
@@ -481,8 +541,7 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
       await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
       return canvas.toDataURL("image/png");
     },
-    ocrPdfPage: async (b64, pageNum, scale, proc, rotation) => {
-      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    ocrPdfPage: async (b64, pageNum, scale, proc, rotation) => {      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       const pdfjs = window.pdfjsLib;
       pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
       const pdf = await pdfjs.getDocument({ data }).promise;
@@ -528,7 +587,7 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
         await worker.loadLanguage("spa");
         await worker.initialize("spa");
         const { data: d } = await worker.recognize(canvas.toDataURL("image/png"));
-        return { w: vp.width, h: vp.height, len: (d.text || "").length, sample: (d.text || "").slice(0, 400) };
+        return { w: vp.width, h: vp.height, len: (d.text || "").length, conf: d.confidence, sample: (d.text || "").slice(0, 400) };
       } finally {
         if (worker) { try { await worker.terminate(); } catch (e) {} }
       }
@@ -569,6 +628,37 @@ if (new URLSearchParams(location.search).get("debug") === "1") {
         if (worker) { try { await worker.terminate(); } catch (e) {} }
       }
       return out;
+    },
+    ocrPdfWords: async (b64, pageNum, scale, rotation) => {
+      const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const pdfjs = window.pdfjsLib;
+      pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      const page = await pdf.getPage(pageNum);
+      const vp = page.getViewport({ scale, rotation: rotation || 0 });
+      const canvas = document.createElement("canvas");
+      canvas.width = vp.width;
+      canvas.height = vp.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      let worker = null;
+      try {
+        worker = await window.Tesseract.createWorker({
+          workerBlobURL: false,
+          workerPath: chrome.runtime.getURL("lib/tesseract/worker.min.js"),
+          corePath: chrome.runtime.getURL("lib/tesseract/tesseract-core.wasm.js"),
+          langPath: chrome.runtime.getURL("lib/tesseract/lang/"),
+          logger: () => {},
+        });
+        await worker.loadLanguage("spa");
+        await worker.initialize("spa");
+        const { data: d } = await worker.recognize(canvas.toDataURL("image/png"));
+        const words = (d.words || []).map((w) => ({ t: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 }));
+        canvas.width = 0;
+        canvas.height = 0;
+        return { w: vp.width, h: vp.height, words: words.slice(0, 2500) };
+      } finally {
+        if (worker) { try { await worker.terminate(); } catch (e) {} }
+      }
     },
   };
 }

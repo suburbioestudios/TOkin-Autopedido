@@ -217,14 +217,53 @@ async function _ocr_worker() {
   return worker;
 }
 
-async function _ocr_page(worker, page) {
-  const viewport = page.getViewport({ scale: 2 });
+async function _render_page(page, rotation, scale) {
+  const viewport = page.getViewport({ scale, rotation: rotation || 0 });
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  return canvas;
+}
+
+async function _ocr_canvas(worker, canvas) {
   const { data } = await worker.recognize(canvas.toDataURL("image/png"));
-  return data.text || "";
+  const words = (data.words || [])
+    .map((w) => ({
+      t: String(w.text || ""),
+      x0: w.bbox.x0,
+      y0: w.bbox.y0,
+      x1: w.bbox.x1,
+      y1: w.bbox.y1,
+    }))
+    .filter((w) => w.t.trim() !== "");
+  return { text: data.text || "", conf: data.confidence || 0, words, w: canvas.width };
+}
+
+// Detectar en que orientacion estan dibujadas las hojas (contenido girado dentro
+// de una hoja vertical). Compara confianza media de Tesseract en 0/90/270 y elige
+// la mayor; el texto girado da confianza mucho mas baja que el texto derecho.
+const OCR_SCALE = 3;
+const OCR_DETECT_SCALE = 2;
+const ROT_CANDIDATES = [0, 90, 270];
+
+async function _detect_rotation(worker, page) {
+  let best = { rot: 0, conf: -1, text: "", words: [], w: 0 };
+  for (const rot of ROT_CANDIDATES) {
+    const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
+    const r = await _ocr_canvas(worker, canvas);
+    if (r.conf > best.conf) best = { rot, conf: r.conf, text: r.text, words: r.words, w: r.w };
+  }
+  return best;
+}
+
+async function _ocr_page(worker, page, rotation) {
+  const canvas = await _render_page(page, rotation, OCR_SCALE);
+  const r = await _ocr_canvas(worker, canvas);
+  const out = { text: r.text, words: r.words, w: r.w };
+  canvas.width = 0;
+  canvas.height = 0;
+  return out;
 }
 
 async function _pdf_text(data) {
@@ -237,33 +276,119 @@ async function _pdf_text(data) {
   }
   const pdf = await pdfjs.getDocument({ data }).promise;
   let text = "";
-  let needOcr = false;
+  const pages = [];
+  const needOcr = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const tc = await page.getTextContent();
     if (tc.items.length > 0) {
       text += _text_items_to_lines(tc) + "\n";
     } else {
-      needOcr = true;
+      needOcr.push(i);
     }
   }
-  if (needOcr) {
+  if (needOcr.length) {
     const worker = await _ocr_worker();
     try {
-      for (let i = 1; i <= pdf.numPages; i++) {
+      const first = await pdf.getPage(needOcr[0]);
+      const rot = await _detect_rotation(worker, first);
+      if (typeof console !== "undefined") console.log("[tokin] rotation=%s conf=%s ocr_pages=%d", rot.rot, rot.conf, needOcr.length);
+      for (const i of needOcr) {
+        if (typeof console !== "undefined") console.log("[tokin] ocr page", i);
         const page = await pdf.getPage(i);
         const tc = await page.getTextContent();
         if (tc.items.length > 0) {
           text += _text_items_to_lines(tc) + "\n";
         } else {
-          text += (await _ocr_page(worker, page)) + "\n";
+          const r = await _ocr_page(worker, page, rot.rot);
+          text += r.text + "\n";
+          if (r.words.length) pages.push({ page: i, words: r.words, w: r.w });
         }
       }
     } finally {
       try { await worker.terminate(); } catch (e) {}
     }
   }
-  return text;
+  return { text, pages };
+}
+
+// Extraer renglones de la tabla de items a partir de palabras OCR con bbox.
+// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/a) |
+// Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
+// producto (descripción), cantidad pedida y unidad (bulto/display).
+function _first_digits(t) {
+  const m = /\d+/.exec(String(t || ""));
+  return m ? m[0] : null;
+}
+
+function _pdf_table_items(words, width) {
+  const wlist = (words || []).filter((w) => w && w.t && String(w.t).trim() !== "");
+  if (wlist.length < 5) return [];
+  const sorted = wlist.slice().sort((a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2);
+  const rows = [];
+  let last = null;
+  for (const w of sorted) {
+    const cy = (w.y0 + w.y1) / 2;
+    if (last === null || cy - last > 20) rows.push([]);
+    rows[rows.length - 1].push(w);
+    last = cy;
+  }
+  const items = [];
+  for (const row of rows) {
+    row.sort((a, b) => a.x0 - b.x0);
+    let sku = null;
+    let sku_i = -1;
+    for (let i = 0; i < row.length; i++) {
+      const w = row[i];
+      if (w.x0 / width < 0.1 && /^\d{4,6}$/.test(w.t)) {
+        sku = w.t;
+        sku_i = i;
+        break;
+      }
+    }
+    if (sku === null) continue;
+    let unit = null;
+    let unit_i = -1;
+    for (let i = sku_i + 1; i < row.length; i++) {
+      const w = row[i];
+      const xf = (w.x0 + w.x1) / 2 / width;
+      if (xf < 0.25 || xf > 0.31) continue;
+      const m = /[bda]/.exec(w.t.toLowerCase());
+      if (m) {
+        unit = m[0];
+        unit_i = i;
+        break;
+      }
+    }
+    if (unit === null) continue;
+    let pedida = null;
+    for (let j = unit_i + 1; j < Math.min(unit_i + 4, row.length); j++) {
+      const d = _first_digits(row[j].t);
+      if (d !== null) {
+        pedida = d;
+        break;
+      }
+    }
+    const xbulTok = unit_i > sku_i + 1 ? String(row[unit_i - 1].t || "") : "";
+    const isXbul = /^\|?\s*\d{1,4}\s*\|?$/.test(xbulTok);
+    let end = isXbul && unit_i - 2 >= sku_i + 1 ? unit_i - 2 : unit_i - 1;
+    if (end < sku_i + 1) end = unit_i - 1;
+    let desc = "";
+    for (let j = sku_i + 1; j <= end && j < row.length; j++) {
+      if (desc) desc += " ";
+      desc += row[j].t;
+    }
+    desc = desc.replace(/^\||\|$/g, "").trim();
+    if (!desc) continue;
+    items.push({
+      sku,
+      producto: desc.slice(0, 200),
+      cantidad: pedida || "",
+      unidad: unit,
+      categoria: medida_categoria(unit),
+    });
+  }
+  return items;
 }
 
 // ------------------------------------------------------------- lineas
@@ -516,10 +641,28 @@ export async function parseDocument(filename, data) {
         }
         doc.kv_pairs.push(..._kv_from_text(text));
       } else {
-        const text = await _pdf_text(data);
+        const { text, pages } = await _pdf_text(data);
         doc.markdown = text;
         doc.file_type = "pdf";
         doc.kv_pairs.push(..._kv_from_text(text));
+        for (const p of pages) {
+          const items = _pdf_table_items(p.words, p.w);
+          if (!items.length) continue;
+          doc.tables.push({
+            sheet: "página " + p.page,
+            headers: ["sku", "producto", "cantidad", "unidad", "categoria"],
+            rows: items.map((it) => ({
+              sku: it.sku,
+              producto: it.producto,
+              cantidad: it.cantidad,
+              unidad: it.unidad,
+              categoria: it.categoria,
+            })),
+            line_items: items,
+            col_indexes: { sku: 0, producto: 1, cantidad: 2, unidad: 3 },
+          });
+          doc.line_items.push(...items);
+        }
       }
     } else {
       doc.error = `Formato no soportado: .${ext}`;

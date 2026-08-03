@@ -68,13 +68,14 @@ export function parse_qty(v) {
   return { num, unit: m[2].toUpperCase() };
 }
 
-// Columna de unidad (B/D) -> categoria del store: "bulto" | "display".
+// Columna de unidad (B/D/U) -> categoria del store: "bulto" | "display" | "unidad".
 export function medida_categoria(unit) {
   if (unit == null) return "";
   const k = normalize(unit);
   if (!k) return "";
   if (/^b(ulto)?s?$/.test(k)) return "bulto";
   if (/^d(isplay|isp)?s?$/.test(k)) return "display";
+  if (/^u(nidad|d)?s?$/.test(k)) return "unidad";
   return k;
 }
 

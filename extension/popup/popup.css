@@ -100,6 +100,16 @@ pre { white-space: pre-wrap; font-family: Consolas, monospace; font-size: 11px; 
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { border: 1px solid var(--border); padding: 4px 6px; text-align: left; }
 th { background: #f8fafc; }
+#items-table td input[type="text"], #items-table td input[type="number"] {
+  width: 100%; border: 1px solid var(--border); border-radius: 6px; padding: 3px 5px; font-size: 12px;
+}
+#items-table td select { width: 100%; border: 1px solid var(--border); border-radius: 6px; padding: 3px 5px; font-size: 12px; }
+#items-table td input[type="number"] { width: 70px; }
+#items-table .mono { font-family: Consolas, monospace; font-size: 11px; white-space: nowrap; }
+#cart-results { margin-top: 8px; max-height: 200px; overflow: auto; }
+.cart-row { display: flex; justify-content: space-between; gap: 8px; padding: 4px 6px; border-radius: 6px; margin: 2px 0; font-size: 12px; }
+.cart-row.ok { background: #dcfce7; }
+.cart-row.err { background: #fee2e2; }
 
 .map-row {
   display: grid;
