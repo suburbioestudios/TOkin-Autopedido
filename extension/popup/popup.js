@@ -37,6 +37,31 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     });
   }
 
+  function getStoreTab() {
+    return new Promise((resolve) => {
+      chrome.tabs.query({}, (tabs) => {
+        const active = tabs.find((t) => t.active && t.id);
+        if (active && active.url && active.url.indexOf("tokintienda.com.ar/store") !== -1) {
+          resolve(active);
+          return;
+        }
+        const store = tabs.find(
+          (t) => t.id && t.url && t.url.indexOf("tokintienda.com.ar/store") !== -1
+        );
+        resolve(store || active || null);
+      });
+    });
+  }
+
+  async function pingWithRetry(tabId, tries) {
+    for (let i = 0; i < (tries || 4); i++) {
+      const pong = await pingTab(tabId);
+      if (pong && pong.ok) return pong;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return null;
+  }
+
   function pingTab(tabId) {
     return new Promise((resolve) => {
       chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
@@ -64,10 +89,14 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   // ------------------------------------------------------------- init
 
   async function init() {
-    const tab = await getActiveTab();
+    const tab = await getStoreTab();
     const tabId = tab && tab.id;
 
-    const access = await getAllowedUsers();
+    let access = await getAllowedUsers();
+    if (!access.ok) {
+      await new Promise((r) => setTimeout(r, 800));
+      access = await getAllowedUsers(true);
+    }
     state.allowed = access;
     if (access.ok) {
       setBadge(access.cached ? "ok" : "ok", "Lista OK", access.warning || "Usuarios autorizados cargados");
@@ -76,18 +105,23 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     }
 
     if (!tabId) {
-      showAccess("No hay pestaña activa.");
+      showAccess(
+        "Abrí https://tokintienda.com.ar/store en una pestaña e iniciá sesión, " +
+        "y volvé a abrir el popup."
+      );
       return;
     }
-    const pong = await pingTab(tabId);
+    const pong = await pingWithRetry(tabId);
     if (!pong || !pong.ok) {
       showAccess(
-        "La extensión solo funciona en tokintienda.com.ar/store. " +
-        "Abrí el store e iniciá sesión, y volvé a abrir el popup."
+        "No se pudo conectar con la página del store. " +
+        "Refrescá la pestaña de tokintienda.com.ar (F5) para recargar la extensión " +
+        "y volvé a abrir el popup."
       );
       return;
     }
     state.session = pong.session;
+    state.storeTabId = tabId;
     $("#user-info").textContent = pong.session.email || "No logueado";
     if (!pong.session.email) {
       showAccess("Iniciá sesión en el store de Tokin para usar la herramienta.");
@@ -338,9 +372,9 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   }
 
   async function armarCarrito() {
-    const tab = await getActiveTab();
+    const tab = await getStoreTab();
     if (!tab || !tab.id) {
-      setStatus("No hay pestaña activa.", "err");
+      setStatus("Abrí el store de Tokin en una pestaña para cargar el carrito.", "err");
       return;
     }
     const items = buildCartItems();
@@ -442,7 +476,18 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       if (access.ok) {
         setBadge("ok", "Lista OK", access.warning || "");
         setStatus("Acceso actualizado.", "ok");
-        const email = state.session && state.session.email;
+        let email = state.session && state.session.email;
+        if (!email) {
+          const tab = await getStoreTab();
+          if (tab && tab.id) {
+            const pong = await pingWithRetry(tab.id, 3);
+            if (pong && pong.ok) {
+              state.session = pong.session;
+              state.storeTabId = tab.id;
+              email = pong.session.email || "";
+            }
+          }
+        }
         if (email) {
           if (await isAllowed(email, state.allowed.hashes)) {
             $("#access-screen").classList.add("hidden");
@@ -453,6 +498,8 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
             setBadge("err", "No autorizado");
             setStatus("Tu usuario aún no está en la lista.", "err");
           }
+        } else {
+          setStatus("No se detectó tu sesión del store. Refrescá la pestaña del store (F5) e intentá de nuevo.", "warn");
         }
       } else {
         setBadge("err", "Lista no disponible", access.error || "");
