@@ -534,6 +534,22 @@
           try { email = JSON.parse(cu).email || ""; } catch (e) {}
         }
       }
+      if (!email) {
+        const m = document.cookie.match(/(?:^|;\s*)UserJWT=([^;]+)/);
+        if (m) {
+          try {
+            const payload = m[1].split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+            const pad = payload.length % 4;
+            const b64 = pad ? payload + "=".repeat(4 - pad) : payload;
+            const data = JSON.parse(decodeURIComponent(escape(atob(b64))));
+            email =
+              (data.user && data.user.email) ||
+              (data.additionalInfo && data.additionalInfo.account && data.additionalInfo.account.email) ||
+              data.email ||
+              "";
+          } catch (e) {}
+        }
+      }
     } catch (e) {}
     return {
       url: location.href,
