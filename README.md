@@ -1,41 +1,26 @@
-# TOkin-Autopedido
+# Tokin AutoPedido
 
-Distribución de la extensión **Tokin AutoPedido**.
+Extensión de Chrome que carga tu pedido en el carrito de
+`tokintienda.com.ar/store` a partir de un archivo Excel/CSV/PDF/DOCX.
+Funciona 100% en tu navegador: los datos de tu pedido nunca salen de tu PC.
 
-## Qué es
+> Herramienta de uso interno, solo para usuarios autorizados.
 
-La extensión de Chrome **Tokin AutoPedido** carga automáticamente un pedido en el
-carrito de `tokintienda.com.ar/store` a partir de un archivo Excel/CSV/PDF/DOCX.
-Funciona 100% en el navegador: los datos del pedido nunca salen de la PC del
-usuario.
+## Instalación
 
-## Acceso
+1. **Code → Download ZIP** y descomprimilo.
+2. En Chrome abrí `chrome://extensions`, activá **Modo desarrollador**
+   (switch arriba a la derecha).
+3. Tocá **Cargar descomprimida** y seleccioná la carpeta `extension`.
+   La extensión aparece como "Tokin AutoPedido".
 
-- El control de acceso vive en el repo separado **`suburbioestudios/tokin-users`**
-  (lista de huellas SHA-256 de emails autorizados; los emails no se publican).
-- Solo el administrador concede o quita acceso editando `allowed_users.json` allí.
-- La extensión lee esa lista, la cachea 24 h en cada PC y deniega el acceso sin
-  internet y sin copia guardada.
+## Cómo usarla
 
-## Instalación de la extensión
+1. Iniciá sesión en `https://tokintienda.com.ar/store` con tu usuario autorizado.
+2. Tocá el icono de la extensión y soltá el archivo del pedido (o tocá la zona).
+3. Revisá las **Líneas** que se detectaron y tocá **Enviar a carrito**.
+4. Esperá el aviso de finalización y confirmá en el carrito del store.
 
-1. **Code → Download ZIP** y descomprimirlo.
-2. `chrome://extensions` → activar **Modo desarrollador** → **Cargar descomprimida**.
-3. Seleccionar la carpeta `extension`.
-4. Iniciar sesión en `https://tokintienda.com.ar/store` con un email autorizado y
-   usar el popup para cargar el pedido.
-
-## Uso diario
-
-1. Logueado en el store con un email autorizado, abrir el popup de la extensión.
-2. Soltar el archivo del pedido y **Generar mapeo**.
-3. Revisar las **Líneas** (solo lectura) y click en **Cargar al carrito**.
-4. La extensión busca cada producto, elige Unidad/Display/Bulto según el archivo,
-   fija la cantidad y agrega. Al terminar se abre el carrito del store: la
-   confirmación final se hace ahí, en el sitio.
-
-## Pruebas (desarrolladores)
-
-- `tools\test_engine.py`: lanza Chrome con la extensión cargada (vía CDP) y
-  verifica parseo de XLSX/CSV/DOCX/PDF, líneas de pedido, fingerprint y mapeo.
-- `tools\probe_cart_*.py`: pruebas de la carga al carrito en el store real.
+La extensión busca cada producto, elige la unidad correcta
+(Unidad/Display/Bulto), fija la cantidad y agrega al carrito. Podés cancelar
+cuando quieras; al terminar o cancelar verás un resumen de lo procesado.

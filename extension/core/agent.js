@@ -17,6 +17,15 @@ function lib(name) {
   return (typeof globalThis !== "undefined" && globalThis[name]) || null;
 }
 
+// Señal de cancelación lanzada desde el pipeline cuando el usuario toca
+// "Cancelar". parseDocument la propaga tal cual (sin volcarla a doc.error).
+export class CancelError extends Error {
+  constructor() {
+    super("Proceso cancelado por el usuario.");
+    this.name = "CancelError";
+  }
+}
+
 // ------------------------------------------------------------ utilidades
 
 function decodeBytes(data) {
@@ -227,7 +236,8 @@ async function _render_page(page, rotation, scale) {
 }
 
 async function _ocr_canvas(worker, canvas) {
-  const { data } = await worker.recognize(canvas.toDataURL("image/png"));
+  // Pasar el canvas directamente evita el costo de codificar a PNG.
+  const { data } = await worker.recognize(canvas);
   const words = (data.words || [])
     .map((w) => ({
       t: String(w.text || ""),
@@ -240,33 +250,71 @@ async function _ocr_canvas(worker, canvas) {
   return { text: data.text || "", conf: data.confidence || 0, words, w: canvas.width };
 }
 
-// Detectar en que orientacion estan dibujadas las hojas (contenido girado dentro
-// de una hoja vertical). Compara confianza media de Tesseract en 0/90/270 y elige
-// la mayor; el texto girado da confianza mucho mas baja que el texto derecho.
-const OCR_SCALE = 3;
-const OCR_DETECT_SCALE = 2;
-const ROT_CANDIDATES = [0, 90, 270];
+// Pool sencillo: reparte los items entre N workers de Tesseract y resuelve en
+// paralelo. next se lee/incrementa sin await en el medio, así que es seguro.
+async function _parallel(pool, items, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    pool.map(async (worker) => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(worker, items[i], i);
+      }
+    })
+  );
+  return out;
+}
 
-async function _detect_rotation(worker, page) {
-  let best = { rot: 0, conf: -1, text: "", words: [], w: 0 };
-  for (const rot of ROT_CANDIDATES) {
-    const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
-    const r = await _ocr_canvas(worker, canvas);
-    if (r.conf > best.conf) best = { rot, conf: r.conf, text: r.text, words: r.words, w: r.w };
+const OCR_WORKERS = 3;
+
+// Detectar en que orientacion estan dibujadas las hojas (contenido girado dentro
+// de una hoja vertical). Prueba 0/90/180/270 y puntua cada una por confianza de
+// Tesseract + legibilidad (proporcion de palabras reales): el texto girado da
+// confianza y legibilidad mucho mas bajas que el texto derecho. Devuelve las
+// rotaciones ordenadas de mejor a peor para poder reintentar desde la vertical.
+// Las hojas del pedido son gráficos vectoriales (cada carácter es un trazado,
+// sin capa de texto). 2.0 (144 DPI) es el mínimo que mantiene SKU/cantidades
+// legibles; 1.5 (~108 DPI) degrada el OCR. La detección de orientación corre a
+// 1.2 para ser rápida (solo discrimina izquierda/derecha).
+const OCR_SCALE = 2.0;
+const OCR_DETECT_SCALE = 1.2;
+const ROT_CANDIDATES = [0, 90, 180, 270];
+
+function _legibility(text) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  if (!words.length) return 0;
+  let real = 0;
+  for (const w of words) {
+    if (/^[a-záéíóúüñ]{2,}$/i.test(w)) real++;
+    else if (/^\d{2,}([.,]\d+)?$/.test(w)) real++;
+    else if (/^[a-záéíóúüñ0-9]+([\.,\/']|[a-záéíóúüñ0-9])*$/i.test(w) && w.length > 1) real++;
   }
-  return best;
+  return real / words.length;
+}
+
+async function _detect_one(worker, page, rot) {
+  const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
+  const r = await _ocr_canvas(worker, canvas);
+  return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w };
+}
+
+async function _detect_rotations(pool, page) {
+  const results = await _parallel(pool, ROT_CANDIDATES, (worker, rot) => _detect_one(worker, page, rot));
+  results.sort((a, b) => b.score - a.score);
+  return results;
 }
 
 async function _ocr_page(worker, page, rotation) {
   const canvas = await _render_page(page, rotation, OCR_SCALE);
   const r = await _ocr_canvas(worker, canvas);
-  const out = { text: r.text, words: r.words, w: r.w };
+  const out = { text: r.text, words: r.words, w: r.w, scale: OCR_SCALE };
   canvas.width = 0;
   canvas.height = 0;
   return out;
 }
 
-async function _pdf_text(data) {
+async function _pdf_text(data, onProgress, onCancel) {
   const pdfjs = lib("pdfjsLib");
   if (!pdfjs) throw new Error("pdf.min.js no está cargado.");
   if (!pdfjs.GlobalWorkerOptions.workerSrc && typeof chrome !== "undefined") {
@@ -274,6 +322,7 @@ async function _pdf_text(data) {
       pdfjs.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
     } catch (e) {}
   }
+  const t0 = Date.now();
   const pdf = await pdfjs.getDocument({ data }).promise;
   let text = "";
   const pages = [];
@@ -288,27 +337,63 @@ async function _pdf_text(data) {
     }
   }
   if (needOcr.length) {
-    const worker = await _ocr_worker();
+    const pool = [];
     try {
-      const first = await pdf.getPage(needOcr[0]);
-      const rot = await _detect_rotation(worker, first);
-      if (typeof console !== "undefined") console.log("[tokin] rotation=%s conf=%s ocr_pages=%d", rot.rot, rot.conf, needOcr.length);
-      for (const i of needOcr) {
-        if (typeof console !== "undefined") console.log("[tokin] ocr page", i);
-        const page = await pdf.getPage(i);
-        const tc = await page.getTextContent();
-        if (tc.items.length > 0) {
-          text += _text_items_to_lines(tc) + "\n";
-        } else {
-          const r = await _ocr_page(worker, page, rot.rot);
-          text += r.text + "\n";
-          if (r.words.length) pages.push({ page: i, words: r.words, w: r.w });
+      if (onCancel && onCancel()) throw new CancelError();
+      for (let k = 0; k < OCR_WORKERS; k++) pool.push(await _ocr_worker());
+      if (typeof console !== "undefined") console.log("[tokin] t_workers=%dms", Date.now() - t0);
+      if (onProgress) onProgress("Detectando orientación de las hojas…");
+      const rots = await _detect_rotations(pool, await pdf.getPage(needOcr[0]));
+      const best = rots[0];
+      if (typeof console !== "undefined") {
+        console.log("[tokin] rotation=%s conf=%s ocr_pages=%d t_detect=%dms", best.rot, best.conf, needOcr.length, Date.now() - t0);
+      }
+
+      // Elegir la rotación que deje texto legible, probando en orden de mejor
+      // puntaje. Si la hoja está girada (ej: 90°), el barrido la encuentra.
+      // El probe de la rotación elegida se reutiliza como OCR de la página 1.
+      let chosen = null;
+      let firstDone = null;
+      for (const cand of rots) {
+        if (onCancel && onCancel()) throw new CancelError();
+        if (onProgress) onProgress("Probando orientación " + cand.rot + "°…");
+        const probePage = await pdf.getPage(needOcr[0]);
+        const probe = await _ocr_page(pool[0], probePage, cand.rot);
+        const legible = _legibility(probe.text) > 0.25 || _pdf_table_items(probe.words, probe.w, probe.scale).length > 0;
+        if (legible || !chosen) {
+          chosen = cand;
+          firstDone = probe;
         }
+        if (legible) break;
+      }
+
+      // Página 1: se reutiliza el probe (misma rotación y escala).
+      text += firstDone.text + "\n";
+      if (firstDone.words.length)
+        pages.push({ page: needOcr[0], words: firstDone.words, w: firstDone.w, scale: firstDone.scale });
+
+      // Resto de páginas OCR en paralelo entre los workers del pool.
+      const rest = needOcr.slice(1);
+      const tProbe = Date.now();
+      const results = await _parallel(pool, rest, async (worker, pageNum) => {
+        if (onCancel && onCancel()) throw new CancelError();
+        if (onProgress) onProgress("OCR página " + pageNum + " de " + pdf.numPages + "…");
+        return await _ocr_page(worker, await pdf.getPage(pageNum), chosen.rot);
+      });
+      if (typeof console !== "undefined") console.log("[tokin] t_pages=%dms", Date.now() - tProbe);
+      for (let k = 0; k < results.length; k++) {
+        const r = results[k];
+        text += r.text + "\n";
+        if (r.words.length) pages.push({ page: rest[k], words: r.words, w: r.w, scale: r.scale });
       }
     } finally {
-      try { await worker.terminate(); } catch (e) {}
+      for (const worker of pool) {
+        try { await worker.terminate(); } catch (e) {}
+      }
     }
   }
+  if (typeof console !== "undefined")
+    console.log("[tokin] pdf_text ok pages=%d elapsed=%dms", pdf.numPages, Date.now() - t0);
   return { text, pages };
 }
 
@@ -321,15 +406,35 @@ function _first_digits(t) {
   return m ? m[0] : null;
 }
 
-function _pdf_table_items(words, width) {
+// Columna de unidad del proveedor: el OCR puede dar la letra (b/d/a) o la
+// nomenclatura UN/DI/BU (unidad/display/bulto). Devuelve siempre la letra
+// canónica que consume el carrito: a=unidad, b=bulto, d=display.
+function _unit_letter(t) {
+  let s = String(t || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[|\[\]()*]/g, "")
+    .trim();
+  if (/^(un|und|unid|unidad|u)$/.test(s)) return "a";
+  if (/^(bu|bulto|bultos|b)$/.test(s)) return "b";
+  if (/^(di|disp|disps|display|d)$/.test(s)) return "d";
+  const m = /[bda]/.exec(s);
+  return m ? m[0] : null;
+}
+
+function _pdf_table_items(words, width, scale) {
   const wlist = (words || []).filter((w) => w && w.t && String(w.t).trim() !== "");
   if (wlist.length < 5) return [];
   const sorted = wlist.slice().sort((a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2);
+  // Umbral de separación entre renglones proporcional a la escala de render
+  // (a escala 2.5 los renglones están ~17px, a escala 3 ~20px). Un umbral fijo
+  // de 20px unía renglones en escalas menores.
+  const rowGap = Math.max(8, 4 * (scale || 3));
   const rows = [];
   let last = null;
   for (const w of sorted) {
     const cy = (w.y0 + w.y1) / 2;
-    if (last === null || cy - last > 20) rows.push([]);
+    if (last === null || cy - last > rowGap) rows.push([]);
     rows[rows.length - 1].push(w);
     last = cy;
   }
@@ -353,9 +458,9 @@ function _pdf_table_items(words, width) {
       const w = row[i];
       const xf = (w.x0 + w.x1) / 2 / width;
       if (xf < 0.25 || xf > 0.31) continue;
-      const m = /[bda]/.exec(w.t.toLowerCase());
-      if (m) {
-        unit = m[0];
+      const u = _unit_letter(w.t);
+      if (u) {
+        unit = u;
         unit_i = i;
         break;
       }
@@ -378,7 +483,11 @@ function _pdf_table_items(words, width) {
       if (desc) desc += " ";
       desc += row[j].t;
     }
-    desc = desc.replace(/^\||\|$/g, "").trim();
+    desc = desc
+      .replace(/^[\|\[\]\(\)]+/, "")
+      .replace(/[\|\[\]\(\)]+$/, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
     if (!desc) continue;
     items.push({
       sku,
@@ -554,13 +663,26 @@ function _build_table_obj(sheet, rows, headerIdx) {
 
 const _KV_RE = /^\s*([A-Za-záéíóúüñÁÉÍÓÚÜÑ0-9][^:;]{0,48}?)\s*[:;]\s*(.+?)\s*$/;
 
+// En un renglón OCR pueden convivir varias claves ("PEDIDO NRO: 3400 FECHA: ...").
+// Corta el valor en la primera clave conocida que aparezca después del ":".
+const _KV_NEXT_RE =
+  /\s+(?:fecha|fecha de entrega|vendedor|comprador|direccion|dirección|proveedor|cliente|domicilio|telefono|teléfono|observaciones|condicion|condición|sucursal|pedido nro|nota de pedido|importe|total|subtotal|lista de precios)\s*:/i;
+
 function _kv_from_text(text) {
   const pairs = [];
+  const seen = new Set();
   for (const line of String(text || "").split(/\r?\n/)) {
     const m = _KV_RE.exec(line);
-    if (m && match_concept(m[1])) {
-      pairs.push({ key: m[1], value: m[2] });
-    }
+    if (!m || !match_concept(m[1])) continue;
+    const key = m[1].trim();
+    if (seen.has(key)) continue; // primera página gana
+    let value = m[2].trim().replace(/\s{2,}/g, " ");
+    const cut = _KV_NEXT_RE.exec(value);
+    if (cut) value = value.slice(0, cut.index);
+    value = value.trim().replace(/[\|\[\]•*]+$/g, "").trim();
+    if (!value) continue;
+    seen.add(key);
+    pairs.push({ key, value: value.slice(0, 140) });
   }
   return pairs;
 }
@@ -604,7 +726,7 @@ async function _fingerprint(doc) {
 
 // ---------------------------------------------------------------- parse
 
-export async function parseDocument(filename, data) {
+export async function parseDocument(filename, data, onProgress, onCancel) {
   const ext = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
   const doc = {
     filename,
@@ -641,12 +763,12 @@ export async function parseDocument(filename, data) {
         }
         doc.kv_pairs.push(..._kv_from_text(text));
       } else {
-        const { text, pages } = await _pdf_text(data);
+        const { text, pages } = await _pdf_text(data, onProgress, onCancel);
         doc.markdown = text;
         doc.file_type = "pdf";
         doc.kv_pairs.push(..._kv_from_text(text));
         for (const p of pages) {
-          const items = _pdf_table_items(p.words, p.w);
+          const items = _pdf_table_items(p.words, p.w, p.scale);
           if (!items.length) continue;
           doc.tables.push({
             sheet: "página " + p.page,
@@ -669,6 +791,7 @@ export async function parseDocument(filename, data) {
       doc.kv_pairs = [{ key: "error", value: `Formato no soportado: .${ext}` }];
     }
   } catch (e) {
+    if (e && e.name === "CancelError") throw e;
     doc.error = String(e && e.message ? e.message : e);
     if (!doc.kv_pairs.length) doc.kv_pairs = [{ key: "error", value: doc.error }];
   }

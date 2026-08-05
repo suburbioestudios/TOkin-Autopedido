@@ -1,16 +1,142 @@
 // Tokin AutoPedido - service worker (MV3)
-// Mantiene la config minima; todo el procesamiento ocurre en el popup,
-// 100% local en el navegador (sin servidor y sin OAuth embebido).
+// Orquesta el documento offscreen: lo crea cuando hace falta y responde a los
+// heartbeats que lo mantienen vivo. Todo el procesamiento del pedido corre en
+// el offscreen, 100% local en el navegador (sin servidor y sin OAuth embebido).
+
+const OFFLINE_URL = "offscreen/offscreen.html";
+let ensuring = null;
+
+function tokMainBridge() {
+  try {
+    if (window.__TOKIN_AUTOPEDIDO__) return;
+    window.__TOKIN_RES__ = null;
+    window.addEventListener("message", function (ev) {
+      var d = ev.data;
+      if (!d || d.__tok !== "cart-res") return;
+      window.__TOKIN_RES__ = d.payload || {};
+    });
+    window.__TOKIN_AUTOPEDIDO__ = {
+      startCart: function (items) {
+        window.__TOKIN_RES__ = null;
+        window.postMessage({ __tok: "cart-req", payload: { probe: "start", items: items } }, "*");
+        return { ok: true, dispatched: true };
+      },
+      cartJob: function () {
+        return new Promise(function (resolve) {
+          function h(ev) {
+            var d = ev.data;
+            if (!d || d.__tok !== "cart-res") return;
+            window.removeEventListener("message", h);
+            resolve(d.payload);
+          }
+          window.addEventListener("message", h);
+          window.postMessage({ __tok: "cart-req", payload: { probe: "cartJob" } }, "*");
+        });
+      },
+    };
+  } catch (e) {}
+}
+
+async function ensureOffscreen() {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
+  if (contexts.length) return { ok: true };
+  await chrome.offscreen.createDocument({
+    url: OFFLINE_URL,
+    reasons: [chrome.offscreen.Reason.WORKERS, chrome.offscreen.Reason.AUDIO_PLAYBACK],
+    justification:
+      "Procesa el pedido (OCR del PDF) en segundo plano mientras el popup está cerrado y avisa con un sonido al finalizar.",
+  });
+  return { ok: true };
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(["tokin_installed_v2"], (data) => {
     if (!data.tokin_installed_v2) {
-      chrome.storage.local.set({ tokin_installed_v2: chrome.runtime.getManifest().version }, () => {});
+      chrome.storage.local.set({ tokin_installed_v2: chrome.runtime.getManifest().version }, () => { void chrome.runtime.lastError; });
     }
   });
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.target === "sw") {
+    if (msg.type === "HEARTBEAT") {
+      sendResponse({ ok: true });
+      return true;
+    }
+    if (msg.type === "ENSURE_OFFSCREEN") {
+      ensuring = ensuring || ensureOffscreen().finally(() => { ensuring = null; });
+      ensuring.then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
+      return true;
+    }
+    if (msg.type === "GET_STATE") {
+      chrome.storage.session.get("tokin_session", (data) => {
+        sendResponse({ ok: true, state: data["tokin_session"] || null });
+      });
+      return true;
+    }
+    if (msg.type === "PERSIST" && msg.state) {
+      chrome.storage.session.set({ tokin_session: msg.state }, () => {
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+    if (msg.type === "CLEAR_PERSIST") {
+      chrome.storage.session.remove("tokin_session", () => {
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+    if (msg.type === "ADD_TO_CART") {
+      chrome.tabs.query({}, (tabs) => {
+        const store = tabs.find(
+          (t) => t.id && t.url && t.url.indexOf("tokintienda.com.ar/store") !== -1
+        );
+        if (!store || !store.id) {
+          sendResponse({ ok: false, message: "Abrí la pestaña del store para cargar el carrito." });
+          return;
+        }
+        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", items: msg.items || [] }, (res) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ ok: false, message: chrome.runtime.lastError.message });
+          } else {
+            sendResponse({ ok: true, ...(res || {}) });
+          }
+        });
+      });
+      return true;
+    }
+    if (msg.type === "CANCEL_CART") {
+      chrome.storage.local.set({ tokinCartCancel: true }, () => { void chrome.runtime.lastError; });
+      chrome.tabs.query({}, (tabs) => {
+        const store = tabs.find(
+          (t) => t.id && t.url && t.url.indexOf("tokintienda.com.ar/store") !== -1
+        );
+        if (store && store.id) {
+          try {
+            chrome.tabs.sendMessage(store.id, { type: "CANCEL_CART" }, () => { void chrome.runtime.lastError; });
+          } catch (e) {}
+        }
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+    if (msg.type === "CLOSE_OFFSCREEN") {
+      chrome.offscreen.closeDocument(() => sendResponse({ ok: true }));
+      return true;
+    }
+  }
+  if (msg && msg.type === "INJECT_MAIN_BRIDGE") {
+    const tabId = (sender && sender.tab && sender.tab.id) || msg.tabId;
+    if (tabId) {
+      try {
+        chrome.scripting
+          .executeScript({ target: { tabId }, world: "MAIN", func: tokMainBridge })
+          .catch(() => {});
+      } catch (e) {}
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
   if (msg && msg.type === "GET_MANIFEST") {
     sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
     return true;

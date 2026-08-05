@@ -1,20 +1,36 @@
 // Tokin AutoPedido - popup logic (100% local, sin servidor, sin OAuth)
+// El popup solo muestra y dirige: el procesamiento (OCR) y la carga al carrito
+// corren en el documento offscreen, que sigue vivo aunque este popup se cierre
+// al minimizar la pestaña. Al reabrir, se restaura la sesión desde allí.
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
-import { getMemory, setMapping, clearMemory } from "../core/memory.js";
 import { getAllowedUsers, isAllowed } from "../core/access.js";
 (function () {
   "use strict";
 
   const $ = (sel) => document.querySelector(sel);
 
-  const state = {
+  const ui = {
     doc: null,
-    fields: [],
-    mapping: [],
     session: null,
     allowed: null,
-    currentTab: "extracted",
+    sessionState: null,
+    lineItems: [],
+    cart: null,
   };
+
+  // ----------------------------------------------------------- mensajes
+
+  function send(target, msg) {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ ...msg, target }, (res) => {
+        if (chrome.runtime.lastError) return resolve({ ok: false, message: chrome.runtime.lastError.message });
+        resolve(res || { ok: false, message: "Sin respuesta" });
+      });
+    });
+  }
+
+  function toSw(msg) { return send("sw", msg); }
+  function toOff(msg) { return send("offscreen", msg); }
 
   // ------------------------------------------------------------- util
 
@@ -31,10 +47,20 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     el.title = title || "";
   }
 
-  function getActiveTab() {
-    return new Promise((resolve) => {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => resolve(tabs[0]));
-    });
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function bufferToB64(buf) {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
   }
 
   function getStoreTab() {
@@ -71,19 +97,193 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     });
   }
 
-  function askTab(tabId, msg) {
+  function sendTab(tabId, msg) {
     return new Promise((resolve) => {
       chrome.tabs.sendMessage(tabId, msg, (res) => {
         if (chrome.runtime.lastError) return resolve({ ok: false, message: chrome.runtime.lastError.message });
-        resolve(res);
+        resolve(res || { ok: false, message: "Sin respuesta" });
       });
     });
   }
 
-  function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-    }[c]));
+  // ------------------------------------------------------------- estado
+
+  function showEl(sel, show) {
+    const el = $(sel);
+    if (el) el.classList.toggle("hidden", !show);
+  }
+
+  function setAction(which) {
+    showEl("#btn-cancel", which === "cancel");
+    showEl("#btn-cart", which === "cart");
+    showEl("#btn-cancel-cart", which === "cancelCart");
+    showEl("#btn-open-store", which === "done");
+    showEl("#btn-clear", which === "done");
+  }
+
+  function resetPanels() {
+    showEl("#items-box", false);
+    showEl("#done-summary", false);
+    showEl("#cart-results-final", false);
+    showEl("#done-hint", false);
+    setAction("none");
+  }
+
+  function statusKind(st) {
+    if (!st) return "";
+    if (st.status === "error") return "err";
+    if (st.status === "parsed" || st.status === "done") return "ok";
+    if (st.status === "canceled") return "warn";
+    return "";
+  }
+
+  function applyState(st) {
+    if (!st || st.status === "idle") {
+      resetPanels();
+      setStatus("Esperando el archivo del pedido…");
+      return;
+    }
+    ui.sessionState = st;
+    ui.lineItems = st.line_items || [];
+    ui.cart = st.cart || null;
+
+    if (st.status === "parsing") {
+      resetPanels();
+      setAction("cancel");
+      setStatus(st.progress || "Procesando…", "");
+      if (st.filename) {
+        $("#file-name").textContent = st.filename;
+        $("#file-name").classList.add("big");
+        $("#dropzone").classList.add("has-file");
+      }
+    } else if (st.status === "parsed") {
+      resetPanels();
+      renderItems();
+      showEl("#items-box", true);
+      setAction(ui.lineItems.length ? "cart" : "none");
+      setStatus(
+        "Pedido reconocido: " + ui.lineItems.length + " líneas. Revisá las filas y tocá «Enviar a carrito».",
+        "ok"
+      );
+    } else if (st.status === "loading_cart") {
+      showEl("#items-box", true);
+      showEl("#done-summary", false);
+      showEl("#cart-results-final", false);
+      showEl("#done-hint", false);
+      setAction("cancelCart");
+      renderCartItems(st.cartProgress, st.cart && st.cart.total);
+    } else if (st.status === "done") {
+      showEl("#items-box", false);
+      showEl("#done-summary", true);
+      showEl("#cart-results-final", true);
+      showEl("#done-hint", true);
+      setAction("done");
+      renderDone(st);
+      const c = st.cart || { ok: 0, total: 0 };
+      setStatus("Pedido cargado en el carrito: " + (c.ok || 0) + " de " + (c.total || 0) + ".", "ok");
+    } else if (st.status === "canceled") {
+      if (st.step === 3) {
+        showEl("#items-box", false);
+        showEl("#done-summary", true);
+        showEl("#cart-results-final", true);
+        showEl("#done-hint", false);
+        setAction("cart");
+        renderDone(st);
+        const c = st.cart || { ok: 0, total: 0 };
+        setStatus("Carga cancelada: " + (c.ok || 0) + " de " + (c.total || 0) + " en el carrito.", "warn");
+      } else {
+        resetPanels();
+        setStatus(st.progress || "Proceso cancelado.", "warn");
+      }
+    } else if (st.status === "error") {
+      resetPanels();
+      setStatus(st.error || st.progress || "Ocurrió un error.", "err");
+      if (st.step === 3 && ui.lineItems.length) {
+        showEl("#items-box", true);
+        setAction("cart");
+      }
+    }
+  }
+
+  function renderItems() {
+    const items = ui.lineItems || [];
+    const box = $("#items-box");
+    if (!items.length) {
+      box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
+      return;
+    }
+    let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
+    items.forEach((it, i) => {
+      const unidad = it.categoria || it.unidad || "";
+      html +=
+        "<tr>" +
+        '<td class="mono">' + (i + 1) + "</td>" +
+        "<td>" + esc(it.producto) + "</td>" +
+        "<td>" + esc(it.cantidad) + "</td>" +
+        "<td>" + esc(unidad) + "</td>" +
+        "</tr>";
+    });
+    html += "</tbody></table>";
+    box.innerHTML = html;
+  }
+
+  function renderCartResults(results, box) {
+    const res = results || [];
+    if (!res.length) {
+      box.innerHTML = '<p class="hint">Cargando…</p>';
+      return;
+    }
+    const ok = res.filter((r) => r.ok).length;
+    let html =
+      '<p class="hint">Agregados al carrito: ' + ok + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>";
+    html += res
+      .map((r) => {
+        const cls = r.ok ? "ok" : "err";
+        return '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
+      })
+      .join("");
+    box.innerHTML = html;
+  }
+
+  function renderCartItems(progress, total) {
+    const box = $("#items-box");
+    const list = ui.lineItems || [];
+    const done = progress && typeof progress.index === "number" ? progress.index : -1;
+    const count = Math.min(done + 1, total || list.length);
+    if (total || list.length) {
+      setStatus("Cargando carrito (" + count + " de " + (total || list.length) + ")…", "");
+    }
+    const remaining = list
+      .map((it, i) => ({ it, n: i + 1 }))
+      .filter((r) => r.n - 1 > done);
+    if (!remaining.length) {
+      box.innerHTML = "";
+      return;
+    }
+    let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
+    remaining.forEach((r) => {
+      const unidad = r.it.categoria || r.it.unidad || "";
+      html +=
+        "<tr>" +
+        '<td class="mono">' + r.n + "</td>" +
+        "<td>" + esc(r.it.producto) + "</td>" +
+        "<td>" + esc(r.it.cantidad) + "</td>" +
+        "<td>" + esc(unidad) + "</td>" +
+        "</tr>";
+    });
+    html += "</tbody></table>";
+    box.innerHTML = html;
+  }
+
+  function renderDone(st) {
+    const c = (st && st.cart) || ui.cart || { results: [], total: 0, ok: 0 };
+    const wasCanceled = st && st.status === "canceled";
+    let html = wasCanceled
+      ? "Carga cancelada. Lo que alcanzó a procesarse quedó en el carrito del store."
+      : "El pedido quedó cargado en el carrito del store.";
+    if (c.total) html += "\nLíneas: " + c.ok + " de " + c.total + ".";
+    $("#done-summary").textContent = html;
+    renderCartResults(c.results, $("#cart-results-final"));
   }
 
   // ------------------------------------------------------------- init
@@ -97,7 +297,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       await new Promise((r) => setTimeout(r, 800));
       access = await getAllowedUsers(true);
     }
-    state.allowed = access;
+    ui.allowed = access;
     if (access.ok) {
       setBadge(access.cached ? "ok" : "ok", "Lista OK", access.warning || "Usuarios autorizados cargados");
     } else {
@@ -120,8 +320,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       );
       return;
     }
-    state.session = pong.session;
-    state.storeTabId = tabId;
+    ui.session = pong.session;
     $("#user-info").textContent = pong.session.email || "No logueado";
     if (!pong.session.email) {
       showAccess("Iniciá sesión en el store de Tokin para usar la herramienta.");
@@ -130,6 +329,15 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     $("#cfg-session").textContent = "Tu email de sesión: " + pong.session.email;
 
     await checkAccess(pong.session.email);
+    if (ui.allowed && ui.allowed.ok && (await isAllowed(pong.session.email, ui.allowed.hashes))) {
+      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      if (!ens || !ens.ok) {
+        setStatus("No se pudo iniciar el procesador de fondo: " + ((ens && ens.message) || "error"), "err");
+        return;
+      }
+      const st = await toOff({ type: "GET_STATE" });
+      if (st && st.ok) applyState(st.state);
+    }
   }
 
   function showAccess(msg) {
@@ -139,14 +347,14 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   }
 
   async function checkAccess(email) {
-    if (!state.allowed || !state.allowed.ok) {
+    if (!ui.allowed || !ui.allowed.ok) {
       showAccess(
         "No se pudo verificar la lista de usuarios (sin internet y sin copia guardada). " +
         "La extensión no se abre por seguridad."
       );
       return;
     }
-    if (await isAllowed(email, state.allowed.hashes)) {
+    if (await isAllowed(email, ui.allowed.hashes)) {
       setBadge("ok", "Autorizado");
       return;
     }
@@ -156,33 +364,15 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     );
   }
 
-  // ------------------------------------------------------------- tabs
-
-  function switchTab(name) {
-    document.querySelectorAll(".tab").forEach((b) => {
-      b.classList.toggle("active", b.dataset.tab === name);
-    });
-    document.querySelectorAll(".tabpanel").forEach((p) => p.classList.remove("active"));
-    $("#tab-" + name).classList.add("active");
-    state.currentTab = name;
-  }
-
-  function initTabs() {
-    document.querySelectorAll(".tab").forEach((btn) => {
-      btn.addEventListener("click", () => switchTab(btn.dataset.tab));
-    });
-  }
-
   // ------------------------------------------------------------- archivo
 
   function initDropzone() {
     const dz = $("#dropzone");
-    const input = $("#file-input");
 
-    dz.addEventListener("click", () => input.click());
-    $("#browse-link").addEventListener("click", (e) => {
-      e.stopPropagation();
-      input.click();
+    dz.addEventListener("click", () => {
+      const st = ui.sessionState;
+      if (st && (st.status === "parsing" || st.status === "loading_cart")) return;
+      openPicker();
     });
     dz.addEventListener("dragover", (e) => {
       e.preventDefault();
@@ -195,181 +385,52 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       const file = e.dataTransfer.files && e.dataTransfer.files[0];
       if (file) handleFile(file);
     });
-    input.addEventListener("change", () => {
-      const file = input.files && input.files[0];
-      if (file) handleFile(file);
-    });
+  }
+
+  async function openPicker() {
+    const tab = await getStoreTab();
+    if (!tab || !tab.id) {
+      setStatus("Abrí tokintienda.com.ar/store en una pestaña para elegir el archivo.", "warn");
+      return;
+    }
+    setStatus("Abriendo el selector de archivos…");
+    const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+    if (!ens || !ens.ok) {
+      setStatus("No se pudo iniciar el procesador de fondo.", "err");
+      return;
+    }
+    const res = await sendTab(tab.id, { type: "SHOW_PICKER" });
+    if (!res || !res.ok) {
+      setStatus((res && res.message) || "No se pudo abrir el selector de archivos.", "err");
+    } else {
+      setStatus("Elegí el archivo del pedido en la ventana de Tokin.");
+    }
   }
 
   async function handleFile(file) {
-    setStatus("Procesando " + file.name + "… (todo en tu navegador)");
+    setStatus("Enviando " + file.name + "…");
     $("#file-name").textContent = file.name;
+    $("#file-name").classList.add("big");
+    $("#dropzone").classList.add("has-file");
     try {
       const buffer = await file.arrayBuffer();
-      const doc = await parseDocument(file.name, buffer);
-      state.doc = doc;
-      $("#doc-info").classList.remove("hidden");
-      $("#btn-map").disabled = false;
-      renderExtracted();
-      renderItems();
-      const s = summarize(doc);
-      setStatus(
-        (doc.error ? "Con advertencias: " + doc.error + " · " : "") + summarizeDoc(s),
-        doc.error ? "warn" : "ok"
-      );
-      switchTab("extracted");
+      const res = await toOff({ type: "PARSE", filename: file.name, b64: bufferToB64(buffer) });
+      if (!res || !res.ok) {
+        setStatus((res && res.message) || "No se pudo iniciar el procesamiento.", "err");
+        return;
+      }
+      // El offscreen transmite STATE/PROGRESS: la UI se actualiza sola.
     } catch (e) {
-      setStatus("Error al procesar: " + (e && e.message ? e.message : e), "err");
+      setStatus("Error al enviar: " + (e && e.message ? e.message : e), "err");
     }
   }
 
-  function summarizeDoc(doc) {
-    const kv = (doc.kv_pairs || []).length;
-    const items = (doc.line_items || []).length;
-    return kv + " dato(s) · " + items + " línea(s) de pedido";
+  async function cancelar() {
+    await toOff({ type: "CANCEL" });
+    setStatus("Cancelando…");
   }
 
-  function renderExtracted() {
-    const d = state.doc;
-    let html = "";
-    if (d.kv_pairs && d.kv_pairs.length) {
-      html += "Datos:\n" + d.kv_pairs.map((p) => "  " + p.key + " → " + p.value).join("\n") + "\n\n";
-    }
-    if (d.tables && d.tables.length) {
-      d.tables.forEach((t) => {
-        html += "Tabla [" + t.sheet + "] " + t.headers.join(" | ") + " (" + t.rows.length + " filas)\n";
-      });
-    } else {
-      html += "(no se detectaron tablas)";
-    }
-    $("#extracted-content").textContent = html || "Sin datos extraídos.";
-  }
-
-  // ------------------------------------------------------------- mapeo
-
-  async function generateMapping() {
-    const tab = await getActiveTab();
-    if (!tab || tab.id == null) return;
-    setStatus("Descubriendo campos del formulario…");
-    const fields = await askTab(tab.id, { type: "GET_FIELDS" });
-    if (!fields.ok || !fields.fields || !fields.fields.length) {
-      setStatus("No se encontraron campos en la página actual. ¿Estás en el formulario de pedido?", "err");
-      return;
-    }
-    if (!state.doc) {
-      setStatus("Primero cargá un documento.", "err");
-      return;
-    }
-    state.fields = fields.fields.filter((f) => f.visible);
-    setStatus("Analizando " + state.fields.length + " campos…");
-    const memory = await getMemory();
-    const res = mapFields(state.fields, state.doc, memory);
-    state.mapping = res.mapping || [];
-    renderMapping();
-    $("#btn-fill").disabled = false;
-    setStatus("Mapeo generado. Revisá los valores y hacé click en «Rellenar».", "ok");
-    switchTab("mapping");
-  }
-
-  function renderMapping() {
-    const list = $("#mapping-list");
-    list.innerHTML = "";
-    if (!state.mapping.length) {
-      list.innerHTML = '<p class="hint">Sin coincidencias.</p>';
-      return;
-    }
-    state.mapping.forEach((m, i) => {
-      const row = document.createElement("div");
-      row.className = "map-row";
-      const f = state.fields.find((x) => x.key === m.field_key) || {};
-      const typeName = f.type || "";
-      row.innerHTML =
-        '<div class="field-name">' + esc(f.label || m.field_key) +
-        (f.placeholder ? " <small>" + esc(f.placeholder) + "</small>" : "") +
-        (typeName ? " <small>" + esc(typeName) + "</small>" : "") + "</div>" +
-        '<input type="text" data-idx="' + i + '" data-key="' + esc(m.field_key) + '" value="' + esc(m.value || "") + '" placeholder="sin dato">' +
-        '<span class="conf ' + (m.confidence || "baja") + '">' + esc(m.confidence || "") + "</span>" +
-        '<input type="checkbox" data-mem="' + i + '" title="Recordar este mapeo para el mismo tipo de documento">' +
-        '<span class="hint" title="' + esc(m.source || "") + '">' + esc((m.source || "").slice(0, 16)) + "</span>";
-      list.appendChild(row);
-    });
-    $("#memory-row").hidden = false;
-  }
-
-  // ------------------------------------------------------------- rellenar
-
-  async function fillForm() {
-    const tab = await getActiveTab();
-    if (!tab || tab.id == null) return;
-    const mapping = [];
-    document.querySelectorAll("#mapping-list .map-row").forEach((row) => {
-      const input = row.querySelector('input[type="text"]');
-      const key = input && input.dataset.key;
-      const value = input ? input.value.trim() : "";
-      if (key && value) mapping.push({ fieldKey: key, value: value });
-    });
-    if (!mapping.length) {
-      setStatus("No hay valores para rellenar. Revisá el mapeo.", "err");
-      return;
-    }
-    setStatus("Rellenando " + mapping.length + " campos…");
-    const res = await askTab(tab.id, { type: "FILL_FORM", mapping: mapping });
-    if (!res.ok) {
-      setStatus("La pestaña cambió o no responde. Recargala e intentá de nuevo.", "err");
-      return;
-    }
-    const ok = res.results.filter((r) => r.ok).length;
-    const fail = res.results.length - ok;
-    setStatus("Rellenados " + ok + " campo(s)" + (fail ? ", " + fail + " con error (revisá los bordes rojos)." : "."),
-      fail ? "warn" : "ok");
-  }
-
-  // ------------------------------------------------------------- items
-
-  function itemsText(withPrices) {
-    const items = (state.doc && state.doc.line_items) || [];
-    if (withPrices) {
-      return items
-        .map((it) => [it.sku, it.producto, it.cantidad, it.precio].join("\t"))
-        .join("\n");
-    }
-    return items
-      .map((it) => (it.sku || it.producto) + "\t" + (it.cantidad || "") + "\t" + (it.categoria || it.unidad || ""))
-      .join("\n");
-  }
-
-  function renderItems() {
-    const items = (state.doc && state.doc.line_items) || [];
-    const box = $("#items-table");
-    if (!items.length) {
-      box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
-      return;
-    }
-    let html = '<table><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr>';
-    items.forEach((it, i) => {
-      const unidad = it.categoria || it.unidad || "";
-      html +=
-        "<tr>" +
-        '<td class="mono">' + (i + 1) + "</td>" +
-        '<td>' + esc(it.producto) + "</td>" +
-        '<td>' + esc(it.cantidad) + "</td>" +
-        "<td>" + esc(unidad) + "</td>" +
-        "</tr>";
-    });
-    html += "</table>";
-    box.innerHTML = html;
-  }
-
-  function buildCartItems() {
-    return ((state.doc && state.doc.line_items) || [])
-      .map((it) => ({
-        producto: it.producto || "",
-        cantidad: it.cantidad || "",
-        unidad: it.categoria || it.unidad || "",
-        sku: it.sku || "",
-      }))
-      .filter((it) => (it.producto || it.sku || "").trim());
-  }
+  // ------------------------------------------------------------- carrito
 
   async function armarCarrito() {
     const tab = await getStoreTab();
@@ -377,119 +438,102 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       setStatus("Abrí el store de Tokin en una pestaña para cargar el carrito.", "err");
       return;
     }
-    const items = buildCartItems();
-    if (!items.length) {
+    if (!ui.lineItems || !ui.lineItems.length) {
       setStatus("No hay líneas de pedido para cargar.", "warn");
       return;
     }
-    $("#btn-cart").disabled = true;
-    setStatus("Armando carrito en el store (" + items.length + " líneas)…", "ok");
-    const out = await askTab(tab.id, { type: "ADD_TO_CART", items });
-    $("#btn-cart").disabled = false;
-    if (!out || !out.ok) {
-      setStatus((out && out.message) || "El store no respondió.", "err");
-      return;
-    }
-    const res = out.results || [];
-    const ok = res.filter((r) => r.ok).length;
-    const rows = res
-      .map((r) => {
-        const cls = r.ok ? "ok" : "err";
-        return '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
-      })
-      .join("");
-    $("#cart-results").innerHTML =
-      '<p class="hint">Agregados al carrito: ' + ok + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>" +
-      rows;
-    setStatus("Pedido procesado: " + ok + " de " + res.length + " en el carrito.", ok === res.length ? "ok" : "warn");
-  }
-
-  async function copyText(text, msg) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setStatus(msg, "ok");
-    } catch (e) {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-      setStatus(msg, "ok");
+    setAction("cancelCart");
+    setStatus("Cargando carrito…");
+    const res = await toOff({ type: "ADD_TO_CART" });
+    if (!res || !res.ok) {
+      setStatus((res && res.message) || "El store no respondió.", "err");
+      setAction("cart");
     }
   }
 
-  // ------------------------------------------------------------- memoria
-
-  async function rememberMapping() {
-    if (!state.doc) return;
-    const sends = [];
-    document.querySelectorAll("#mapping-list .map-row").forEach((row) => {
-      const cb = row.querySelector('input[data-mem]');
-      if (!cb || !cb.checked) return;
-      const input = row.querySelector('input[type="text"]');
-      const idx = Number(input.dataset.idx);
-      const m = state.mapping[idx];
-      const value = input.value.trim();
-      const source = (m && m.source) || "";
-      sends.push({
-        fingerprint: state.doc.fingerprint,
-        field_key: m.field_key,
-        source: /sin dato|sin coincidencia|memoria/.test(source) ? "" : source,
-        value: value,
-      });
-    });
-    if (!sends.length) {
-      setStatus("Marcá con ✔ las filas que querés recordar.", "warn");
-      return;
+  async function abrirStore() {
+    const tab = await getStoreTab();
+    if (tab && tab.id && tab.url) {
+      chrome.tabs.update(tab.id, { active: true });
+    } else {
+      chrome.tabs.create({ url: "https://tokintienda.com.ar/store" });
     }
-    for (const s of sends) {
-      await setMapping(s.fingerprint, s.field_key, s.source, s.value);
-    }
-    setStatus("Mapeo guardado para próximos documentos del mismo tipo.", "ok");
   }
 
-  async function clearMemory() {
-    await clearMemory();
-    setStatus("Memoria de mapeo borrada.", "ok");
+  async function terminar() {
+    const res = await toOff({ type: "CLEAR" });
+    resetUi();
+    setStatus(
+      (res && res.ok ? "Sesión terminada y datos limpiados. " : "") + "Cargá un archivo para empezar.",
+      res && res.ok ? "ok" : "warn"
+    );
+  }
+
+  async function reanudar() {
+    await toOff({ type: "CLEAR" });
+    resetUi();
+    setStatus("Formulario limpio. Cargá un archivo para empezar.", "ok");
+  }
+
+  function resetUi() {
+    ui.sessionState = null;
+    ui.lineItems = [];
+    ui.cart = null;
+    $("#items-box").innerHTML = "";
+    $("#cart-results-final").innerHTML = "";
+    $("#done-summary").textContent = "";
+    $("#file-name").textContent = "";
+    $("#file-name").classList.remove("big");
+    $("#dropzone").classList.remove("has-file");
+    resetPanels();
+    setStatus("Tocá la zona o arrastrá el archivo del pedido (Excel, PDF o DOCX).");
   }
 
   // ------------------------------------------------------------- settings
 
   function initSettings() {
     $("#btn-settings").addEventListener("click", async () => {
-      const access = await getAllowedUsers(true);
-      state.allowed = access;
-      if (access.ok) {
-        setBadge("ok", "Lista OK", access.warning || "");
-      } else {
-        setBadge("err", "Lista no disponible", access.error || "");
-      }
       $("#settings-overlay").classList.remove("hidden");
+      try {
+        const access = await getAllowedUsers(true);
+        ui.allowed = access;
+        if (access && access.ok) {
+          setBadge("ok", "Lista OK", (access.warning || "").toString());
+        } else {
+          setBadge("err", "Lista no disponible", (access && access.error) || "");
+        }
+      } catch (e) {
+        ui.allowed = { ok: false, error: String((e && e.message) || e) };
+        setBadge("err", "Lista no disponible", String((e && e.message) || e));
+      }
     });
     $("#btn-close-settings").addEventListener("click", () => {
       $("#settings-overlay").classList.add("hidden");
     });
     $("#btn-refresh-list").addEventListener("click", async () => {
-      const access = await getAllowedUsers(true);
-      state.allowed = access;
-      if (access.ok) {
+      let access;
+      try {
+        access = await getAllowedUsers(true);
+      } catch (e) {
+        access = { ok: false, error: String((e && e.message) || e) };
+      }
+      ui.allowed = access;
+      if (access && access.ok) {
         setBadge("ok", "Lista OK", access.warning || "");
         setStatus("Acceso actualizado.", "ok");
-        let email = state.session && state.session.email;
+        let email = ui.session && ui.session.email;
         if (!email) {
           const tab = await getStoreTab();
           if (tab && tab.id) {
             const pong = await pingWithRetry(tab.id, 3);
             if (pong && pong.ok) {
-              state.session = pong.session;
-              state.storeTabId = tab.id;
+              ui.session = pong.session;
               email = pong.session.email || "";
             }
           }
         }
         if (email) {
-          if (await isAllowed(email, state.allowed.hashes)) {
+          if (await isAllowed(email, ui.allowed.hashes)) {
             $("#access-screen").classList.add("hidden");
             $("#main-screen").classList.remove("hidden");
             setBadge("ok", "Autorizado");
@@ -511,21 +555,31 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   // ------------------------------------------------------------- bind
 
   function bind() {
-    $("#btn-map").addEventListener("click", generateMapping);
-    $("#btn-fill").addEventListener("click", fillForm);
-    $("#btn-copy-items").addEventListener("click", () =>
-      copyText(itemsText(false), "Líneas copiadas (SKU|CANT).")
-    );
+    $("#btn-cancel").addEventListener("click", cancelar);
     $("#btn-cart").addEventListener("click", armarCarrito);
-    $("#btn-remember").addEventListener("click", rememberMapping);
-    $("#btn-clear-memory").addEventListener("click", clearMemory);
+    $("#btn-cancel-cart").addEventListener("click", cancelar);
+    $("#btn-open-store").addEventListener("click", abrirStore);
+    $("#btn-clear").addEventListener("click", terminar);
+    $("#btn-reset").addEventListener("click", reanudar);
   }
 
-  initTabs();
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.target === "popup") {
+      if (msg.type === "PROGRESS") setStatus(msg.message, "");
+      else if (msg.type === "STATE") applyState(msg.state);
+      sendResponse({ ok: true });
+      return false;
+    }
+    return false;
+  });
+
   initDropzone();
   initSettings();
   bind();
   init();
+  if (new URLSearchParams(location.search).get("debug") === "1") {
+    window.__TOKIN_UI__ = { applyState, renderCartItems, openPicker };
+  }
 })();
 
 // Hook de depuracion para tests automatizados (solo con ?debug=1).

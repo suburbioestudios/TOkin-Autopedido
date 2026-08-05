@@ -21,11 +21,14 @@ function extractHashes(data) {
 }
 
 async function getAllowedUsers(force) {
-  if (!force) {
-    const cached = await chrome.storage.local.get(CACHE_KEY);
-    if (cached[CACHE_KEY] && Date.now() - cached[CACHE_KEY].ts < CACHE_TTL) {
-      return { ok: true, hashes: cached[CACHE_KEY].hashes, cached: true };
-    }
+  let cached = {};
+  try {
+    cached = await chrome.storage.local.get(CACHE_KEY);
+  } catch (e) {
+    cached = {};
+  }
+  if (!force && cached[CACHE_KEY] && Date.now() - cached[CACHE_KEY].ts < CACHE_TTL) {
+    return { ok: true, hashes: cached[CACHE_KEY].hashes, cached: true };
   }
   try {
     const ctrl = new AbortController();

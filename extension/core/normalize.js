@@ -68,14 +68,15 @@ export function parse_qty(v) {
   return { num, unit: m[2].toUpperCase() };
 }
 
-// Columna de unidad (B/D/U) -> categoria del store: "bulto" | "display" | "unidad".
+// Columna de unidad -> categoria del store: "bulto" | "display" | "unidad".
+// Acepta letras simples (B/D/U/A) y nomenclatura OCR UN/DI/BU.
 export function medida_categoria(unit) {
   if (unit == null) return "";
   const k = normalize(unit);
   if (!k) return "";
-  if (/^b(ulto)?s?$/.test(k)) return "bulto";
-  if (/^d(isplay|isp)?s?$/.test(k)) return "display";
-  if (/^u(nidad|d)?s?$/.test(k)) return "unidad";
+  if (k === "b" || k === "bu" || k === "bulto" || k === "bultos") return "bulto";
+  if (k === "d" || k === "di" || k === "disp" || k === "disps" || k === "display" || k === "pack" || k === "packs" || k === "paquete" || k === "paquetes" || k === "pk") return "display";
+  if (k === "a" || k === "u" || k === "un" || k === "ud" || k === "uds" || k === "und" || k === "unid" || k === "unidad") return "unidad";
   return k;
 }
 

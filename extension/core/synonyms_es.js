@@ -78,7 +78,7 @@ export const SYNONYM_GROUPS = {
   marca: ["marca", "fabrica", "fabricante", "linea", "rubro"],
   medida: [
     "unidad de medida", "um", "medida", "presentacion", "formato", "unidad",
-    "bulto", "bultos", "display", "disp", "envase",
+    "bulto", "bultos", "display", "disp", "pack", "packs", "paquete", "envase",
   ],
 };
 
