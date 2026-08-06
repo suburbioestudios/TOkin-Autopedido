@@ -281,14 +281,42 @@ const OCR_SCALE = 2.0;
 const OCR_DETECT_SCALE = 1.2;
 const ROT_CANDIDATES = [0, 90, 180, 270];
 
+// Palabras funcionales y claves del documento de pedido. El texto girado produce
+// basura alfanumérica que un chequeo genérico no distingue; estas claves solo
+// aparecen en el texto derecho ("NOTA DE PEDIDO", "FECHA", "código", "Cantidad"…).
+const _SPANISH_WORDS = new Set([
+  "de", "la", "el", "los", "las", "del", "y", "a", "en", "un", "una", "unos", "unas", "con", "por", "para",
+  "se", "su", "sus", "al", "que", "o", "es", "no", "si", "me", "te", "le", "lo", "mi", "tu", "sin", "sobre",
+  "entre", "hasta", "desde", "hacia", "cada", "todo", "toda", "todos", "todas", "este", "esta", "estos",
+  "estas", "ese", "esa", "esos", "esas", "otro", "otra", "otros", "otras", "como", "cuando", "donde",
+  "quien", "cual", "pero", "porque", "tambien", "tan", "bien", "muy", "hay",
+  "nota", "pedido", "fecha", "hora", "horario", "vendedor", "comprador", "cliente", "proveedor",
+  "distribuidora", "direccion", "telefono", "telefonos", "recepcion", "confirmar", "entregar", "entrega",
+  "codigo", "cantidad", "cantidades", "precio", "precios", "importe", "descripcion", "producto",
+  "productos", "unidad", "unidades", "bulto", "bultos", "display", "displays", "marca", "gramos", "piezas",
+  "bonificaciones", "descuentos", "observaciones", "surtido", "total", "subtotal", "reimpresion",
+  "sucursal", "autorizada", "autorizado", "nro", "referencia", "lista", "listado", "renglon", "renglones",
+  "dulces", "villa", "parque", "ciudad", "caba", "localidad", "provincia", "nombre", "apellido", "correo",
+  "envio", "envios", "carton", "cartones", "kiosco", "almacen", "deposito", "congelado", "srl", "empresa",
+  "compania", "razon", "social", "dias", "hora", "hs", "uds", "kg", "cm",
+]);
+
 function _legibility(text) {
   const words = String(text || "").split(/\s+/).filter(Boolean);
   if (!words.length) return 0;
   let real = 0;
   for (const w of words) {
-    if (/^[a-záéíóúüñ]{2,}$/i.test(w)) real++;
-    else if (/^\d{2,}([.,]\d+)?$/.test(w)) real++;
-    else if (/^[a-záéíóúüñ0-9]+([\.,\/']|[a-záéíóúüñ0-9])*$/i.test(w) && w.length > 1) real++;
+    const t = String(w).replace(/[^a-záéíóúüñ0-9]/gi, "").toLowerCase();
+    if (!t) continue;
+    if (/^\d{2,}([.,]\d+)?$/.test(t)) { real++; continue; }
+    if (_SPANISH_WORDS.has(t)) { real++; continue; }
+    // Estructura de palabra plausible (al menos 4 letras y 2 vocales): descarta
+    // fragmentos sueltos del texto girado, no la basura larga (la filtra el
+    // diccionario + la confianza + la evidencia de tabla de la selección).
+    if (/^[a-záéíóúüñ]{4,}$/.test(t)) {
+      const vowels = (t.match(/[aeiouáéíóúü]/g) || []).length;
+      if (vowels >= 2) real++;
+    }
   }
   return real / words.length;
 }
@@ -308,7 +336,7 @@ async function _detect_rotations(pool, page) {
 async function _ocr_page(worker, page, rotation) {
   const canvas = await _render_page(page, rotation, OCR_SCALE);
   const r = await _ocr_canvas(worker, canvas);
-  const out = { text: r.text, words: r.words, w: r.w, scale: OCR_SCALE };
+  const out = { text: r.text, words: r.words, w: r.w, scale: OCR_SCALE, conf: r.conf };
   canvas.width = 0;
   canvas.height = 0;
   return out;
@@ -349,22 +377,26 @@ async function _pdf_text(data, onProgress, onCancel) {
         console.log("[tokin] rotation=%s conf=%s ocr_pages=%d t_detect=%dms", best.rot, best.conf, needOcr.length, Date.now() - t0);
       }
 
-      // Elegir la rotación que deje texto legible, probando en orden de mejor
-      // puntaje. Si la hoja está girada (ej: 90°), el barrido la encuentra.
+      // Elegir la rotación con mayor evidencia combinada: confianza de Tesseract
+      // + legibilidad (diccionario) + items de tabla del probe. Antes se cortaba
+      // en el primer candidato "legible" y la métrica aceptaba basura alfanumérica,
+      // eligiendo 0° cuando la hoja estaba girada 90° (ej: pedidos de Arcor).
       // El probe de la rotación elegida se reutiliza como OCR de la página 1.
       let chosen = null;
       let firstDone = null;
+      let bestEvidence = -1;
       for (const cand of rots) {
         if (onCancel && onCancel()) throw new CancelError();
         if (onProgress) onProgress("Probando orientación " + cand.rot + "°…");
         const probePage = await pdf.getPage(needOcr[0]);
         const probe = await _ocr_page(pool[0], probePage, cand.rot);
-        const legible = _legibility(probe.text) > 0.25 || _pdf_table_items(probe.words, probe.w, probe.scale).length > 0;
-        if (legible || !chosen) {
+        const items = _pdf_table_items(probe.words, probe.w, probe.scale);
+        const evidence = probe.conf + 25 * _legibility(probe.text) + (items.length > 0 ? 50 : 0);
+        if (!chosen || evidence > bestEvidence) {
           chosen = cand;
           firstDone = probe;
+          bestEvidence = evidence;
         }
-        if (legible) break;
       }
 
       // Página 1: se reutiliza el probe (misma rotación y escala).

@@ -323,6 +323,9 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     ui.session = pong.session;
     $("#user-info").textContent = pong.session.email || "No logueado";
     if (!pong.session.email) {
+      // Sesión de Tokin cerrada o vencida: limpiar los datos del pedido anterior.
+      await toOff({ type: "CLEAR" });
+      await toSw({ type: "CLEAR_PERSIST" });
       showAccess("Iniciá sesión en el store de Tokin para usar la herramienta.");
       return;
     }
@@ -336,7 +339,16 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
         return;
       }
       const st = await toOff({ type: "GET_STATE" });
-      if (st && st.ok) applyState(st.state);
+      if (st && st.ok) {
+        // Si la tarea ya terminó en una sesión anterior del popup, al reabrir se
+        // arranca limpio para el próximo pedido (el resultado quedó visible antes).
+        if (st.state && st.state.status === "done") {
+          await toOff({ type: "CLEAR" });
+          resetUi();
+        } else {
+          applyState(st.state);
+        }
+      }
     }
   }
 
@@ -368,11 +380,24 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
 
   function initDropzone() {
     const dz = $("#dropzone");
+    const fi = $("#file-input");
+
+    fi.addEventListener("change", () => {
+      const file = fi.files && fi.files[0];
+      fi.value = "";
+      if (file) handleFile(file);
+    });
 
     dz.addEventListener("click", () => {
       const st = ui.sessionState;
       if (st && (st.status === "parsing" || st.status === "loading_cart")) return;
-      openPicker();
+      try {
+        // Selector desde el propio popup: no se pierde foco, la ingesta y el
+        // resultado quedan en el mismo popup abierto.
+        fi.click();
+      } catch (e) {
+        openPicker();
+      }
     });
     dz.addEventListener("dragover", (e) => {
       e.preventDefault();

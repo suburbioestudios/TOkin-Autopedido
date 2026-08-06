@@ -410,25 +410,6 @@
     return s;
   }
 
-  // Tamaños que figuran en la card: "Display: 30 Uds / Bulto: 240 Uds", "Pack x 16".
-  function tokUnitSizes(articleText) {
-    const t = String(articleText || "");
-    const out = {};
-    const m = t.match(/(?:display|pack)\b[:\s]*x?\s*(\d[\d.]*)\s*(?:uds?|unidades?)?/i);
-    if (m) out.display = parseFloat(m[1].replace(",", "."));
-    const n = t.match(/bulto\b[:\s]*x?\s*(\d[\d.]*)\s*(?:uds?|unidades?)?/i);
-    if (n) out.bulto = parseFloat(n[1].replace(",", "."));
-    return out;
-  }
-
-  // Si el pedido dice "DISPLAY DE 30 UNIDADES" / "PACK X 16", el tamaño esperado es 30 / 16.
-  function tokWantedDisplay(item) {
-    const text = tokNorm(String(item.unidad || "") + " " + String(item.producto || ""));
-    const m = text.match(/(?:display|pack)\s+(?:(?:de|x)\s+)?(\d[\d.,]*)/);
-    if (m) return parseFloat(m[1].replace(",", "."));
-    return null;
-  }
-
   // Un boton de unidad coincide si alguna de sus palabras es el tipo o un sinonimo
   // ("x Pack" es Display en la tienda de Tokin).
   function tokUnitBtnMatch(btnText, type) {
@@ -457,51 +438,55 @@
     return false;
   }
 
-  // Ranking: primero la card que ofrece el botón de la unidad pedida (si la hay),
-  // luego las card con botón Agregar/unidades, y al final las promos/combo o sin
-  // stock. Dentro de cada grupo, el puntaje (que incluye el gramaje) decide.
-  // Devuelve { el, score, group, hasWanted } o null.
-  function tokBestArticle(target, wantType, wantedDisplay) {
+  // La unidad pedida tiene MÁXIMA jerarquía: solo entran cards que ofrezcan el
+  // botón exacto (o, para "unidad", cards sin selector de unidad). El gramaje
+  // debe coincidir exacto y el producto debe compartir palabras núcleo exactas
+  // (el store puede omitir el sabor, ej: SONRISAS; lo deciden gramaje + unidad).
+  // Entre los válidos gana el que comparte más palabras y mejor puntaje.
+  function tokBestArticle(target, wantType, wantedGrams) {
     const arts = Array.from(document.querySelectorAll("article")).filter(
       (a) => a.getAttribute("data-id") !== "cart-product-card" && tokIsProductCard(a)
     );
     if (!arts.length) return null;
+    const targetCore = tokCoreName(target).split(" ").filter(Boolean);
     let best = null;
+    let bestShared = -1;
     let bestScore = -1;
-    let bestGroup = 99;
     for (let i = 0; i < arts.length; i++) {
       const a = arts[i];
       const t = (a.innerText || "").replace(/\s+/g, " ");
-      let s = tokArticleScore(target, t);
-      const ds = tokUnitSizes(t).display;
-      if (wantedDisplay != null) {
-        if (ds === wantedDisplay) s += 0.3;
-        else if (ds != null) s -= 0.15;
-      }
       const btns = Array.from(a.querySelectorAll("[data-id=sku-selector-button]"));
-      const hasWanted = wantType ? btns.some((b) => tokUnitBtnMatch(b.innerText || "", wantType)) : false;
-      const group = hasWanted ? 0 : btns.length || a.querySelector("[data-id=add-to-cart-button]") ? 1 : 2;
-      if (group < bestGroup || (group === bestGroup && s > bestScore)) {
-        bestGroup = group;
+      const hasSelector = btns.length > 0;
+      const isNoStock = /sin stock/i.test(t);
+      let hasWanted;
+      if (!wantType) {
+        hasWanted = true;
+      } else if (hasSelector) {
+        hasWanted = btns.some((b) => tokUnitBtnMatch(b.innerText || "", wantType));
+      } else {
+        // Sin botones de unidad: solo entra si se pide "unidad" o si la card está
+        // sin stock (no se puede verificar la unidad, pero tampoco agregar nada).
+        hasWanted = wantType === "unidad" || isNoStock;
+      }
+      if (!hasWanted) continue;
+      const grams = tokGrams(t);
+      if (wantedGrams.length && !grams.some((g) => wantedGrams.indexOf(g) !== -1)) continue;
+      const cardCore = tokCoreName(t).split(" ").filter(Boolean);
+      const shared = targetCore.filter((w) => cardCore.indexOf(w) !== -1).length;
+      if (!shared) continue;
+      const s = tokArticleScore(target, t);
+      if (!best || shared > bestShared || (shared === bestShared && s > bestScore)) {
+        bestShared = shared;
         bestScore = s;
-        best = { el: a, score: s, group, hasWanted };
+        best = { el: a, score: s, shared };
       }
     }
     return best;
   }
 
-  // Se acepta el candidato si es suficientemente bueno. En la última query
-  // posible ("si o sí encontrar el producto") se acepta cualquier card que
-  // comparta al menos una palabra-núcleo del pedido, aunque difiera gramaje.
-  function tokAccept(cand, lastChance, target) {
-    if (cand.group === 0) return cand.score >= 0.2;
-    if (cand.score >= 0.5) return true;
-    if (lastChance) {
-      const ta = tokCoreName(target).split(" ").filter(Boolean);
-      const aa = tokCoreName(cand.el.innerText || "").split(" ").filter(Boolean);
-      if (ta.some((w) => aa.indexOf(w) !== -1)) return true;
-    }
-    return false;
+  // El candidato ya pasó los filtros exactos (unidad + gramaje + producto).
+  function tokAccept(cand) {
+    return !!cand;
   }
 
   function tokToast() {
@@ -730,9 +715,9 @@
   }
 
   // Queries candidatas para el buscador del store, de la más específica a la más
-  // amplia. El pack ("18x40g") se descarta dejando el gramaje ("40g"), porque el
-  // store busca mejor por gramos; si no aparece nada se prueba sin números y por
-  // marca ("si o sí encontrar el producto").
+  // amplia, siempre filtradas por la unidad de venta pedida. El pack ("18x40g")
+  // se descarta dejando el gramaje ("40g"), porque el store busca mejor por
+  // gramos; si no aparece nada se prueba sin números y por marca.
   function tokBuildQueries(item) {
     const raw = String(item.producto || item.sku || "").trim();
     if (!raw) return [];
@@ -746,23 +731,33 @@
         out.push(q);
       }
     };
+    const unitWord = tokNorm(tokUnitLabel(item)); // bulto|display|unidad
+    const grams = tokGrams(raw);
+    const g0 = grams.length ? grams[0] : null;
+    const gramToken = g0 != null && Number.isInteger(g0) ? String(g0) + "g" : "";
     // 1) SKU exacto del pedido (ARC-XXXX), si existe: es la búsqueda más precisa
     const sku = String(item.sku || "").trim();
     if (sku) push(sku);
-    // 2) con el gramaje limpio ("ROCKLETS CONFITADOS 18x40g" -> "ROCKLETS CONFITADOS 40g")
-    push(raw.replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g"));
+    // 2) con el gramaje limpio ("ROCKLETS CONFITADOS 18x40g" -> "... 40g") + unidad
     push(
-      tokNorm(raw)
-        .replace(/\d+/g, " ")
-        .split(" ")
-        .filter((w) => w.length >= 3 && !TOK_STOP.has(w))
-        .join(" ")
+      raw.replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g") +
+        (unitWord ? " " + unitWord : "")
     );
-    push(
-      tokNorm(raw)
-        .split(" ")
-        .filter((w) => w.length >= 3 && !TOK_STOP.has(w))[0] || ""
-    );
+    // 3) palabras núcleo + gramaje + unidad
+    const words = tokNorm(raw)
+      .replace(/\d+/g, " ")
+      .split(" ")
+      .filter((w) => w.length >= 3 && !TOK_STOP.has(w))
+      .join(" ");
+    push(words + (gramToken ? " " + gramToken : "") + (unitWord ? " " + unitWord : ""));
+    // 4) primera palabra núcleo + unidad (amplia)
+    push((words.split(" ")[0] || "") + (unitWord ? " " + unitWord : ""));
+    // 5-7) sin unidad ni gramaje: el buscador del store exige AND de todos los
+    // términos, así que "display"/"14g" rompen la búsqueda; al final quedan las
+    // palabras clave, dos palabras y la marca sola (ej: "sonrisas", "top line").
+    push(words);
+    push(words.split(" ").slice(0, 2).join(" "));
+    push(words.split(" ")[0] || "");
     return out;
   }
 
@@ -864,22 +859,21 @@
       }
       const wantUnit = tokUnitLabel(it);
       const wantType = tokNorm(wantUnit);
-      const wantedDisplay = tokWantedDisplay(it);
+      const wantedGrams = tokGrams(String(it.producto || "") + " " + String(it.unidad || ""));
       const queries = tokBuildQueries(it);
-      const lastChance = job.qIdx >= queries.length - 1;
 
       const cand = await waitForTokin(
-        () => tokBestArticle(target, wantType, wantedDisplay),
+        () => tokBestArticle(target, wantType, wantedGrams),
         12000,
         350
       );
-      if (!cand || !tokAccept(cand, lastChance, target)) {
+      if (!cand || !tokAccept(cand)) {
         job.qIdx++;
         job.phase = "pending";
         await tokStoreSet(CART_JOB_KEY, job);
         return tokRunJob();
       }
-      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedDisplay);
+      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams);
       Object.assign(r, out);
     } catch (e) {
       r.message = "error: " + String((e && e.message) || e).slice(0, 140);
@@ -888,36 +882,31 @@
     return tokAdvance(job, r.ok);
   }
 
-  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedDisplay) {
+  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams) {
     const card = cand.el;
     const cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
     const out = { ok: false, message: "", storeName: cardText.slice(0, 90) };
-    let sizes = tokUnitSizes(cardText);
 
     let unitBtn = null;
-    if (cand.hasWanted) {
-      const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
+    const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
+    if (wantType && btns.length) {
       unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType));
     }
     if (unitBtn) {
       unitBtn.click();
       await toksleep(1500);
-    } else if (card.querySelector("[data-id=sku-selector-button]")) {
-      const anyBtn = card.querySelector("[data-id=sku-selector-button]");
+    } else if (btns.length) {
+      const anyBtn = btns[0];
       anyBtn.click();
       await toksleep(1500);
       out.message = "(sin botón de " + wantUnit + ", se usó " + (anyBtn.innerText || "").trim() + ")";
     }
 
-    let unitNote = "";
-    if (wantedDisplay != null && sizes.display != null && sizes.display !== wantedDisplay) {
-      unitNote = " (card: " + wantUnit.toLowerCase() + " de " + sizes.display + ", pedido " + wantedDisplay + ")";
-    }
     const isNoStock = /sin stock/i.test(cardText);
     const qty = Math.floor(Number(String(it.cantidad || "").replace(/[^\d.]/g, ""))) || 0;
 
     let nums = await waitForTokin(() => {
-      const c = tokBestArticle(target, wantType, wantedDisplay);
+      const c = tokBestArticle(target, wantType, wantedGrams);
       if (!c) return null;
       const els = c.el.querySelectorAll("input[type=number]");
       return els.length ? els : null;
@@ -925,27 +914,28 @@
 
     if (!nums) {
       const addBtn = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedDisplay);
+        const c = tokBestArticle(target, wantType, wantedGrams);
         if (!c) return null;
         const b = c.el.querySelector("[data-id=add-to-cart-button]");
         return b && !b.disabled ? b : null;
       }, 6000, 250);
       if (!addBtn) {
         out.message = isNoStock
-          ? "encontrado pero sin stock" + unitNote
-          : "sin botón Agregar habilitado" + unitNote;
+          ? "encontrado pero sin stock"
+          : "sin botón Agregar habilitado";
+        out.ok = !!isNoStock;
         return out;
       }
       addBtn.click();
       nums = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedDisplay);
+        const c = tokBestArticle(target, wantType, wantedGrams);
         if (!c) return null;
         const els = c.el.querySelectorAll("input[type=number]");
         return els.length ? els : null;
       }, 8000, 250);
       if (!nums) {
         out.ok = true;
-        out.message = "agregado sin poder fijar cantidad" + unitNote + out.message;
+        out.message = "agregado sin poder fijar cantidad" + out.message;
         return out;
       }
     }
@@ -954,10 +944,10 @@
       for (const el of nums) tokSetValue(el, String(qty));
       await toksleep(600);
       out.ok = true;
-      out.message = "agregado: " + qty + " " + wantUnit + unitNote + out.message;
+      out.message = "agregado: " + qty + " " + wantUnit + out.message;
     } else {
       out.ok = true;
-      out.message = "agregado sin cantidad" + unitNote + out.message;
+      out.message = "agregado sin cantidad" + out.message;
     }
     return out;
   }
