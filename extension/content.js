@@ -304,9 +304,15 @@
         inter += 1;
         continue;
       }
-      if (t.length < 4 || B.length > 80) continue;
+      if (t.length < 3 || B.length > 80) continue;
       for (const u of B) {
-        if (u.length < 4 || u[0] !== t[0]) continue;
+        if (u.length < 3 || u[0] !== t[0]) continue;
+        // Prefijo/abreviatura: "alf"~"alfajor", "top"~"topline", "xplos"~"xplosive".
+        // Los usuarios suelen abreviar o escribir mal en el pedido.
+        if (t.indexOf(u) === 0 || u.indexOf(t) === 0) {
+          inter += 0.9;
+          break;
+        }
         if (Math.abs(t.length - u.length) > 1) continue;
         if (tokLev(t, u) <= 1) {
           inter += 0.85;
@@ -365,12 +371,25 @@
     return Array.from(new Set((String(s || "").match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(",", "."))));
   }
 
-  // Nombre "nucleo": solo palabras de letras >= 2 chars (descarta x, gr, medidas, skus…).
+  // Nombre "nucleo": solo palabras de letras >= 2 chars, sin palabras de
+  // función/unidad (x, gr, display, bulto…) para que el matcheo por prefijos
+  // no falsee con "con"~"confitado" o "pack".
   function tokCoreName(s) {
     return tokNorm(s)
       .split(" ")
-      .filter((w) => /^[a-z]{2,}$/.test(w))
+      .filter((w) => /^[a-z]{2,}$/.test(w) && !TOK_STOP.has(w))
       .join(" ");
+  }
+
+  // Compara dos palabras del nombre núcleo tolerando errores de tipeo del
+  // pedido: iguales, prefijo/abreviatura ("alf"~"alfajor") o distancia 1.
+  function tokWordMatch(a, b) {
+    if (a === b) return true;
+    if (a.length < 3 || b.length < 3) return false;
+    if (a.indexOf(b) === 0 || b.indexOf(a) === 0) return true;
+    if (Math.abs(a.length - b.length) > 1) return false;
+    if (a[0] !== b[0]) return false;
+    return tokLev(a, b) <= 1;
   }
 
   // Puntaje de articulo: max entre sim. completa y sim. del nombre nucleo, mas bonus
@@ -410,6 +429,21 @@
     return s;
   }
 
+  // Extrae el código ARC-XXXX de una card y devuelve sus dígitos (o null).
+  function tokArcCode(text) {
+    const m = String(text || "").match(/ARC-?(\d+)/i);
+    return m ? m[1] : null;
+  }
+
+  // Empatar el código del pedido con el de la card: el SKU del archivo ("13357",
+  // "11913" o "ARC-1013357") es sufijo del ARC del store ("ARC-1013357").
+  function tokSkuMatch(cardText, sku) {
+    const d = String(sku || "").replace(/\D+/g, "");
+    if (!d) return false;
+    const arc = tokArcCode(cardText);
+    return !!arc && (arc.endsWith(d) || d.endsWith(arc));
+  }
+
   // Un boton de unidad coincide si alguna de sus palabras es el tipo o un sinonimo
   // ("x Pack" es Display en la tienda de Tokin).
   function tokUnitBtnMatch(btnText, type) {
@@ -439,16 +473,21 @@
   }
 
   // La unidad pedida tiene MÁXIMA jerarquía: solo entran cards que ofrezcan el
-  // botón exacto (o, para "unidad", cards sin selector de unidad). El gramaje
-  // debe coincidir exacto y el producto debe compartir palabras núcleo exactas
-  // (el store puede omitir el sabor, ej: SONRISAS; lo deciden gramaje + unidad).
-  // Entre los válidos gana el que comparte más palabras y mejor puntaje.
-  function tokBestArticle(target, wantType, wantedGrams) {
+  // botón exacto (o, para "unidad", cards sin selector de unidad). El producto
+  // debe compartir palabras núcleo exactas o tolerables (abreviaturas como
+  // "alf"~"alfajor", "top"~"topline", palabras repetidas). El gramaje es una
+  // señal de desempate en el puntaje, no un filtro duro: el archivo puede
+  // traer gramaje mal escrito (ej. "TOP LINE 7 XPLOS MINT 16x14g" y el store
+  // vende la lata "x 24gr"); entre cards válidos gana el que comparte más
+  // palabras y mejor puntaje (con bonus por gramaje coincidente). El CÓDIGO
+  // del pedido (sku) es desempate: entre cards con igual cantidad de palabras
+  // compartidas gana la cuyo ARC-XXXX termina con el sku del archivo.
+  function tokBestArticle(target, wantType, wantedGrams, sku) {
     const arts = Array.from(document.querySelectorAll("article")).filter(
       (a) => a.getAttribute("data-id") !== "cart-product-card" && tokIsProductCard(a)
     );
     if (!arts.length) return null;
-    const targetCore = tokCoreName(target).split(" ").filter(Boolean);
+    const targetCore = Array.from(new Set(tokCoreName(target).split(" ").filter(Boolean)));
     let best = null;
     let bestShared = -1;
     let bestScore = -1;
@@ -469,16 +508,24 @@
         hasWanted = wantType === "unidad" || isNoStock;
       }
       if (!hasWanted) continue;
-      const grams = tokGrams(t);
-      if (wantedGrams.length && !grams.some((g) => wantedGrams.indexOf(g) !== -1)) continue;
-      const cardCore = tokCoreName(t).split(" ").filter(Boolean);
-      const shared = targetCore.filter((w) => cardCore.indexOf(w) !== -1).length;
+      const cardCore = Array.from(new Set(tokCoreName(t).split(" ").filter(Boolean)));
+      let shared = 0;
+      for (const w of targetCore) {
+        if (cardCore.some((c) => tokWordMatch(w, c))) shared++;
+      }
       if (!shared) continue;
+      const codeMatch = tokSkuMatch(t, sku);
       const s = tokArticleScore(target, t);
-      if (!best || shared > bestShared || (shared === bestShared && s > bestScore)) {
+      const better =
+        !best ||
+        shared > bestShared ||
+        (shared === bestShared &&
+          ((codeMatch && !best.codeMatch) ||
+            (codeMatch === best.codeMatch && s > bestScore)));
+      if (better) {
         bestShared = shared;
         bestScore = s;
-        best = { el: a, score: s, shared };
+        best = { el: a, score: s, shared, codeMatch };
       }
     }
     return best;
@@ -863,7 +910,7 @@
       const queries = tokBuildQueries(it);
 
       const cand = await waitForTokin(
-        () => tokBestArticle(target, wantType, wantedGrams),
+        () => tokBestArticle(target, wantType, wantedGrams, it.sku),
         12000,
         350
       );
@@ -906,7 +953,7 @@
     const qty = Math.floor(Number(String(it.cantidad || "").replace(/[^\d.]/g, ""))) || 0;
 
     let nums = await waitForTokin(() => {
-      const c = tokBestArticle(target, wantType, wantedGrams);
+      const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
       if (!c) return null;
       const els = c.el.querySelectorAll("input[type=number]");
       return els.length ? els : null;
@@ -914,7 +961,7 @@
 
     if (!nums) {
       const addBtn = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams);
+        const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
         if (!c) return null;
         const b = c.el.querySelector("[data-id=add-to-cart-button]");
         return b && !b.disabled ? b : null;
@@ -928,7 +975,7 @@
       }
       addBtn.click();
       nums = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams);
+        const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
         if (!c) return null;
         const els = c.el.querySelectorAll("input[type=number]");
         return els.length ? els : null;

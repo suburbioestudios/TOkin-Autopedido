@@ -323,10 +323,13 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     ui.session = pong.session;
     $("#user-info").textContent = pong.session.email || "No logueado";
     if (!pong.session.email) {
-      // Sesión de Tokin cerrada o vencida: limpiar los datos del pedido anterior.
-      await toOff({ type: "CLEAR" });
-      await toSw({ type: "CLEAR_PERSIST" });
-      showAccess("Iniciá sesión en el store de Tokin para usar la herramienta.");
+      // Sesión de Tokin cerrada o vencida: se conservan los datos del pedido
+      // hasta que el usuario toque «Reanudar» (el resultado final es parte de
+      // la sesión abierta y no se pierde al cerrar o minimizar el popup).
+      showAccess(
+        "Iniciá sesión en el store de Tokin para usar la herramienta. " +
+        "Tu pedido sigue guardado hasta que toques «Reanudar»."
+      );
       return;
     }
     $("#cfg-session").textContent = "Tu email de sesión: " + pong.session.email;
@@ -340,14 +343,10 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       }
       const st = await toOff({ type: "GET_STATE" });
       if (st && st.ok) {
-        // Si la tarea ya terminó en una sesión anterior del popup, al reabrir se
-        // arranca limpio para el próximo pedido (el resultado quedó visible antes).
-        if (st.state && st.state.status === "done") {
-          await toOff({ type: "CLEAR" });
-          resetUi();
-        } else {
-          applyState(st.state);
-        }
+        // La sesión queda cargada tal como estaba aunque el popup se haya
+        // cerrado o minimizado; solo «Reanudar» o «Terminar» limpian el
+        // formulario.
+        applyState(st.state);
       }
     }
   }
