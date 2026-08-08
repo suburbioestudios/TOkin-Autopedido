@@ -4,7 +4,49 @@
 // el offscreen, 100% local en el navegador (sin servidor y sin OAuth embebido).
 
 const OFFLINE_URL = "offscreen/offscreen.html";
+const CART_JOB_KEY = "tokinCartJob";
+const CART_CANCEL_KEY = "tokinCartCancel";
+const CART_RUNNING_TAB_KEY = "tokinCartRunningTab";
 let ensuring = null;
+
+// Frena toda la automatización de carrito por interrupción del sistema
+// (pestaña cerrada, sesión cerrada): marca cancelado con motivo "stop" (el
+// content script aborta en su siguiente chequeo sin marcar "canceled") y avisa
+// al offscreen para que vuelva al paso de líneas capturadas (la tarea no
+// terminó con confirmación del usuario).
+function stopRunningCart() {
+  chrome.storage.local.set({ [CART_CANCEL_KEY]: "stop" }, () => { void chrome.runtime.lastError; });
+  try {
+    chrome.runtime.sendMessage({ target: "offscreen", type: "CART_STOP" }, () => { void chrome.runtime.lastError; });
+  } catch (e) {}
+}
+
+// Si la pestaña que corría el lote se cierra, la tarea se detiene.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.local.get([CART_RUNNING_TAB_KEY], (d) => {
+    if (d && d[CART_RUNNING_TAB_KEY] === tabId) {
+      stopRunningCart();
+      chrome.storage.local.remove(CART_RUNNING_TAB_KEY, () => { void chrome.runtime.lastError; });
+    }
+  });
+});
+
+// Si la sesión se cierra (navegación a /store/login) durante un lote, se detiene.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  const url = String(changeInfo.url || "");
+  if (url.indexOf("/store/login") === -1) return;
+  chrome.storage.local.get([CART_RUNNING_TAB_KEY], (d) => {
+    if (d && d[CART_RUNNING_TAB_KEY] === tabId) stopRunningCart();
+  });
+});
+
+// Cuando el job desaparece (terminó/canceló/abortó), se deja de rastrear la pestaña.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[CART_JOB_KEY] && !changes[CART_JOB_KEY].newValue) {
+    chrome.storage.local.remove(CART_RUNNING_TAB_KEY, () => { void chrome.runtime.lastError; });
+  }
+});
 
 function tokMainBridge() {
   try {
@@ -95,7 +137,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, message: "Abrí la pestaña del store para cargar el carrito." });
           return;
         }
-        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", items: msg.items || [] }, (res) => {
+        chrome.storage.local.set({ [CART_RUNNING_TAB_KEY]: store.id }, () => { void chrome.runtime.lastError; });
+        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [] }, (res) => {
           if (chrome.runtime.lastError) {
             sendResponse({ ok: false, message: chrome.runtime.lastError.message });
           } else {
@@ -106,7 +149,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
     if (msg.type === "CANCEL_CART") {
-      chrome.storage.local.set({ tokinCartCancel: true }, () => { void chrome.runtime.lastError; });
+      chrome.storage.local.set({ tokinCartCancel: "user" }, () => { void chrome.runtime.lastError; });
       chrome.tabs.query({}, (tabs) => {
         const store = tabs.find(
           (t) => t.id && t.url && t.url.indexOf("tokintienda.com.ar/store") !== -1
@@ -139,6 +182,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === "GET_MANIFEST") {
     sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
+    return true;
+  }
+  if (msg && msg.type === "GET_TAB_ID") {
+    sendResponse({ ok: true, tabId: sender && sender.tab ? sender.tab.id : null });
     return true;
   }
   return false;

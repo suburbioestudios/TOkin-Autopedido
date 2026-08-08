@@ -817,7 +817,7 @@
     } catch (e) {}
   }
 
-  async function tokCartStart(items) {
+  async function tokCartStart(items, tabId) {
     cartCancel = false;
     const existing = await tokStoreGet(CART_JOB_KEY);
     if (existing) {
@@ -844,6 +844,12 @@
       total: clean.length,
       phase: "pending",
       query: "",
+      // El job queda ligado a la pestaña y a la sesión que lo lanzó: si la
+      // pestaña se cierra, se cierra la sesión o pasa demasiado tiempo, la
+      // automatización NO se reanuda sola desde una sesión anterior.
+      tabId: tabId || null,
+      email: getSessionInfo().email,
+      started: Date.now(),
     };
     await tokStoreRemove(CART_CANCEL_KEY);
     await tokStoreSet(CART_JOB_KEY, job);
@@ -853,11 +859,22 @@
     return { ok: true, started: true, total: clean.length };
   }
 
+  // Motivo de cancelación: "stop" = interrupción del sistema (pestaña o sesión
+  // cerrada, lote huérfano) → volver al paso de líneas; "user" = cancelación
+  // explícita → marcar canceled.
+  async function tokCancelReason() {
+    const v = await tokStoreGet(CART_CANCEL_KEY);
+    return v === "stop" ? "stop" : v ? "user" : "";
+  }
+
   async function tokRunJob() {
     try {
       const job = await tokStoreGet(CART_JOB_KEY);
       if (!job || job.phase === "done") return;
-      if (cartCancel || (await tokStoreGet(CART_CANCEL_KEY))) return tokAbortCart(job);
+      // Si la sesión de Tokin se cerró, se frena todo (sin reanudar después).
+      if (job.email && getSessionInfo().email !== job.email) return tokAbortCart(job, true);
+      const reason = cartCancel ? "user" : await tokCancelReason();
+      if (reason) return tokAbortCart(job, reason === "stop");
       if (job.phase === "pending") {
         const it = job.items[job.index];
         const queries = tokBuildQueries(it);
@@ -896,7 +913,8 @@
   async function tokProcessCurrentItem() {
     const job = await tokStoreGet(CART_JOB_KEY);
     if (!job) return;
-    if (cartCancel || (await tokStoreGet(CART_CANCEL_KEY))) return tokAbortCart(job);
+    const reason = cartCancel ? "user" : await tokCancelReason();
+    if (reason) return tokAbortCart(job, reason === "stop");
     const it = job.items[job.index];
     const r = { producto: it.producto || it.sku || "", ok: false, message: "", storeName: "" };
     try {
@@ -1051,47 +1069,71 @@
     } catch (e) {}
   }
 
-  async function tokAbortCart(job) {
+  async function tokAbortCart(job, interrupted) {
     await tokStoreRemove(CART_JOB_KEY);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
-    tokToastSet("Carga cancelada.", "");
+    tokToastSet(interrupted ? "Tarea interrumpida (pestaña o sesión cerrada)." : "Carga cancelada.", "");
+    try {
+      // interrupted: la pestaña/sesión se cerró o el lote quedó huérfano → el
+      // offscreen vuelve al paso de líneas capturadas (CART_STOP), no a
+      // "canceled": la tarea no terminó con confirmación del usuario.
+      chrome.runtime.sendMessage(
+        interrupted
+          ? { target: "offscreen", type: "CART_STOP" }
+          : {
+              target: "offscreen",
+              type: "CART_DONE",
+              canceled: true,
+              total: (job && job.total) || 0,
+              results: (job && job.results) || [],
+            },
+        () => { void chrome.runtime.lastError; }
+      );
+    } catch (e) {}
     try {
       window.postMessage(
         { __tok: "cart-res", payload: { done: true, canceled: true, total: (job && job.total) || 0, results: (job && job.results) || [] } },
         "*"
       );
     } catch (e) {}
-    try {
-      chrome.runtime.sendMessage(
-        {
-          target: "offscreen",
-          type: "CART_DONE",
-          canceled: true,
-          total: (job && job.total) || 0,
-          results: (job && job.results) || [],
-        },
-        () => { void chrome.runtime.lastError; }
-      );
-    } catch (e) {}
   }
 
-  function resumeCart() {
+  function tokGetTabId() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "GET_TAB_ID" }, (r) => {
+          resolve((r && r.ok && r.tabId) || null);
+        });
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // Reanudar tras una navegación del MISMO lote. Se exige que el job siga
+  // siendo de la MISMA pestaña y de la MISMA sesión de Tokin y que no esté
+  // vencido: un job huérfano de una sesión anterior (pestaña cerrada, logout,
+  // tiempo) se aborta y NO se reanuda.
+  async function resumeCart() {
     try {
-      chrome.storage.local.get([CART_JOB_KEY, CART_CANCEL_KEY], (d) => {
-        if (chrome.runtime.lastError) return;
-        const cancel = d && d[CART_CANCEL_KEY];
-        const job = d && d[CART_JOB_KEY];
-        if (!job) return;
-        if (cancel) {
-          tokAbortCart(job);
-          return;
-        }
-        if (job.phase === "searching" && location.href.indexOf("/store/search") !== -1) {
-          setTokRun(true);
-          tokRunJob();
-        }
-      });
+      const d = await new Promise((res) =>
+        chrome.storage.local.get([CART_JOB_KEY, CART_CANCEL_KEY], (x) => res(x || {}))
+      );
+      const cancel = d[CART_CANCEL_KEY];
+      const job = d[CART_JOB_KEY];
+      if (!job) return;
+      if (cancel) return tokAbortCart(job, cancel === "stop");
+      const email = getSessionInfo().email;
+      const lostSession = (job.email && (!email || email !== job.email));
+      const stale = lostSession || (job.started && Date.now() - job.started > 60 * 60 * 1000);
+      if (stale) return tokAbortCart(job, true);
+      if (job.tabId) {
+        const me = await tokGetTabId();
+        if (!me || me !== job.tabId) return tokAbortCart(job, true);
+      }
+      if (job.phase === "searching" && location.href.indexOf("/store/search") !== -1) {
+        setTokRun(true);
+        tokRunJob();
+      }
     } catch (e) {}
   }
 
@@ -1149,13 +1191,13 @@
         sendResponse({ ok: true });
         break;
       case "ADD_TO_CART":
-        tokCartStart(msg.items || [])
+        tokCartStart(msg.items || [], msg.tabId)
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
         break;
       case "CANCEL_CART":
         cartCancel = true;
-        tokStoreSet(CART_CANCEL_KEY, true);
+        tokStoreSet(CART_CANCEL_KEY, "user");
         sendResponse({ ok: true });
         break;
       case "SHOW_PICKER":

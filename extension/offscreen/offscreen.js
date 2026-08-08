@@ -125,6 +125,13 @@ function summarizeMsg(doc) {
 }
 
 async function runParse(filename, data) {
+  // Entrar un documento nuevo frena cualquier automatización de carrito que
+  // haya quedado corriendo de una tarea anterior.
+  if (state.status === "loading_cart") {
+    sendSw({ type: "CANCEL_CART" });
+    state.cart = null;
+    state.cartProgress = null;
+  }
   state.cancelRequested = false;
   state.filename = filename;
   state.error = "";
@@ -209,6 +216,9 @@ async function runCart() {
 }
 
 function applyCartDone(msg) {
+  // Si ya se ingresó otro documento mientras corría el lote, el resultado
+  // viejo NO pisa la sesión nueva.
+  if (state.status !== "loading_cart") return;
   if (!msg || !msg.canceled) {
     const results = (msg && msg.results) || [];
     state.cart = {
@@ -446,6 +456,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: true });
       break;
+    case "CART_STOP":
+      // El lote quedó huérfano (pestaña o sesión cerrada): vuelve al paso de
+      // líneas capturadas. La tarea no terminó con confirmación del usuario,
+      // así que NO se marca "canceled" y NO se limpia la sesión.
+      if (state.status === "loading_cart") {
+        state.cart = null;
+        state.cartProgress = null;
+        state.cartCanceled = false;
+        setStatus("idle", "", 1);
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
     case "CART_DONE":
       applyCartDone(msg);
       persist();
@@ -502,6 +526,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 setInterval(() => {
   safeSend({ target: "sw", type: "HEARTBEAT" });
 }, 20000);
+
+// Al recrear el offscreen (Chrome lo cierra y se vuelve a abrir) se restaura la
+// sesión previa: el formulario queda en el paso donde estaba. Un lote a medias
+// no se resume: si la sesión persistida quedó "cargando", vuelve a "idle"
+// (las líneas capturadas quedan y "Enviar a carrito" queda disponible).
+function restoreSession() {
+  sendSw({ type: "GET_STATE" }).then((res) => {
+    try {
+      const s = (res && res.ok && res.state) || null;
+      if (!s) return;
+      if (s.status === "loading_cart") {
+        state.status = "idle";
+        state.step = 1;
+        state.progress = "";
+        state.cart = null;
+        state.cartProgress = null;
+      } else {
+        state.status = s.status || "idle";
+        state.step = s.step || 1;
+        state.progress = s.progress || "";
+        state.filename = s.filename || "";
+        state.error = s.error || "";
+        state.summary = s.summary || null;
+        state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
+        state.cart = s.cart || null;
+        state.cartProgress = s.cartProgress || null;
+      }
+      persist();
+      emitState();
+    } catch (e) {}
+  });
+}
+restoreSession();
 
 // Hook de depuracion para tests automatizados (solo con ?debug=1).
 if (new URLSearchParams(location.search).get("debug") === "1") {
