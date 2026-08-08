@@ -192,6 +192,13 @@ th { background: var(--violet-soft); color: var(--violet-dark); font-weight: 700
 tr:nth-child(even) td { background: #faf8ff; }
 #items-box .mono { font-family: Consolas, monospace; font-size: 11px; white-space: nowrap; }
 #items-box { margin-top: 10px; }
+#items-box td.editable { cursor: text; }
+#items-box td.editable:hover { outline: 1px dashed var(--violet); }
+#items-box .cell-input {
+  width: 100%; box-sizing: border-box;
+  border: 1px solid var(--violet); border-radius: 4px;
+  padding: 2px 4px; font: inherit; background: #fff;
+}
 .cart-row {
   display: flex; justify-content: space-between; gap: 8px;
   padding: 6px 8px; border-radius: 8px; margin: 3px 0;

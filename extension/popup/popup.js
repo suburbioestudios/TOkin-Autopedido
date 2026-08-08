@@ -212,19 +212,69 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
       return;
     }
-    let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
+    let html =
+      '<table><thead><tr><th>#</th><th>Código</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
     items.forEach((it, i) => {
       const unidad = it.categoria || it.unidad || "";
       html +=
         "<tr>" +
         '<td class="mono">' + (i + 1) + "</td>" +
-        "<td>" + esc(it.producto) + "</td>" +
-        "<td>" + esc(it.cantidad) + "</td>" +
-        "<td>" + esc(unidad) + "</td>" +
+        '<td class="mono editable" data-i="' + i + '" data-field="sku" title="Doble clic para editar">' + esc(it.sku || "") + "</td>" +
+        '<td class="editable" data-i="' + i + '" data-field="producto" title="Doble clic para editar">' + esc(it.producto) + "</td>" +
+        '<td class="editable" data-i="' + i + '" data-field="cantidad" title="Doble clic para editar">' + esc(it.cantidad) + "</td>" +
+        '<td class="editable" data-i="' + i + '" data-field="unidad" title="Doble clic para editar">' + esc(unidad) + "</td>" +
         "</tr>";
     });
     html += "</tbody></table>";
     box.innerHTML = html;
+  }
+
+  // Doble clic sobre una celda de la tabla: el casillero pasa a editable como
+  // texto; Enter/Enter fuera confirma y Escape cancela. Los cambios se persisten
+  // en la sesión del offscreen (UPDATE_LINE_ITEMS) para que la carga al carrito
+  // use los valores corregidos.
+  function startCellEdit(td) {
+    const i = Number(td.dataset.i);
+    const field = td.dataset.field;
+    const items = ui.lineItems || [];
+    if (!(i >= 0) || !items[i] || td.querySelector("input")) return;
+    const current = String(items[i][field] == null ? "" : items[i][field]);
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "cell-input";
+    input.value = current;
+    td.textContent = "";
+    td.appendChild(input);
+    input.focus();
+    input.select();
+    let finished = false;
+    const commit = (save) => {
+      if (finished) return;
+      finished = true;
+      if (save) {
+        const v = input.value;
+        if (v !== current) {
+          items[i][field] = v;
+          if (field === "unidad") items[i].categoria = v;
+          pushItems();
+        }
+      }
+      renderItems();
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        commit(true);
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        commit(false);
+      }
+    });
+    input.addEventListener("blur", () => commit(true));
+  }
+
+  function pushItems() {
+    toOff({ type: "UPDATE_LINE_ITEMS", items: ui.lineItems });
   }
 
   function renderCartResults(results, box) {
@@ -468,6 +518,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     }
     setAction("cancelCart");
     setStatus("Cargando carrito…");
+    await toOff({ type: "UPDATE_LINE_ITEMS", items: ui.lineItems });
     const res = await toOff({ type: "ADD_TO_CART" });
     if (!res || !res.ok) {
       setStatus((res && res.message) || "El store no respondió.", "err");
@@ -585,6 +636,10 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     $("#btn-open-store").addEventListener("click", abrirStore);
     $("#btn-clear").addEventListener("click", terminar);
     $("#btn-reset").addEventListener("click", reanudar);
+    $("#items-box").addEventListener("dblclick", (e) => {
+      const td = e.target && e.target.closest ? e.target.closest("td[data-field]") : null;
+      if (td) startCellEdit(td);
+    });
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

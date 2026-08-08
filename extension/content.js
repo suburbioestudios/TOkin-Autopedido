@@ -516,12 +516,14 @@
       if (!shared) continue;
       const codeMatch = tokSkuMatch(t, sku);
       const s = tokArticleScore(target, t);
+      // Jerarquía de confirmación: CÓDIGO (ARC del store == sku del pedido) >
+      // NOMBRE (palabras núcleo compartidas) > GRAMAJE (bonus en el puntaje) >
+      // UNIDAD (filtro duro de botón exacto, ya aplicado arriba).
       const better =
         !best ||
-        shared > bestShared ||
-        (shared === bestShared &&
-          ((codeMatch && !best.codeMatch) ||
-            (codeMatch === best.codeMatch && s > bestScore)));
+        (codeMatch && !best.codeMatch) ||
+        (codeMatch === best.codeMatch &&
+          (shared > bestShared || (shared === bestShared && s > bestScore)));
       if (better) {
         bestShared = shared;
         bestScore = s;
@@ -943,10 +945,11 @@
       unitBtn.click();
       await toksleep(1500);
     } else if (btns.length) {
-      const anyBtn = btns[0];
-      anyBtn.click();
-      await toksleep(1500);
-      out.message = "(sin botón de " + wantUnit + ", se usó " + (anyBtn.innerText || "").trim() + ")";
+      // La card pasó el filtro de unidad pero no ofrece el botón exacto de la
+      // unidad pedida: NO se elige otra unidad, el pedido pide exactamente esa.
+      out.message = "la card no ofrece el botón de " + wantUnit + " pedido";
+      out.ok = false;
+      return out;
     }
 
     const isNoStock = /sin stock/i.test(cardText);

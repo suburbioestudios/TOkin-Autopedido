@@ -421,6 +421,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
       return true;
+    case "UPDATE_LINE_ITEMS":
+      // El popup permitió editar las filas (doble clic): se persisten los
+      // cambios en la sesión para que la carga al carrito use los valores
+      // corregidos por el usuario.
+      if (Array.isArray(msg.items) && state.status !== "loading_cart") {
+        state.line_items = msg.items;
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
     case "GET_STATE":
       sendResponse({ ok: true, state: sessionView() });
       break;
