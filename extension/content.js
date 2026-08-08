@@ -402,7 +402,7 @@
     const re = /(\d+(?:[.,]\d+)?)\s*(?:g|gr|grs|gramo|gramos|kg)\b/g;
     while ((m = re.exec(t))) {
       const v = parseFloat(m[1].replace(",", "."));
-      if (!isNaN(v) && out.indexOf(v) === -1) out.push(v);
+      if (!isNaN(v) && v > 0 && out.indexOf(v) === -1) out.push(v);
     }
     return out;
   }
@@ -421,7 +421,8 @@
     const tg = tokGrams(target);
     const ag = tokGrams(articleText);
     if (tg.length && ag.length) {
-      for (const g of tg) if (ag.indexOf(g) !== -1) {
+      // Gramaje comparado con redondeo: "73" == "73,5" (TOFI x73 vs ByN x73,5gr).
+      for (const g of tg) if (ag.some((a) => Math.round(a) === Math.round(g))) {
         s += 0.2;
         break;
       }
@@ -454,6 +455,20 @@
     );
   }
 
+  // De un botón de unidad ("x Display", "10% OFF x Bulto") devuelve el nombre
+  // de la unidad normalizado ("Display") o "" si no se reconoce.
+  function tokUnitLabelFromBtn(btnText) {
+    const words = tokNorm(btnText).split(" ");
+    const names = { display: "Display", bulto: "Bulto", unidad: "Unidad", caja: "Caja" };
+    for (const key of ["display", "bulto", "unidad", "caja"]) {
+      const aliases = TOK_UNIT_ALIASES[key];
+      if (words.some((w) => aliases.some((al) => (al.length >= 3 ? w === al || w.indexOf(al) === 0 : w === al)))) {
+        return names[key];
+      }
+    }
+    return "";
+  }
+
   // Una card de producto real tiene precio, SKU ARC-*, botones de unidad o de
   // Agregar (o dice "sin stock"). Los <article> del footer/Institucional no.
   function tokIsProductCard(a) {
@@ -472,62 +487,70 @@
     return false;
   }
 
-  // La unidad pedida tiene MÁXIMA jerarquía: solo entran cards que ofrezcan el
-  // botón exacto (o, para "unidad", cards sin selector de unidad). El producto
-  // debe compartir palabras núcleo exactas o tolerables (abreviaturas como
-  // "alf"~"alfajor", "top"~"topline", palabras repetidas). El gramaje es una
-  // señal de desempate en el puntaje, no un filtro duro: el archivo puede
-  // traer gramaje mal escrito (ej. "TOP LINE 7 XPLOS MINT 16x14g" y el store
-  // vende la lata "x 24gr"); entre cards válidos gana el que comparte más
-  // palabras y mejor puntaje (con bonus por gramaje coincidente). El CÓDIGO
-  // del pedido (sku) es desempate: entre cards con igual cantidad de palabras
-  // compartidas gana la cuyo ARC-XXXX termina con el sku del archivo.
+  // La unidad pedida es MÁXIMA jerarquía SOLO para el matcheo por nombre. Si el
+  // pedido trae sku y existe la card del store con ese código (ARC-sufijo), esa
+  // card ES el producto: es candidata aunque no ofrezca la unidad pedida (y en
+  // ese caso se agrega en la unidad disponible, nunca otro producto). Sin
+  // código, solo entran cards que ofrezcan el botón exacto de la unidad (o
+  // "unidad"/"sin stock" sin selector). El producto debe compartir palabras
+  // núcleo exactas o tolerables (abreviaturas como "alf"~"alfajor", "top"~
+  // "topline", palabras repetidas). El gramaje es señal de desempate con
+  // redondeo (73 ≈ 73,5). Entre cards válidos gana el que comparte más palabras
+  // y mejor puntaje; el CÓDIGO del pedido (sku) es desempate principal.
   function tokBestArticle(target, wantType, wantedGrams, sku) {
     const arts = Array.from(document.querySelectorAll("article")).filter(
       (a) => a.getAttribute("data-id") !== "cart-product-card" && tokIsProductCard(a)
     );
     if (!arts.length) return null;
     const targetCore = Array.from(new Set(tokCoreName(target).split(" ").filter(Boolean)));
-    let best = null;
-    let bestShared = -1;
-    let bestScore = -1;
+    const parsed = [];
     for (let i = 0; i < arts.length; i++) {
       const a = arts[i];
       const t = (a.innerText || "").replace(/\s+/g, " ");
       const btns = Array.from(a.querySelectorAll("[data-id=sku-selector-button]"));
-      const hasSelector = btns.length > 0;
-      const isNoStock = /sin stock/i.test(t);
-      let hasWanted;
-      if (!wantType) {
-        hasWanted = true;
-      } else if (hasSelector) {
-        hasWanted = btns.some((b) => tokUnitBtnMatch(b.innerText || "", wantType));
-      } else {
-        // Sin botones de unidad: solo entra si se pide "unidad" o si la card está
-        // sin stock (no se puede verificar la unidad, pero tampoco agregar nada).
-        hasWanted = wantType === "unidad" || isNoStock;
-      }
-      if (!hasWanted) continue;
       const cardCore = Array.from(new Set(tokCoreName(t).split(" ").filter(Boolean)));
       let shared = 0;
       for (const w of targetCore) {
         if (cardCore.some((c) => tokWordMatch(w, c))) shared++;
       }
-      if (!shared) continue;
-      const codeMatch = tokSkuMatch(t, sku);
-      const s = tokArticleScore(target, t);
-      // Jerarquía de confirmación: CÓDIGO (ARC del store == sku del pedido) >
-      // NOMBRE (palabras núcleo compartidas) > GRAMAJE (bonus en el puntaje) >
-      // UNIDAD (filtro duro de botón exacto, ya aplicado arriba).
+      parsed.push({
+        el: a,
+        btns,
+        codeMatch: tokSkuMatch(t, sku),
+        shared,
+        score: tokArticleScore(target, t),
+      });
+    }
+    // 1) Código del pedido: si alguna card matchea el sku, solo esas son candidatas
+    // (nunca se agrega un producto distinto cuando el pedido existe en el store).
+    const byCode = parsed.filter((p) => p.codeMatch);
+    const pool = byCode.length ? byCode : parsed.filter((p) => p.shared > 0);
+    if (!pool.length) return null;
+    let best = null;
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i];
+      if (!p.codeMatch) {
+        // Sin código: filtro duro de unidad.
+        const t = (p.el.innerText || "");
+        const isNoStock = /sin stock/i.test(t);
+        const hasSelector = p.btns.length > 0;
+        let hasWanted;
+        if (!wantType) {
+          hasWanted = true;
+        } else if (hasSelector) {
+          hasWanted = p.btns.some((b) => tokUnitBtnMatch(b.innerText || "", wantType));
+        } else {
+          hasWanted = wantType === "unidad" || isNoStock;
+        }
+        if (!hasWanted) continue;
+      }
       const better =
         !best ||
-        (codeMatch && !best.codeMatch) ||
-        (codeMatch === best.codeMatch &&
-          (shared > bestShared || (shared === bestShared && s > bestScore)));
+        (p.codeMatch && !best.codeMatch) ||
+        (p.codeMatch === best.codeMatch &&
+          (p.shared > best.shared || (p.shared === best.shared && p.score > best.score)));
       if (better) {
-        bestShared = shared;
-        bestScore = s;
-        best = { el: a, score: s, shared, codeMatch };
+        best = { el: p.el, btns: p.btns, score: p.score, shared: p.shared, codeMatch: p.codeMatch };
       }
     }
     return best;
@@ -955,23 +978,43 @@
     const out = { ok: false, message: "", storeName: cardText.slice(0, 90) };
 
     let unitBtn = null;
+    let usedUnit = wantUnit;
+    let unitNote = "";
     const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
     if (wantType && btns.length) {
-      unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType));
+      unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType)) || null;
     }
     if (unitBtn) {
       unitBtn.click();
       await toksleep(1500);
     } else if (btns.length) {
-      // La card pasó el filtro de unidad pero no ofrece el botón exacto de la
-      // unidad pedida: NO se elige otra unidad, el pedido pide exactamente esa.
-      out.message = "la card no ofrece el botón de " + wantUnit + " pedido";
-      out.ok = false;
-      return out;
+      if (cand.codeMatch) {
+        // Producto confirmado por CÓDIGO: la card no ofrece la unidad pedida.
+        // Se agrega en la primera unidad disponible (no se usa otro producto).
+        const uName = tokUnitLabelFromBtn(btns[0].innerText || "");
+        unitBtn = btns[0];
+        usedUnit = uName || wantUnit;
+        unitNote = " (la card solo ofrece " + (uName || "otra unidad") + ")";
+        unitBtn.click();
+        await toksleep(1500);
+      } else {
+        // Sin código confirmado: NO se elige otra unidad, el pedido pide esa.
+        out.message = "la card no ofrece el botón de " + wantUnit + " pedido";
+        out.ok = false;
+        return out;
+      }
     }
 
     const isNoStock = /sin stock/i.test(cardText);
     const qty = Math.floor(Number(String(it.cantidad || "").replace(/[^\d.]/g, ""))) || 0;
+
+    if (qty > 999) {
+      out.ok = false;
+      out.message =
+        "cantidad " + it.cantidad + " parece un error de lectura (límite 999): " +
+        "corregila en la tabla y volvé a enviar";
+      return out;
+    }
 
     let nums = await waitForTokin(() => {
       const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
@@ -1003,7 +1046,7 @@
       }, 8000, 250);
       if (!nums) {
         out.ok = true;
-        out.message = "agregado sin poder fijar cantidad" + out.message;
+        out.message = "agregado sin poder fijar cantidad" + unitNote;
         return out;
       }
     }
@@ -1012,10 +1055,10 @@
       for (const el of nums) tokSetValue(el, String(qty));
       await toksleep(600);
       out.ok = true;
-      out.message = "agregado: " + qty + " " + wantUnit + out.message;
+      out.message = "agregado: " + qty + " " + usedUnit + unitNote;
     } else {
       out.ok = true;
-      out.message = "agregado sin cantidad" + out.message;
+      out.message = "agregado sin cantidad" + unitNote;
     }
     return out;
   }
