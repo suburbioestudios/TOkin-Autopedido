@@ -331,6 +331,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     let html = wasCanceled
       ? "Carga cancelada. Lo que alcanzó a procesarse quedó en el carrito del store."
       : "El pedido quedó cargado en el carrito del store.";
+    if (c.docName) html += "\nDocumento procesado: " + c.docName + ".";
     if (c.total) html += "\nLíneas: " + c.ok + " de " + c.total + ".";
     $("#done-summary").textContent = html;
     renderCartResults(c.results, $("#cart-results-final"));

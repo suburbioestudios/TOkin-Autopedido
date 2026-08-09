@@ -138,7 +138,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         chrome.storage.local.set({ [CART_RUNNING_TAB_KEY]: store.id }, () => { void chrome.runtime.lastError; });
-        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [] }, (res) => {
+        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [], filename: msg.filename || "" }, (res) => {
           if (chrome.runtime.lastError) {
             sendResponse({ ok: false, message: chrome.runtime.lastError.message });
           } else {

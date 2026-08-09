@@ -201,7 +201,7 @@ async function runCart() {
   try {
     // El content script corre un lote resumible (navega por cada búsqueda) y va
     // reportando CART_PROGRESS; al terminar envía CART_DONE, que aplica el estado.
-    const out = await sendSw({ type: "ADD_TO_CART", items });
+    const out = await sendSw({ type: "ADD_TO_CART", items, filename: state.filename || "" });
     if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
   } catch (e) {
     if (state.cancellingCart) {
@@ -225,6 +225,7 @@ function applyCartDone(msg) {
       total: (msg && msg.total) || results.length,
       ok: results.filter((r) => r.ok).length,
       results,
+      docName: (msg && msg.docName) || state.filename || "",
     };
     // Las líneas que NO se agregaron al carrito quedan en las filas para
     // corregir y reintentar; solo se quitan las confirmadas (message empieza
@@ -245,9 +246,11 @@ function applyCartDone(msg) {
       if (!added) pending.push(it);
     }
     state.line_items = pending;
+    const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
     setStatus(
       "done",
       "Pedido cargado en el carrito: " + state.cart.ok + " de " + state.cart.total + "." +
+        docNote +
         (pending.length ? " Quedaron " + pending.length + " líneas para revisar." : ""),
       4
     );
@@ -258,6 +261,7 @@ function applyCartDone(msg) {
       total: (msg && msg.total) || results.length,
       ok: results.filter((r) => r.ok).length,
       results,
+      docName: (msg && msg.docName) || state.filename || "",
     };
     setStatus("canceled", "Carga del carrito cancelada.", 3);
   }

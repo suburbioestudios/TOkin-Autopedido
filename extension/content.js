@@ -840,7 +840,7 @@
     } catch (e) {}
   }
 
-  async function tokCartStart(items, tabId) {
+  async function tokCartStart(items, tabId, filename) {
     cartCancel = false;
     const existing = await tokStoreGet(CART_JOB_KEY);
     if (existing) {
@@ -884,6 +884,8 @@
       tabId: tabId || null,
       email: getSessionInfo().email,
       started: Date.now(),
+      // Nombre del documento ingestado, para el informe de cierre de la tarea.
+      docName: String(filename || ""),
     };
     await tokStoreRemove(CART_CANCEL_KEY);
     await tokStoreSet(CART_JOB_KEY, job);
@@ -983,7 +985,11 @@
     const reason = cartCancel ? "user" : await tokCancelReason();
     if (reason) return tokAbortCart(job, reason === "stop");
     const it = job.items[job.index];
-    const r = { producto: it.producto || it.sku || "", ok: false, message: "", storeName: "" };
+    // Además del resultado, se guardan los datos para la RE-CONFIRMACIÓN final
+    // del cierre (tokFinalVerify): texto de la card del store, unidad usada y
+    // cantidad agregada, para volver a matchear la card del carrito cuando el
+    // estado del drawer ya está estable.
+    const r = { producto: it.producto || it.sku || "", ok: false, message: "", storeName: "", usedUnit: "", added: 0, storeText: "" };
     try {
       const target = String(it.producto || it.sku || "").trim();
       if (!target) {
@@ -1012,13 +1018,14 @@
       }
       const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty);
       Object.assign(r, out);
+      const storeText = cand.el.innerText || "";
+      r.storeText = storeText;
       if (r.ok && out.added > 0) {
         // Confirmar por PRODUCTO que la línea realmente se cargó (semántica
         // SET: la card del carrito debe quedar con la qty pedida). Si la
         // primera fijación se perdió en un re-render de React (la SPA cambia
         // la URL a &size=n_20_n y remonta las cards), se RE-aplica la cantidad
         // sobre las cards ya estables y se vuelve a verificar.
-        const storeText = cand.el.innerText || "";
         let hit = null;
         let confirmed = false;
         for (let i = 0; i < 8 && !confirmed; i++) {
@@ -1164,10 +1171,45 @@
     if (job.index >= job.total) {
       job.phase = "done";
       await tokStoreSet(CART_JOB_KEY, job);
+      // Cierre de la tarea: re-confirmación final contra el carrito ya estable,
+      // para que el informe sea completo y real (ver tokFinalVerify).
+      await tokFinalVerify(job);
       return tokFinishCart(job);
     }
     await tokStoreSet(CART_JOB_KEY, job);
     return tokRunJob();
+  }
+
+  // Re-confirmación final al terminar el lote. Durante la corrida una línea
+  // puede quedar "no se confirmó en el carrito" por un estado transitorio del
+  // drawer (la card todavía no estaba con la qty pedida), pero el producto SÍ
+  // quedó cargado. Al cierre se re-lee el carrito completo (estado estable) y
+  // se vuelve a matchear cada línea no confirmada contra su card; si aparece
+  // con qty >= pedida, el resultado se corrige a "agregado (confirmado en el
+  // cierre)". Lo que siga sin card real se mantiene como fallido.
+  async function tokFinalVerify(job) {
+    try {
+      await toksleep(1500);
+      const cards = tokCartCards();
+      const results = job.results || [];
+      let changed = 0;
+      for (const r of results) {
+        if (r.ok) continue;
+        if (String(r.message || "").indexOf("no se confirmó") !== 0) continue;
+        const wantQty = r.added || 0;
+        if (!wantQty) continue;
+        const hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty);
+        if (!hit) continue;
+        r.ok = true;
+        r.message =
+          "agregado: " + wantQty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
+        changed++;
+      }
+      if (changed) await tokStoreSet(CART_JOB_KEY, job);
+      return changed;
+    } catch (e) {
+      return 0;
+    }
   }
 
   async function tokFinishCart(job) {
@@ -1176,11 +1218,12 @@
     setTokRun(false);
     const results = job.results || [];
     const okCount = results.filter((x) => x.ok).length;
+    const docName = job.docName || "";
     try {
-      window.__TOKIN_RES__ = { done: true, ok: okCount, total: job.total, results };
+      window.__TOKIN_RES__ = { done: true, ok: okCount, total: job.total, results, docName };
     } catch (e) {}
     try {
-      window.postMessage({ __tok: "cart-res", payload: { done: true, ok: okCount, total: job.total, results } }, "*");
+      window.postMessage({ __tok: "cart-res", payload: { done: true, ok: okCount, total: job.total, results, docName } }, "*");
     } catch (e) {}
     tokToastSet(
       "Pedido listo: " + okCount + " de " + job.total + " en el carrito",
@@ -1189,7 +1232,7 @@
     tokToastHide();
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results },
+        { target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
@@ -1321,7 +1364,7 @@
         sendResponse({ ok: true });
         break;
       case "ADD_TO_CART":
-        tokCartStart(msg.items || [], msg.tabId)
+        tokCartStart(msg.items || [], msg.tabId, msg.filename)
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
         break;
@@ -1351,7 +1394,7 @@
         window.postMessage({ __tok: "cart-res", payload: { ok: true, job } }, "*");
         return;
       }
-      const out = await tokCartStart(payload.items || []);
+      const out = await tokCartStart(payload.items || [], null, payload.filename || "");
       if (out && !out.ok) {
         window.postMessage({ __tok: "cart-res", payload: out }, "*");
       }
