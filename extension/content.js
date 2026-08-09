@@ -954,26 +954,43 @@
   // verificación es por PRODUCTO (la qty de la card del carrito debe quedar
   // igual al valor pedido), no por delta de unidades totales.
   function tokCartCards() {
-    return Array.from(document.querySelectorAll("article[data-id=cart-product-card]")).map((a) => ({
-      name: (a.innerText || "").replace(/\s+/g, " ").trim(),
-      qty: parseInt(String((a.querySelector("input[type=number]") || {}).value || "").replace(/\D+/g, ""), 10) || 0,
-    }));
+    return Array.from(document.querySelectorAll("article[data-id=cart-product-card]")).map((a) => {
+      const sizeEl = a.querySelector("[data-id^=unit-size-ARC-]");
+      const code = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id")) : null;
+      return {
+        name: (a.innerText || "").replace(/\s+/g, " ").trim(),
+        code,
+        qty: parseInt(String((a.querySelector("input[type=number]") || {}).value || "").replace(/\D+/g, ""), 10) || 0,
+      };
+    });
   }
 
   // Card del carrito que corresponde al producto que acabamos de agregar.
   // El store deja SIN nombre de producto las cards agregadas eligiendo unidad
   // por pestaña (empiezan con "x Bulto (216 Uds)" / "x Display (18 Uds)"):
   // además de la similitud por nombre se acepta esa card si su qty alcanza la
-  // pedida y su texto empieza con la unidad usada.
-  function tokCartFindProduct(cards, storeText, unitLabel, wantQty) {
+  // pedida y su texto empieza con la unidad usada. Si conocemos el CÓDIGO
+  // ARC-XXXX de la card del store (v2.0.10), el código es señal inequívoca:
+  // la card del carrito que lo lleve es la del producto, por más que el nombre
+  // haya quedado sin producto o con tipeo distinto al buscado.
+  function tokCartFindProduct(cards, storeText, unitLabel, wantQty, code) {
     const un = tokNorm(unitLabel);
+    const want = tokArcCode(String(code || ""));
     let best = null;
     for (const c of cards) {
       if (c.qty < wantQty) continue;
-      const text = c.name;
-      const norm = tokNorm(text);
-      const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
-      const s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+      let s;
+      if (want && c.code) {
+        if (c.code === want) s = 3;
+        else if (c.code.endsWith(want) || want.endsWith(c.code)) s = 2.5;
+        else continue;
+      } else {
+        const text = c.name;
+        const norm = tokNorm(text);
+        const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
+        s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+        if (s <= 0) continue;
+      }
       if (!best || s > best.score) best = { qty: c.qty, score: s };
     }
     return best;
@@ -983,17 +1000,27 @@
   // candidata para el producto/unidad/qty pedida. Si hay más de una con el
   // mismo puntaje (ej. dos productos distintos agregados por la misma unidad
   // con texto "x Bulto"), NO confirma: queda para revisión manual y el informe
-  // no cuenta de más ("agregado" solo si es inequívoco).
-  function tokCartFindUnique(cards, storeText, unitLabel, wantQty) {
+  // no cuenta de más ("agregado" solo si es inequívoco). Con el código (v2.0.10)
+  // el ARC-XXXX identifica la card exacta del producto.
+  function tokCartFindUnique(cards, storeText, unitLabel, wantQty, code) {
     const un = tokNorm(unitLabel);
+    const want = tokArcCode(String(code || ""));
     let best = null;
     let n = 0;
     for (const c of cards) {
       if (c.qty < wantQty) continue;
       const text = c.name;
-      const norm = tokNorm(text);
-      const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
-      const s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+      let s;
+      if (want && c.code) {
+        if (c.code === want) s = 3;
+        else if (c.code.endsWith(want) || want.endsWith(c.code)) s = 2.5;
+        else continue;
+      } else {
+        const norm = tokNorm(text);
+        const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
+        s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+        if (s <= 0) continue;
+      }
       if (!best || s > best.score) {
         best = { qty: c.qty, score: s };
         n = 1;
@@ -1045,16 +1072,38 @@
       Object.assign(r, out);
       const storeText = cand.el.innerText || "";
       r.storeText = storeText;
+      // Código ARC-XXXX de la card del store elegida (v2.0.10): la verificación
+      // del carrito lo usa como señal inequívoca (la card del carrito lo lleva
+      // en data-id=unit-size-ARC-...). Si la primera fijación de cantidad se
+      // perdió en un re-render de React (la SPA cambia la URL a &size=n_20_n y
+      // remonta las cards), se RE-aplica la qty DIRECTAMENTE en la card del
+      // carrito (por su código) y en la card del store, y se vuelve a verificar.
+      const code = tokArcCode(storeText);
       if (r.ok && out.added > 0) {
         // Confirmar por PRODUCTO que la línea realmente se cargó (semántica
-        // SET: la card del carrito debe quedar con la qty pedida). Si la
-        // primera fijación se perdió en un re-render de React (la SPA cambia
-        // la URL a &size=n_20_n y remonta las cards), se RE-aplica la cantidad
-        // sobre las cards ya estables y se vuelve a verificar.
+        // SET: la card del carrito debe quedar con la qty pedida).
         let hit = null;
         let confirmed = false;
         for (let i = 0; i < 8 && !confirmed; i++) {
           if (i > 0) {
+            // 1) re-aplicar la qty en la card del carrito por su CÓDIGO (la card
+            // real puede estar sin nombre de producto, pero conserva el ARC).
+            if (code) {
+              const cart = tokCartCards();
+              const mine = cart.find((c) => c.code && (c.code === code || c.code.endsWith(code) || code.endsWith(c.code)));
+              if (mine && mine.qty < out.added) {
+                const cartEl = document.querySelectorAll("article[data-id=cart-product-card]");
+                for (const el of cartEl) {
+                  const sc = tokArcCode((el.querySelector("[data-id^=unit-size-ARC-]") || {}).getAttribute ? (el.querySelector("[data-id^=unit-size-ARC-]").getAttribute("data-id") || "") : "");
+                  if (sc && (sc === code || sc.endsWith(code) || code.endsWith(sc))) {
+                    const inp = el.querySelector("input[type=number]");
+                    if (inp) tokSetValue(inp, String(out.added));
+                    break;
+                  }
+                }
+              }
+            }
+            // 2) re-aplicar la cantidad sobre la card del store (fallback previo).
             const els = await waitForTokin(
               () => {
                 const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
@@ -1070,7 +1119,7 @@
             if (els) for (const el of els) tokSetValue(el, String(out.added));
             await toksleep(600);
           }
-          hit = tokCartFindProduct(tokCartCards(), storeText, out.usedUnit || "", out.added);
+          hit = tokCartFindProduct(tokCartCards(), storeText, out.usedUnit || "", out.added, code);
           confirmed = !!hit;
           if (!confirmed) await toksleep(700);
         }
@@ -1223,7 +1272,7 @@
         if (String(r.message || "").indexOf("no se confirmó") !== 0) continue;
         const wantQty = r.added || 0;
         if (!wantQty) continue;
-        const hit = tokCartFindUnique(cards, r.storeText || "", r.usedUnit || "", wantQty);
+        const hit = tokCartFindUnique(cards, r.storeText || "", r.usedUnit || "", wantQty, r.storeText);
         if (!hit) continue;
         r.ok = true;
         r.message =
@@ -1407,6 +1456,14 @@
       case "CANCEL_CART":
         cartCancel = true;
         tokStoreSet(CART_CANCEL_KEY, "user");
+        sendResponse({ ok: true });
+        break;
+      case "OPEN_CART":
+        // El botón "Abrir store" del popup abre el CARRITO (drawer del store).
+        try {
+          const b = document.querySelector("[data-id=navbar-minicart-button]");
+          if (b) b.click();
+        } catch (e) {}
         sendResponse({ ok: true });
         break;
       case "SHOW_PICKER":

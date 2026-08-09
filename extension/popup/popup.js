@@ -118,6 +118,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     showEl("#btn-cart", which === "cart");
     showEl("#btn-cancel-cart", which === "cancelCart");
     showEl("#btn-open-store", which === "done");
+    showEl("#btn-excel", which === "done");
     showEl("#btn-clear", which === "done");
   }
 
@@ -194,6 +195,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
         showEl("#done-summary", true);
         showEl("#cart-results-final", true);
         showEl("#done-hint", false);
+        showEl("#btn-excel", true);
         setAction("cart");
         renderDone(st);
         const c = st.cart || { ok: 0, total: 0 };
@@ -551,8 +553,70 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     const tab = await getStoreTab();
     if (tab && tab.id && tab.url) {
       chrome.tabs.update(tab.id, { active: true });
+      await new Promise((r) => setTimeout(r, 600));
+      sendTab(tab.id, { type: "OPEN_CART" });
     } else {
       chrome.tabs.create({ url: "https://tokintienda.com.ar/store" });
+    }
+  }
+
+  // Excel de cierre (v2.0.10): ítems del pedido + los que NO quedaron en el
+  // carrito (con su motivo). Regla de negocio: solo puede quedar fuera del
+  // pedido un ítem "sin stock"; los demás (no encontrado / sin confirmar /
+  // error) se marcan para revisión. Se genera con SheetJS (xlsx.full.min.js).
+  function descargarExcel() {
+    const items = ui.lineItems || [];
+    const results = ((ui.cart && ui.cart.results) || []).slice();
+    const baseName = (ui.cart && ui.cart.docName) || "informe";
+    const isAdded = (r) => r.ok && String(r.message || "").indexOf("agregado") === 0;
+    const rows = [];
+    const pending = [];
+    items.forEach((it, i) => {
+      const r = results[i] || {};
+      const unidad = it.categoria || it.unidad || "";
+      let estado;
+      let motivo = r.message || "";
+      if (isAdded(r)) {
+        estado = "Agregado";
+        motivo = "";
+      } else if (/sin stock/i.test(r.message || "")) {
+        estado = "Sin stock (fuera del pedido)";
+      } else if (/no se encontró/i.test(r.message || "")) {
+        estado = "No encontrado";
+        motivo = "Falta cargar: no se encontró en el store";
+      } else if (String(r.message || "").indexOf("no se confirmó") === 0) {
+        estado = "Sin confirmar";
+        motivo = "Falta cargar: no se confirmó en el carrito";
+      } else if (r.message) {
+        estado = "Falta cargar";
+      } else {
+        estado = "Pendiente";
+      }
+      const row = {
+        "#": i + 1,
+        "Código": it.sku || "",
+        "Producto": it.producto || "",
+        "Cant.": it.cantidad || "",
+        "Unidad": unidad,
+        "Estado": estado,
+        "Detalle": motivo,
+      };
+      rows.push(row);
+      if (!isAdded(r)) pending.push(row);
+    });
+    try {
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(rows);
+      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 34 }, { wch: 46 }];
+      XLSX.utils.book_append_sheet(wb, ws, "Pedido");
+      const ws2 = XLSX.utils.json_to_sheet(pending);
+      ws2["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 34 }, { wch: 46 }];
+      XLSX.utils.book_append_sheet(wb, ws2, "No cargados");
+      const name = String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "informe";
+      XLSX.writeFile(wb, name + ".xlsx");
+      setStatus("Excel descargado: " + name + ".xlsx", "ok");
+    } catch (e) {
+      setStatus("No se pudo generar el Excel: " + String((e && e.message) || e), "err");
     }
   }
 
@@ -655,6 +719,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     $("#btn-cart").addEventListener("click", armarCarrito);
     $("#btn-cancel-cart").addEventListener("click", cancelar);
     $("#btn-open-store").addEventListener("click", abrirStore);
+    $("#btn-excel").addEventListener("click", descargarExcel);
     $("#btn-clear").addEventListener("click", terminar);
     $("#btn-reset").addEventListener("click", reanudar);
     $("#items-box").addEventListener("dblclick", (e) => {
