@@ -979,6 +979,31 @@
     return best;
   }
 
+  // Variante para el cierre del lote (informe): SOLO confirma si hay UNA card
+  // candidata para el producto/unidad/qty pedida. Si hay más de una con el
+  // mismo puntaje (ej. dos productos distintos agregados por la misma unidad
+  // con texto "x Bulto"), NO confirma: queda para revisión manual y el informe
+  // no cuenta de más ("agregado" solo si es inequívoco).
+  function tokCartFindUnique(cards, storeText, unitLabel, wantQty) {
+    const un = tokNorm(unitLabel);
+    let best = null;
+    let n = 0;
+    for (const c of cards) {
+      if (c.qty < wantQty) continue;
+      const text = c.name;
+      const norm = tokNorm(text);
+      const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
+      const s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+      if (!best || s > best.score) {
+        best = { qty: c.qty, score: s };
+        n = 1;
+      } else if (s === best.score) {
+        n++;
+      }
+    }
+    return n === 1 ? best : null;
+  }
+
   async function tokProcessCurrentItem() {
     const job = await tokStoreGet(CART_JOB_KEY);
     if (!job) return;
@@ -1198,7 +1223,7 @@
         if (String(r.message || "").indexOf("no se confirmó") !== 0) continue;
         const wantQty = r.added || 0;
         if (!wantQty) continue;
-        const hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty);
+        const hit = tokCartFindUnique(cards, r.storeText || "", r.usedUnit || "", wantQty);
         if (!hit) continue;
         r.ok = true;
         r.message =
@@ -1217,22 +1242,33 @@
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
     const results = job.results || [];
-    const okCount = results.filter((x) => x.ok).length;
+    // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
+    // "agregado"). "sin stock"/"no se encontró"/"no se confirmó" NO suman.
+    const isAdded = (x) => x.ok && String(x.message || "").indexOf("agregado") === 0;
+    const added = results.filter(isAdded).length;
+    const prodAdded = new Set(results.filter(isAdded).map((x) => String(x.producto || "").trim())).size;
+    const sinStock = results.filter((x) => !isAdded(x) && /sin stock/i.test(x.message || "")).length;
+    const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
+    const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;
     const docName = job.docName || "";
+    const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded };
     try {
-      window.__TOKIN_RES__ = { done: true, ok: okCount, total: job.total, results, docName };
+      window.__TOKIN_RES__ = summary;
     } catch (e) {}
     try {
-      window.postMessage({ __tok: "cart-res", payload: { done: true, ok: okCount, total: job.total, results, docName } }, "*");
+      window.postMessage({ __tok: "cart-res", payload: summary }, "*");
     } catch (e) {}
     tokToastSet(
-      "Pedido listo: " + okCount + " de " + job.total + " en el carrito",
-      okCount === job.total ? "ok" : "err"
+      "Pedido listo: " + added + " de " + job.total + " en el carrito",
+      added === job.total ? "ok" : "err"
     );
     tokToastHide();
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName },
+        {
+          target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName,
+          sinStock, notFound, notConfirmed, prodAdded,
+        },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}

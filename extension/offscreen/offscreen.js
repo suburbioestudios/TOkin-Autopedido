@@ -219,14 +219,27 @@ function applyCartDone(msg) {
   // Si ya se ingresó otro documento mientras corría el lote, el resultado
   // viejo NO pisa la sesión nueva.
   if (state.status !== "loading_cart") return;
+  const results = (msg && msg.results) || [];
+  // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
+  // "agregado"). "sin stock" / "no se encontró" / "no se confirmó" no suman al
+  // conteo de cargado (el informe refleja el carrito, no las líneas ok).
+  const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+  const added = results.filter(isAdded).length;
+  const prodAdded = new Set(results.filter(isAdded).map((r) => String(r.producto || "").trim())).size;
+  const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
+  const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+  const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  state.cart = {
+    total: (msg && msg.total) || results.length,
+    ok: added,
+    prodAdded: (msg && msg.prodAdded != null) ? msg.prodAdded : prodAdded,
+    sinStock,
+    notFound,
+    notConfirmed,
+    results,
+    docName: (msg && msg.docName) || state.filename || "",
+  };
   if (!msg || !msg.canceled) {
-    const results = (msg && msg.results) || [];
-    state.cart = {
-      total: (msg && msg.total) || results.length,
-      ok: results.filter((r) => r.ok).length,
-      results,
-      docName: (msg && msg.docName) || state.filename || "",
-    };
     // Las líneas que NO se agregaron al carrito quedan en las filas para
     // corregir y reintentar; solo se quitan las confirmadas (message empieza
     // con "agregado"), porque reenviarlas las duplicaría. Quedan las falladas,
@@ -242,27 +255,26 @@ function applyCartDone(msg) {
       }
       const r = results[idx];
       idx++;
-      const added = !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
-      if (!added) pending.push(it);
+      if (!isAdded(r)) pending.push(it);
     }
     state.line_items = pending;
     const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
+    const parts = [];
+    if (sinStock) parts.push(sinStock + " sin stock");
+    if (notFound) parts.push(notFound + " no encontrados");
+    if (notConfirmed) parts.push(notConfirmed + " sin confirmar");
+    const other = Math.max(0, state.cart.total - added - sinStock - notFound - notConfirmed);
+    if (other) parts.push(other + " con error");
     setStatus(
       "done",
-      "Pedido cargado en el carrito: " + state.cart.ok + " de " + state.cart.total + "." +
+      "Pedido cargado en el carrito: " + added + " de " + state.cart.total + "." +
         docNote +
+        (parts.length ? " (" + parts.join(", ") + ")" : "") +
         (pending.length ? " Quedaron " + pending.length + " líneas para revisar." : ""),
       4
     );
     playBeep(true);
   } else {
-    const results = (msg && msg.results) || [];
-    state.cart = {
-      total: (msg && msg.total) || results.length,
-      ok: results.filter((r) => r.ok).length,
-      results,
-      docName: (msg && msg.docName) || state.filename || "",
-    };
     setStatus("canceled", "Carga del carrito cancelada.", 3);
   }
 }

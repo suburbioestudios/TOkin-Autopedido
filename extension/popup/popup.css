@@ -205,6 +205,7 @@ tr:nth-child(even) td { background: #faf8ff; }
   font-size: 12px; border: 1px solid var(--border);
 }
 .cart-row.ok { background: var(--green-soft); border-color: #bbf7d0; }
+.cart-row.warn { background: var(--orange-soft); border-color: #fed7aa; }
 .cart-row.err { background: var(--err-soft); border-color: #fecaca; }
 
 footer {

@@ -137,6 +137,13 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     return "";
   }
 
+  function showDropzoneFile(name) {
+    if (!name) return;
+    $("#file-name").textContent = name;
+    $("#file-name").classList.add("big");
+    $("#dropzone").classList.add("has-file");
+  }
+
   function applyState(st) {
     if (!st || st.status === "idle") {
       resetPanels();
@@ -147,15 +154,15 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     ui.lineItems = st.line_items || [];
     ui.cart = st.cart || null;
 
+    // El documento de la sesión activa se ve cargado en la dropzone en todos
+    // los estados (parseando, reconocido, cargando carrito, terminado,
+    // cancelado y error): denota sobre qué archivo se está trabajando.
+    showDropzoneFile((st.cart && st.cart.docName) || st.filename || "");
+
     if (st.status === "parsing") {
       resetPanels();
       setAction("cancel");
       setStatus(st.progress || "Procesando…", "");
-      if (st.filename) {
-        $("#file-name").textContent = st.filename;
-        $("#file-name").classList.add("big");
-        $("#dropzone").classList.add("has-file");
-      }
     } else if (st.status === "parsed") {
       resetPanels();
       renderItems();
@@ -283,12 +290,15 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       box.innerHTML = '<p class="hint">Cargando…</p>';
       return;
     }
-    const ok = res.filter((r) => r.ok).length;
+    // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
+    // "agregado"); "sin stock" y "no se confirmó" no cuentan como cargados.
+    const isAdded = (r) => r.ok && String(r.message || "").indexOf("agregado") === 0;
+    const added = res.filter(isAdded).length;
     let html =
-      '<p class="hint">Agregados al carrito: ' + ok + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>";
+      '<p class="hint">Agregados al carrito: ' + added + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>";
     html += res
       .map((r) => {
-        const cls = r.ok ? "ok" : "err";
+        const cls = isAdded(r) ? "ok" : r.ok ? "warn" : "err";
         return '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
       })
       .join("");
@@ -332,7 +342,17 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       ? "Carga cancelada. Lo que alcanzó a procesarse quedó en el carrito del store."
       : "El pedido quedó cargado en el carrito del store.";
     if (c.docName) html += "\nDocumento procesado: " + c.docName + ".";
-    if (c.total) html += "\nLíneas: " + c.ok + " de " + c.total + ".";
+    if (c.total) {
+      html += "\nLíneas agregadas: " + c.ok + " de " + c.total + ".";
+      if (c.prodAdded && c.prodAdded !== c.ok) {
+        html += " En el carrito: " + c.prodAdded + " productos (hay líneas repetidas que se suman en una card).";
+      }
+    }
+    const parts = [];
+    if (c.sinStock) parts.push("Sin stock: " + c.sinStock);
+    if (c.notFound) parts.push("No encontrados: " + c.notFound);
+    if (c.notConfirmed) parts.push("Sin confirmar: " + c.notConfirmed);
+    if (parts.length) html += "\n" + parts.join(" · ");
     $("#done-summary").textContent = html;
     renderCartResults(c.results, $("#cart-results-final"));
   }
