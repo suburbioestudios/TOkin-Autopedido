@@ -226,9 +226,29 @@ function applyCartDone(msg) {
       ok: results.filter((r) => r.ok).length,
       results,
     };
+    // Las líneas que NO se agregaron al carrito quedan en las filas para
+    // corregir y reintentar; solo se quitan las confirmadas (message empieza
+    // con "agregado"), porque reenviarlas las duplicaría. Quedan las falladas,
+    // las "sin stock" y las "no se confirmó". Los resultados llegan en el mismo
+    // orden que cartItems() (líneas no vacías).
+    const all = state.line_items || [];
+    const pending = [];
+    let idx = 0;
+    for (const it of all) {
+      if (!(it.producto || it.sku || "").trim()) {
+        pending.push(it);
+        continue;
+      }
+      const r = results[idx];
+      idx++;
+      const added = !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+      if (!added) pending.push(it);
+    }
+    state.line_items = pending;
     setStatus(
       "done",
-      "Pedido cargado en el carrito: " + state.cart.ok + " de " + state.cart.total + ".",
+      "Pedido cargado en el carrito: " + state.cart.ok + " de " + state.cart.total + "." +
+        (pending.length ? " Quedaron " + pending.length + " líneas para revisar." : ""),
       4
     );
     playBeep(true);

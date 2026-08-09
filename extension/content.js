@@ -858,6 +858,16 @@
     if (!clean.length) {
       return { ok: false, message: "No hay líneas de pedido para cargar." };
     }
+    // Total por producto (sku|unidad) en TODO el pedido: el store usa
+    // semántica de FIJAR cantidad (set), así que cuando el mismo producto
+    // aparece en varias líneas (ej. MENTA x810 x2 y x2, REX x75 x12 y x5) la
+    // card del carrito debe quedar en la SUMA, no en el valor de una línea.
+    const totals = {};
+    for (const it of clean) {
+      const key = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(tokUnitLabel(it));
+      const q = Math.floor(Number(String(it.cantidad || "").replace(/[^\d.]/g, ""))) || 0;
+      totals[key] = (totals[key] || 0) + q;
+    }
     const job = {
       token: Date.now() + "-" + Math.floor(Math.random() * 1e6),
       items: clean,
@@ -867,6 +877,7 @@
       total: clean.length,
       phase: "pending",
       query: "",
+      productTotals: totals,
       // El job queda ligado a la pestaña y a la sesión que lo lanzó: si la
       // pestaña se cierra, se cierra la sesión o pasa demasiado tiempo, la
       // automatización NO se reanuda sola desde una sesión anterior.
@@ -933,6 +944,39 @@
     } catch (e) {}
   }
 
+  // Estado real del carrito de Tokin desde el DOM: las cards del drawer
+  // (article[data-id=cart-product-card]) están siempre en el DOM, aunque
+  // ocultas, y sus inputs reflejan las unidades. El store usa semántica de
+  // FIJAR cantidad (set), no de sumar: al agregar un producto que ya está en
+  // el carrito, su qty pasa al valor pedido (no se acumula). Por eso la
+  // verificación es por PRODUCTO (la qty de la card del carrito debe quedar
+  // igual al valor pedido), no por delta de unidades totales.
+  function tokCartCards() {
+    return Array.from(document.querySelectorAll("article[data-id=cart-product-card]")).map((a) => ({
+      name: (a.innerText || "").replace(/\s+/g, " ").trim(),
+      qty: parseInt(String((a.querySelector("input[type=number]") || {}).value || "").replace(/\D+/g, ""), 10) || 0,
+    }));
+  }
+
+  // Card del carrito que corresponde al producto que acabamos de agregar.
+  // El store deja SIN nombre de producto las cards agregadas eligiendo unidad
+  // por pestaña (empiezan con "x Bulto (216 Uds)" / "x Display (18 Uds)"):
+  // además de la similitud por nombre se acepta esa card si su qty alcanza la
+  // pedida y su texto empieza con la unidad usada.
+  function tokCartFindProduct(cards, storeText, unitLabel, wantQty) {
+    const un = tokNorm(unitLabel);
+    let best = null;
+    for (const c of cards) {
+      if (c.qty < wantQty) continue;
+      const text = c.name;
+      const norm = tokNorm(text);
+      const unnamedUnit = un.length > 0 && norm.indexOf("x " + un) === 0;
+      const s = tokSim(storeText, text) + (unnamedUnit ? 0.5 : 0);
+      if (!best || s > best.score) best = { qty: c.qty, score: s };
+    }
+    return best;
+  }
+
   async function tokProcessCurrentItem() {
     const job = await tokStoreGet(CART_JOB_KEY);
     if (!job) return;
@@ -951,6 +995,9 @@
       const wantType = tokNorm(wantUnit);
       const wantedGrams = tokGrams(String(it.producto || "") + " " + String(it.unidad || ""));
       const queries = tokBuildQueries(it);
+      // Cantidad total del producto en el pedido (suma de líneas duplicadas).
+      const wantKey = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(wantUnit);
+      const wantQty = (job.productTotals || {})[wantKey] || 0;
 
       const cand = await waitForTokin(
         () => tokBestArticle(target, wantType, wantedGrams, it.sku),
@@ -963,8 +1010,44 @@
         await tokStoreSet(CART_JOB_KEY, job);
         return tokRunJob();
       }
-      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams);
+      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty);
       Object.assign(r, out);
+      if (r.ok && out.added > 0) {
+        // Confirmar por PRODUCTO que la línea realmente se cargó (semántica
+        // SET: la card del carrito debe quedar con la qty pedida). Si la
+        // primera fijación se perdió en un re-render de React (la SPA cambia
+        // la URL a &size=n_20_n y remonta las cards), se RE-aplica la cantidad
+        // sobre las cards ya estables y se vuelve a verificar.
+        const storeText = cand.el.innerText || "";
+        let hit = null;
+        let confirmed = false;
+        for (let i = 0; i < 8 && !confirmed; i++) {
+          if (i > 0) {
+            const els = await waitForTokin(
+              () => {
+                const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
+                if (!c) return null;
+                const ins = Array.from(c.el.querySelectorAll("input[type=number]")).filter(
+                  (e) => e.offsetParent !== null
+                );
+                return ins.length ? ins : null;
+              },
+              5000,
+              250
+            );
+            if (els) for (const el of els) tokSetValue(el, String(out.added));
+            await toksleep(600);
+          }
+          hit = tokCartFindProduct(tokCartCards(), storeText, out.usedUnit || "", out.added);
+          confirmed = !!hit;
+          if (!confirmed) await toksleep(700);
+        }
+        if (!confirmed) {
+          r.ok = false;
+          r.message =
+            "no se confirmó en el carrito (pedido " + out.added + (hit ? ", card qty " + hit.qty : ", sin card") + ")";
+        }
+      }
     } catch (e) {
       r.message = "error: " + String((e && e.message) || e).slice(0, 140);
     }
@@ -972,10 +1055,10 @@
     return tokAdvance(job, r.ok);
   }
 
-  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams) {
+  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty) {
     const card = cand.el;
     const cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
-    const out = { ok: false, message: "", storeName: cardText.slice(0, 90) };
+    const out = { ok: false, message: "", storeName: cardText.slice(0, 90), added: 0, usedUnit: wantUnit };
 
     let unitBtn = null;
     let usedUnit = wantUnit;
@@ -1046,16 +1129,20 @@
       }, 8000, 250);
       if (!nums) {
         out.ok = true;
+        out.added = wantQty > 0 ? wantQty : 1;
+        out.usedUnit = usedUnit;
         out.message = "agregado sin poder fijar cantidad" + unitNote;
         return out;
       }
     }
 
-    if (qty > 0) {
-      for (const el of nums) tokSetValue(el, String(qty));
+    if (wantQty > 0) {
+      for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, String(wantQty));
       await toksleep(600);
       out.ok = true;
-      out.message = "agregado: " + qty + " " + usedUnit + unitNote;
+      out.added = wantQty;
+      out.usedUnit = usedUnit;
+      out.message = "agregado: " + wantQty + " " + usedUnit + unitNote;
     } else {
       out.ok = true;
       out.message = "agregado sin cantidad" + unitNote;
