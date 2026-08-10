@@ -419,26 +419,48 @@ async function _pdf_text(data, onProgress, onCancel) {
         if (r.words.length) pages.push({ page: rest[k], words: r.words, w: r.w, h: r.h, scale: r.scale });
       }
 
-      // Re-OCR de banda para filas con Cant. Pedida sospechosa: si el OCR global
-      // degradó la celda (ej. CUENCA: 14184 MOGUL JELLY BEANS leyó "a|" y el
-      // parser tomó el 8067 de la columna precio), re-renderiza la banda de la
-      // fila a mayor escala y extrae la cantidad por posición de columna.
-      const REFINE_SCALE = 3.0;
+      // Re-OCR de banda para TODAS las filas (la celda de unidad b/d/a y el sku
+      // son poco confiables a escala 2.0): re-renderiza la banda de cada fila a
+      // mayor escala y extrae POR POSICIÓN de columna la cantidad (la celda que
+      // tiene la letra b/d y el número a su derecha, excluyendo el xBulto), la
+      // unidad y el sku. La cantidad solo se corrige en filas sospechosas (Cant.
+      // Pedida degradada o sin unidad); la unidad y el sku en todas.
+      const REFINE_SCALE = 3.5;
       for (const pg of pages) {
-        const suspects = _pdf_suspect_rows(pg.words, pg.w, pg.scale);
-        if (!suspects.length) continue;
-        if (onProgress) onProgress("Corrigiendo cantidades de la página " + pg.page + "…");
+        const rows = _pdf_all_rows(pg.words, pg.w, pg.scale);
+        if (!rows.length) continue;
+        if (onProgress) onProgress("Corrigiendo filas de la página " + pg.page + "…");
         const pageObj = await pdf.getPage(pg.page);
+        // La página a escala alta se renderiza UNA vez y se reutiliza en todas
+        // las filas de esa página.
+        const full = await _render_page(pageObj, chosen.rot, REFINE_SCALE);
         const fixes = {};
-        for (const s of suspects) {
+        for (const s of rows) {
           if (onCancel && onCancel()) throw new CancelError();
-          const qty = await _pdf_band_qty(pool[0], pageObj, chosen.rot, s.sku, s.cy, pg.w, pg.h, pg.scale, REFINE_SCALE);
-          if (qty) {
-            fixes[s.sku] = qty;
+          const fix = await _pdf_band_refine(
+            pool[0],
+            pageObj,
+            chosen.rot,
+            s.sku,
+            s.cy,
+            pg.w,
+            pg.h,
+            pg.scale,
+            REFINE_SCALE,
+            full
+          );
+          if (!fix) continue;
+          // La cantidad del re-OCR solo se aplica si la fila es sospechosa:
+          // para las filas normales el valor del parse global ya es correcto.
+          if (!s.suspect) delete fix.cantidad;
+          if (fix.cantidad != null || fix.unidad != null || fix.sku != null) {
+            fixes[s.sku] = fix;
             if (typeof console !== "undefined")
-              console.log("[tokin] qty refine sku=%s %s->%s", s.sku, s.pedida, qty);
+              console.log("[tokin] refine sku=%s pedida=%s -> %j", s.sku, s.pedida, fix);
           }
         }
+        full.width = 0;
+        full.height = 0;
         if (Object.keys(fixes).length) pg.qtyFix = fixes;
       }
     } finally {
@@ -526,21 +548,35 @@ function _pdf_row_info(width, row) {
       break;
     }
   }
-  if (unit === null) return null;
   let pedida = null;
   let pedidaXf = 0;
-  for (let j = unit_i + 1; j < Math.min(unit_i + 4, row.length); j++) {
-    const d = _first_digits(row[j].t);
-    if (d !== null) {
-      pedida = d;
-      pedidaXf = (row[j].x0 + row[j].x1) / 2 / width;
-      break;
+  let xbulTok = "";
+  if (unit !== null) {
+    for (let j = unit_i + 1; j < Math.min(unit_i + 4, row.length); j++) {
+      const d = _first_digits(row[j].t);
+      if (d !== null) {
+        pedida = d;
+        pedidaXf = (row[j].x0 + row[j].x1) / 2 / width;
+        break;
+      }
+    }
+    xbulTok = unit_i > sku_i + 1 ? String(row[unit_i - 1].t || "") : "";
+  }
+  const isXbul = /^\|?\s*\d{1,4}\s*\|?$/.test(xbulTok);
+  let end;
+  if (unit !== null) {
+    end = isXbul && unit_i - 2 >= sku_i + 1 ? unit_i - 2 : unit_i - 1;
+    if (end < sku_i + 1) end = unit_i - 1;
+  } else {
+    // Celda de unidad ilegible a esta escala: el fin de la descripción es la
+    // columna xBulto (x≈0.25). La fila NO se descarta: el re-OCR de banda a
+    // mayor escala recupera unidad y Cant. Pedida (ver _pdf_band_refine).
+    end = sku_i;
+    for (let j = sku_i + 1; j < row.length; j++) {
+      if ((row[j].x0 + row[j].x1) / 2 / width >= 0.25) break;
+      end = j;
     }
   }
-  const xbulTok = unit_i > sku_i + 1 ? String(row[unit_i - 1].t || "") : "";
-  const isXbul = /^\|?\s*\d{1,4}\s*\|?$/.test(xbulTok);
-  let end = isXbul && unit_i - 2 >= sku_i + 1 ? unit_i - 2 : unit_i - 1;
-  if (end < sku_i + 1) end = unit_i - 1;
   let desc = "";
   for (let j = sku_i + 1; j <= end && j < row.length; j++) {
     if (desc) desc += " ";
@@ -555,20 +591,26 @@ function _pdf_row_info(width, row) {
   // La celda de Cant. Pedida está en x≈0.30 (a escala 2, ancho 1584). Si el
   // token que tomó el parser quedó en la columna precio (>0.33) o con 4+
   // dígitos (una cantidad de pedido nunca supera 999), el OCR global degradó la
-  // celda: la fila necesita re-OCR de banda.
-  const suspect = pedida === null || pedidaXf > 0.33 || (pedida !== null && /^\d{4,}$/.test(pedida));
+  // celda: la fila necesita re-OCR de banda. También es sospechosa si la celda
+  // de unidad (b/d/a) no se leyó.
+  const suspect =
+    unit === null ||
+    pedida === null ||
+    pedidaXf > 0.33 ||
+    (pedida !== null && /^\d{4,}$/.test(pedida));
   const cy = (row[sku_i].y0 + row[sku_i].y1) / 2;
   return {
     item: {
       sku,
       producto: desc.slice(0, 200),
       cantidad: pedida || "",
-      unidad: unit,
+      unidad: unit || "",
       categoria: medida_categoria(unit),
     },
     sku,
     cy,
     pedida,
+    unit,
     suspect,
   };
 }
@@ -582,26 +624,45 @@ function _pdf_table_items(words, width, scale) {
   return items;
 }
 
-// Filas cuya Cant. Pedida es sospechosa (OCR global degradado): devuelve sku,
-// cy (centro vertical de la fila) y el valor leído para el re-OCR de banda.
-function _pdf_suspect_rows(words, width, scale) {
+// TODAS las filas con sku, para el re-OCR de banda: la celda de unidad b/d/a
+// es poco confiable a escala 2.0 (suele degradarse a "|p"/"|>"/"la"), así que
+// el re-OCR a mayor escala la corrige en cada fila. Devuelve sku, cy y si la
+// fila necesita fix de cantidad (suspect).
+function _pdf_all_rows(words, width, scale) {
   const out = [];
   for (const row of _pdf_build_rows(words, scale)) {
     const info = _pdf_row_info(width, row);
-    if (info && info.suspect) out.push({ sku: info.sku, cy: info.cy, pedida: info.pedida });
+    if (info) out.push({ sku: info.sku, cy: info.cy, pedida: info.pedida, suspect: info.suspect });
   }
   return out;
 }
 
+function _to_num(t) {
+  let s = String(t || "").replace(/[^\d.,]/g, "");
+  if (s.indexOf(",") !== -1 && s.indexOf(".") !== -1) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else if (s.indexOf(",") !== -1) {
+    s = s.replace(",", ".");
+  }
+  const v = parseFloat(s);
+  return isNaN(v) ? null : v;
+}
+
 // Re-OCR de la banda horizontal de una fila (cy±18 a escala 2, normalizado por
-// la altura de página) a mayor escala y extracción posicional de la cantidad: el
-// primer número de 1-3 dígitos en el rango x de la celda Cant. Pedida
-// (0.24-0.35 del ancho a escala 2), después del sku. Devuelve la cantidad o null.
-async function _pdf_band_qty(worker, page, rotation, sku, cy, width, height, scale, refineScale) {
-  const ya = Math.max(0, (cy - 18) / height);
-  const yb = Math.min(1, (cy + 18) / height);
-  const full = await _render_page(page, rotation, refineScale);
+// la altura de página) a mayor escala y extracción POSICIONAL de las celdas por
+// columna del pedido del proveedor: sku (xf<0.10) · desc · xBulto (≈0.24-0.28)
+// · unidad b/d/a (≈0.25-0.31) · **Cantidad Pedida** (≈0.28-0.36, la celda que
+// tiene la letra b/d y el número a su derecha, excluyendo el xBulto) · … ·
+// Precio (≈0.36-0.43) · Importe (≈0.66-0.74). Devuelve fixes parciales
+// { sku?, unidad?, cantidad? } según lo que el re-OCR logró recuperar. Si la
+// celda de Cant. Pedida sale ilegible pero se leen xBulto, precio e importe, la
+// cantidad se deriva de importe/(xBulto×precio). fullCanvas (opcional) permite
+// reutilizar la página ya renderizada a refineScale.
+async function _pdf_band_refine(worker, page, rotation, sku, cy, width, height, scale, refineScale, fullCanvas) {
+  const full = fullCanvas || (await _render_page(page, rotation, refineScale));
   try {
+    const ya = Math.max(0, (cy - 18) / height);
+    const yb = Math.min(1, (cy + 18) / height);
     const top = full.height * ya;
     const bh = Math.max(1, Math.round(full.height * (yb - ya)));
     const band = document.createElement("canvas");
@@ -619,20 +680,57 @@ async function _pdf_band_qty(worker, page, rotation, sku, cy, width, height, sca
         y0: w.y0 * k + offset,
         y1: w.y1 * k + offset,
       }))
-      .filter((w) => w.t && String(w.t).trim() !== "" && Math.abs((w.y0 + w.y1) / 2 - cy) <= 16)
+      .filter((w) => w.t && String(w.t).trim() !== "" && Math.abs((w.y0 + w.y1) / 2 - cy) <= 8)
       .sort((a, b) => a.x0 - b.x0);
-    const skuIdx = rowWords.findIndex((w) => w.t === sku);
-    if (skuIdx < 0) return null;
+    const fix = {};
+    // SKU: el código del proveedor es el primer token de 4-6 dígitos en la
+    // primera columna; si el OCR global lo había leído mal (ej. "2848" por
+    // "4848") el re-OCR lo corrige.
+    const skuIdx = rowWords.findIndex((w) => (w.x0 + w.x1) / 2 / width < 0.1 && /^\d{4,6}$/.test(w.t));
+    if (skuIdx >= 0 && rowWords[skuIdx].t !== sku) fix.sku = rowWords[skuIdx].t;
+    // UNIDAD: la celda b/d/a está justo a la derecha del xBulto (xf≈0.27-0.31,
+    // token con | como "|b"/"|d", o "6|b" degradado). Se prefiere un token con
+    // | (celda de unidad real) sobre una letra suelta de ruido ("A" de la
+    // separación de columnas), que el OCR de 3.5 suele inventar a la izquierda.
+    let unitTok = null;
     for (let j = skuIdx + 1; j < rowWords.length; j++) {
       const xf = (rowWords[j].x0 + rowWords[j].x1) / 2 / width;
-      if (xf < 0.24 || xf > 0.35) continue;
-      const d = _first_digits(rowWords[j].t);
-      if (d !== null && /^\d{1,3}$/.test(d)) return d;
+      if (xf < 0.265 || xf > 0.31) continue;
+      const u = _unit_letter(rowWords[j].t);
+      if (!u) continue;
+      const shaped = /[|]/.test(rowWords[j].t);
+      if (!unitTok || (!unitTok.shaped && shaped)) unitTok = { u, shaped };
     }
-    return null;
+    if (unitTok) fix.unidad = unitTok.u;
+    // xBulto, Cant. Pedida, precio e importe por posición de columna.
+    let xbul = null;
+    let pedida = null;
+    let precio = null;
+    let importe = null;
+    for (let j = skuIdx + 1; j < rowWords.length; j++) {
+      const xf = (rowWords[j].x0 + rowWords[j].x1) / 2 / width;
+      const d = _first_digits(rowWords[j].t);
+      if (d === null || xf < 0.24) continue;
+      if (xf < 0.28 && xbul === null && /^\d{1,4}$/.test(d)) xbul = d;
+      else if (xf >= 0.28 && xf <= 0.36 && pedida === null && /^[1-9]\d{0,2}$/.test(d)) pedida = d;
+      else if (xf > 0.36 && xf < 0.43 && precio === null && /^\d{1,4}$/.test(d)) precio = _to_num(rowWords[j].t);
+      else if (xf > 0.66 && xf < 0.74 && importe === null) importe = _to_num(rowWords[j].t);
+    }
+    if (pedida) {
+      fix.cantidad = pedida;
+    } else if (xbul !== null && precio !== null && importe !== null && precio > 0) {
+      // La celda no se leyó: derivar del importe (cantidad = importe/(xBulto×precio)).
+      const q = importe / (parseFloat(xbul) * precio);
+      if (q > 0 && Math.abs(q - Math.round(q)) < 0.01 && Math.round(q) <= 999) {
+        fix.cantidad = String(Math.round(q));
+      }
+    }
+    return fix;
   } finally {
-    full.width = 0;
-    full.height = 0;
+    if (!fullCanvas) {
+      full.width = 0;
+      full.height = 0;
+    }
   }
 }
 
@@ -907,24 +1005,35 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
           const items = _pdf_table_items(p.words, p.w, p.scale);
           if (p.qtyFix) {
             for (const it of items) {
-              if (p.qtyFix[it.sku] != null) it.cantidad = p.qtyFix[it.sku];
+              const f = p.qtyFix[it.sku];
+              if (!f) continue;
+              if (f.sku) it.sku = f.sku;
+              if (f.cantidad != null) it.cantidad = f.cantidad;
+              if (f.unidad) {
+                it.unidad = f.unidad;
+                it.categoria = medida_categoria(f.unidad);
+              }
             }
           }
-          if (!items.length) continue;
+          // Descarta filas que no son líneas de pedido: sin Cant. Pedida NI
+          // unidad aun después del re-OCR de banda (ej. el bloque de dirección
+          // "1440 C.A.B.A." del encabezado, que el OCR lee con un número).
+          const items2 = items.filter((it) => it.cantidad || it.unidad);
+          if (!items2.length) continue;
           doc.tables.push({
             sheet: "página " + p.page,
             headers: ["sku", "producto", "cantidad", "unidad", "categoria"],
-            rows: items.map((it) => ({
+            rows: items2.map((it) => ({
               sku: it.sku,
               producto: it.producto,
               cantidad: it.cantidad,
               unidad: it.unidad,
               categoria: it.categoria,
             })),
-            line_items: items,
+            line_items: items2,
             col_indexes: { sku: 0, producto: 1, cantidad: 2, unidad: 3 },
           });
-          doc.line_items.push(...items);
+          doc.line_items.push(...items2);
         }
       }
     } else {

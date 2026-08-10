@@ -521,10 +521,14 @@
         score: tokArticleScore(target, t),
       });
     }
-    // 1) Código del pedido: si alguna card matchea el sku, solo esas son candidatas
-    // (nunca se agrega un producto distinto cuando el pedido existe en el store).
+    // 1) Código del pedido (v2.0.14): si la línea trae sku, el código es GATE
+    // ESTRICTO — SOLO las cards cuyo ARC-XXXX termina con ese sku son candidatas.
+    // Si el código no existe en el store (código mal leído o producto no
+    // cargado) la línea se reporta "no se encontró": el nombre solo verifica,
+    // nunca sustituye un producto distinto (ej. TOFI 2848 no está en el store).
+    // Las líneas SIN sku (Excel sin columna código) siguen matcheando por nombre.
     const byCode = parsed.filter((p) => p.codeMatch);
-    const pool = byCode.length ? byCode : parsed.filter((p) => p.shared > 0);
+    const pool = String(sku || "").trim() ? byCode : parsed.filter((p) => p.shared > 0);
     if (!pool.length) return null;
     let best = null;
     for (let i = 0; i < pool.length; i++) {
@@ -1228,6 +1232,41 @@
       out.ok = true;
       out.message = "agregado sin cantidad" + unitNote;
     }
+    // v2.0.13: el set en la card del STORE puede enviar updateCart con la
+    // variante de la unidad que la card muestra (para un producto YA en el
+    // carrito la card queda mostrando Unidad/Display aunque el ítem sea Bulto)
+    // y el servidor no la aplica: la card del carrito queda corta aunque el DOM
+    // la muestre optimista (React comparte el estado local). El input de la
+    // card del CARRITO (misma unidad que el ítem) sí persiste (verificado
+    // contra el servidor), así que la cantidad se fija SIEMPRE ahí también,
+    // forzando un cambio si el DOM ya muestra el valor pedido (un set al mismo
+    // valor no dispara el onChange de React y el servidor quedaría corto).
+    if (out.ok && wantQty > 0) {
+      const code = tokArcCode(cardText);
+      if (code) {
+        const cartInp = await waitForTokin(() => {
+          for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+            const sc = tokArcCode(
+              (el.querySelector("[data-id^=unit-size-ARC-]") || { getAttribute: () => "" }).getAttribute("data-id") || ""
+            );
+            if (sc && (sc === code || sc.endsWith(code) || code.endsWith(sc))) {
+              const inp = el.querySelector("input[type=number]");
+              if (inp) return inp;
+            }
+          }
+          return null;
+        }, 6000, 250);
+        if (cartInp) {
+          const cur = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10) || 0;
+          if (cur === wantQty && wantQty > 1) {
+            tokSetValue(cartInp, String(wantQty - 1));
+            await toksleep(250);
+          }
+          tokSetValue(cartInp, String(wantQty));
+          await toksleep(500);
+        }
+      }
+    }
     return out;
   }
 
@@ -1254,19 +1293,68 @@
     return tokRunJob();
   }
 
-  // Re-confirmación final al terminar el lote. Durante la corrida una línea
-  // puede quedar "no se confirmó en el carrito" por un estado transitorio del
-  // drawer (la card todavía no estaba con la qty pedida), pero el producto SÍ
-  // quedó cargado. Al cierre se re-lee el carrito completo (estado estable) y
-  // se vuelve a matchear cada línea no confirmada contra su card; si aparece
-  // con qty >= pedida, el resultado se corrige a "agregado (confirmado en el
-  // cierre)". Lo que siga sin card real se mantiene como fallido.
+  // Re-confirmación final al terminar el lote. Tiene dos partes:
+  // 1) RE-FIJAR cantidad: una card que quedó "agregado: N Bulto" durante la
+  //    corrida puede quedar corta DESPUÉS, porque el re-render de React / la
+  //    sincronización con el servidor la resetea a la unidad mínima (1) cuando
+  //    la siguiente navegación recarga el carrito desde el servidor (el
+  //    tokSetValue sobre la card del store no siempre registra a tiempo). Al
+  //    cierre no hay más navegaciones: se setea la qty directo en la card del
+  //    carrito (por su código ARC) y la actualización persiste (igual que el
+  //    fix GOAT de v2.0.10). Así el informe y el carrito final coinciden.
+  // 2) RE-CONFIRMAR las líneas "no se confirmó" que en realidad sí quedaron con
+  //    su card y qty pedida (estado del drawer ya estable).
   async function tokFinalVerify(job) {
     try {
       await toksleep(1500);
-      const cards = tokCartCards();
       const results = job.results || [];
       let changed = 0;
+      let cards = tokCartCards();
+
+      for (const r of results) {
+        if (!(r.ok && String(r.message || "").indexOf("agregado") === 0)) continue;
+        const wantQty = r.added || 0;
+        if (!wantQty) continue;
+        const code = tokArcCode(r.storeText || "");
+        // No se salta si el DOM ya muestra la qty pedida: ese valor puede ser
+        // OPTIMISTA (React comparte el estado local) mientras el servidor quedó
+        // corto; un set al mismo valor no dispara el onChange, por eso se fuerza
+        // un cambio real (wantQty-1 -> wantQty) para que updateCart regrese la
+        // qty al servidor.
+        let hit = null;
+        for (let i = 0; i < 8; i++) {
+          const cartEls = document.querySelectorAll("article[data-id=cart-product-card]");
+          for (const el of cartEls) {
+            const sizeEl = el.querySelector("[data-id^=unit-size-ARC-]");
+            const sc = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id") || "") : null;
+            if (sc && (sc === code || sc.endsWith(code) || code.endsWith(sc))) {
+              const inp = el.querySelector("input[type=number]");
+              if (inp) {
+                const cur = parseInt(String(inp.value || "").replace(/\D+/g, ""), 10) || 0;
+                if (cur === wantQty && wantQty > 1) {
+                  tokSetValue(inp, String(wantQty - 1));
+                  await toksleep(250);
+                }
+                tokSetValue(inp, String(wantQty));
+              }
+              break;
+            }
+          }
+          await toksleep(1000);
+          cards = tokCartCards();
+          hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty, code);
+          if (hit && hit.qty >= wantQty) break;
+        }
+        if (hit && hit.qty >= wantQty) {
+          changed++;
+        } else {
+          // La card no llegó a la qty pedida (o no existe): el informe no debe
+          // contar de más, se marca como no confirmado con su qty real.
+          r.ok = false;
+          r.message = "no se confirmó en el cierre (card qty " + (hit ? hit.qty : "sin card") + ")";
+        }
+      }
+
       for (const r of results) {
         if (r.ok) continue;
         if (String(r.message || "").indexOf("no se confirmó") !== 0) continue;
