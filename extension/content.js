@@ -1295,7 +1295,18 @@
     // "agregado"). "sin stock"/"no se encontró"/"no se confirmó" NO suman.
     const isAdded = (x) => x.ok && String(x.message || "").indexOf("agregado") === 0;
     const added = results.filter(isAdded).length;
-    const prodAdded = new Set(results.filter(isAdded).map((x) => String(x.producto || "").trim())).size;
+    // "En el carrito: N productos" se cuenta por la IDENTIDAD que usa el carrito
+    // (el código ARC de la card donde cayó la línea), no por el texto de la
+    // línea: si dos líneas (aunque tengan descripción distinta) quedaron en la
+    // MISMA card, son UN producto (semántica SET). Ej. CUENCA: el PDF lista el
+    // código 14800 en "SANDIA x500" y "FRUTILLA x500" (error del proveedor) y el
+    // gate por código las rutea a la misma card ARC-1014800 -> 41 líneas
+    // "agregado" pero 40 cards reales.
+    const prodKey = (x) => {
+      const code = tokArcCode(x.storeText || "");
+      return code ? "c:" + code : "t:" + String(x.producto || "").trim();
+    };
+    const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
     const sinStock = results.filter((x) => !isAdded(x) && /sin stock/i.test(x.message || "")).length;
     const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
     const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;

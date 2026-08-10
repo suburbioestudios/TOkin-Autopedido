@@ -225,7 +225,16 @@ function applyCartDone(msg) {
   // conteo de cargado (el informe refleja el carrito, no las líneas ok).
   const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
   const added = results.filter(isAdded).length;
-  const prodAdded = new Set(results.filter(isAdded).map((r) => String(r.producto || "").trim())).size;
+  // "En el carrito: N productos" por la IDENTIDAD del carrito (código ARC de la
+  // card donde cayó cada línea), no por el texto: dos líneas en la misma card
+  // son UN producto (SET). Caso real CUENCA: código 14800 en "SANDIA x500" y
+  // "FRUTILLA x500" (error del proveedor) -> ambas en ARC-1014800 -> 41 líneas
+  // "agregado" pero 40 cards.
+  const prodKey = (r) => {
+    const m = String(r.storeText || "").match(/ARC-?(\d+)/i);
+    return m ? "c:" + m[1] : "t:" + String(r.producto || "").trim();
+  };
+  const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
   const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
   const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
   const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
