@@ -247,7 +247,7 @@ async function _ocr_canvas(worker, canvas) {
       y1: w.bbox.y1,
     }))
     .filter((w) => w.t.trim() !== "");
-  return { text: data.text || "", conf: data.confidence || 0, words, w: canvas.width };
+  return { text: data.text || "", conf: data.confidence || 0, words, w: canvas.width, h: canvas.height };
 }
 
 // Pool sencillo: reparte los items entre N workers de Tesseract y resuelve en
@@ -336,7 +336,7 @@ async function _detect_rotations(pool, page) {
 async function _ocr_page(worker, page, rotation) {
   const canvas = await _render_page(page, rotation, OCR_SCALE);
   const r = await _ocr_canvas(worker, canvas);
-  const out = { text: r.text, words: r.words, w: r.w, scale: OCR_SCALE, conf: r.conf };
+  const out = { text: r.text, words: r.words, w: r.w, h: r.h, scale: OCR_SCALE, conf: r.conf };
   canvas.width = 0;
   canvas.height = 0;
   return out;
@@ -402,7 +402,7 @@ async function _pdf_text(data, onProgress, onCancel) {
       // Página 1: se reutiliza el probe (misma rotación y escala).
       text += firstDone.text + "\n";
       if (firstDone.words.length)
-        pages.push({ page: needOcr[0], words: firstDone.words, w: firstDone.w, scale: firstDone.scale });
+        pages.push({ page: needOcr[0], words: firstDone.words, w: firstDone.w, h: firstDone.h, scale: firstDone.scale });
 
       // Resto de páginas OCR en paralelo entre los workers del pool.
       const rest = needOcr.slice(1);
@@ -416,7 +416,30 @@ async function _pdf_text(data, onProgress, onCancel) {
       for (let k = 0; k < results.length; k++) {
         const r = results[k];
         text += r.text + "\n";
-        if (r.words.length) pages.push({ page: rest[k], words: r.words, w: r.w, scale: r.scale });
+        if (r.words.length) pages.push({ page: rest[k], words: r.words, w: r.w, h: r.h, scale: r.scale });
+      }
+
+      // Re-OCR de banda para filas con Cant. Pedida sospechosa: si el OCR global
+      // degradó la celda (ej. CUENCA: 14184 MOGUL JELLY BEANS leyó "a|" y el
+      // parser tomó el 8067 de la columna precio), re-renderiza la banda de la
+      // fila a mayor escala y extrae la cantidad por posición de columna.
+      const REFINE_SCALE = 3.0;
+      for (const pg of pages) {
+        const suspects = _pdf_suspect_rows(pg.words, pg.w, pg.scale);
+        if (!suspects.length) continue;
+        if (onProgress) onProgress("Corrigiendo cantidades de la página " + pg.page + "…");
+        const pageObj = await pdf.getPage(pg.page);
+        const fixes = {};
+        for (const s of suspects) {
+          if (onCancel && onCancel()) throw new CancelError();
+          const qty = await _pdf_band_qty(pool[0], pageObj, chosen.rot, s.sku, s.cy, pg.w, pg.h, pg.scale, REFINE_SCALE);
+          if (qty) {
+            fixes[s.sku] = qty;
+            if (typeof console !== "undefined")
+              console.log("[tokin] qty refine sku=%s %s->%s", s.sku, s.pedida, qty);
+          }
+        }
+        if (Object.keys(fixes).length) pg.qtyFix = fixes;
       }
     } finally {
       for (const worker of pool) {
@@ -454,7 +477,7 @@ function _unit_letter(t) {
   return m ? m[0] : null;
 }
 
-function _pdf_table_items(words, width, scale) {
+function _pdf_build_rows(words, scale) {
   const wlist = (words || []).filter((w) => w && w.t && String(w.t).trim() !== "");
   if (wlist.length < 5) return [];
   const sorted = wlist.slice().sort((a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2);
@@ -470,66 +493,147 @@ function _pdf_table_items(words, width, scale) {
     rows[rows.length - 1].push(w);
     last = cy;
   }
-  const items = [];
-  for (const row of rows) {
-    row.sort((a, b) => a.x0 - b.x0);
-    let sku = null;
-    let sku_i = -1;
-    for (let i = 0; i < row.length; i++) {
-      const w = row[i];
-      if (w.x0 / width < 0.1 && /^\d{4,6}$/.test(w.t)) {
-        sku = w.t;
-        sku_i = i;
-        break;
-      }
+  return rows;
+}
+
+// Analiza una fila (ordenada por x) y devuelve el item + metadatos de cantidad.
+// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/a) |
+// Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
+// producto (descripción), cantidad pedida y unidad (bulto/display).
+function _pdf_row_info(width, row) {
+  row.sort((a, b) => a.x0 - b.x0);
+  let sku = null;
+  let sku_i = -1;
+  for (let i = 0; i < row.length; i++) {
+    const w = row[i];
+    if (w.x0 / width < 0.1 && /^\d{4,6}$/.test(w.t)) {
+      sku = w.t;
+      sku_i = i;
+      break;
     }
-    if (sku === null) continue;
-    let unit = null;
-    let unit_i = -1;
-    for (let i = sku_i + 1; i < row.length; i++) {
-      const w = row[i];
-      const xf = (w.x0 + w.x1) / 2 / width;
-      if (xf < 0.25 || xf > 0.31) continue;
-      const u = _unit_letter(w.t);
-      if (u) {
-        unit = u;
-        unit_i = i;
-        break;
-      }
+  }
+  if (sku === null) return null;
+  let unit = null;
+  let unit_i = -1;
+  for (let i = sku_i + 1; i < row.length; i++) {
+    const w = row[i];
+    const xf = (w.x0 + w.x1) / 2 / width;
+    if (xf < 0.25 || xf > 0.31) continue;
+    const u = _unit_letter(w.t);
+    if (u) {
+      unit = u;
+      unit_i = i;
+      break;
     }
-    if (unit === null) continue;
-    let pedida = null;
-    for (let j = unit_i + 1; j < Math.min(unit_i + 4, row.length); j++) {
-      const d = _first_digits(row[j].t);
-      if (d !== null) {
-        pedida = d;
-        break;
-      }
+  }
+  if (unit === null) return null;
+  let pedida = null;
+  let pedidaXf = 0;
+  for (let j = unit_i + 1; j < Math.min(unit_i + 4, row.length); j++) {
+    const d = _first_digits(row[j].t);
+    if (d !== null) {
+      pedida = d;
+      pedidaXf = (row[j].x0 + row[j].x1) / 2 / width;
+      break;
     }
-    const xbulTok = unit_i > sku_i + 1 ? String(row[unit_i - 1].t || "") : "";
-    const isXbul = /^\|?\s*\d{1,4}\s*\|?$/.test(xbulTok);
-    let end = isXbul && unit_i - 2 >= sku_i + 1 ? unit_i - 2 : unit_i - 1;
-    if (end < sku_i + 1) end = unit_i - 1;
-    let desc = "";
-    for (let j = sku_i + 1; j <= end && j < row.length; j++) {
-      if (desc) desc += " ";
-      desc += row[j].t;
-    }
-    desc = desc
-      .replace(/^[\|\[\]\(\)]+/, "")
-      .replace(/[\|\[\]\(\)]+$/, "")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    if (!desc) continue;
-    items.push({
+  }
+  const xbulTok = unit_i > sku_i + 1 ? String(row[unit_i - 1].t || "") : "";
+  const isXbul = /^\|?\s*\d{1,4}\s*\|?$/.test(xbulTok);
+  let end = isXbul && unit_i - 2 >= sku_i + 1 ? unit_i - 2 : unit_i - 1;
+  if (end < sku_i + 1) end = unit_i - 1;
+  let desc = "";
+  for (let j = sku_i + 1; j <= end && j < row.length; j++) {
+    if (desc) desc += " ";
+    desc += row[j].t;
+  }
+  desc = desc
+    .replace(/^[\|\[\]\(\)]+/, "")
+    .replace(/[\|\[\]\(\)]+$/, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (!desc) return null;
+  // La celda de Cant. Pedida está en x≈0.30 (a escala 2, ancho 1584). Si el
+  // token que tomó el parser quedó en la columna precio (>0.33) o con 4+
+  // dígitos (una cantidad de pedido nunca supera 999), el OCR global degradó la
+  // celda: la fila necesita re-OCR de banda.
+  const suspect = pedida === null || pedidaXf > 0.33 || (pedida !== null && /^\d{4,}$/.test(pedida));
+  const cy = (row[sku_i].y0 + row[sku_i].y1) / 2;
+  return {
+    item: {
       sku,
       producto: desc.slice(0, 200),
       cantidad: pedida || "",
       unidad: unit,
       categoria: medida_categoria(unit),
-    });
+    },
+    sku,
+    cy,
+    pedida,
+    suspect,
+  };
+}
+
+function _pdf_table_items(words, width, scale) {
+  const items = [];
+  for (const row of _pdf_build_rows(words, scale)) {
+    const info = _pdf_row_info(width, row);
+    if (info) items.push(info.item);
   }
   return items;
+}
+
+// Filas cuya Cant. Pedida es sospechosa (OCR global degradado): devuelve sku,
+// cy (centro vertical de la fila) y el valor leído para el re-OCR de banda.
+function _pdf_suspect_rows(words, width, scale) {
+  const out = [];
+  for (const row of _pdf_build_rows(words, scale)) {
+    const info = _pdf_row_info(width, row);
+    if (info && info.suspect) out.push({ sku: info.sku, cy: info.cy, pedida: info.pedida });
+  }
+  return out;
+}
+
+// Re-OCR de la banda horizontal de una fila (cy±18 a escala 2, normalizado por
+// la altura de página) a mayor escala y extracción posicional de la cantidad: el
+// primer número de 1-3 dígitos en el rango x de la celda Cant. Pedida
+// (0.24-0.35 del ancho a escala 2), después del sku. Devuelve la cantidad o null.
+async function _pdf_band_qty(worker, page, rotation, sku, cy, width, height, scale, refineScale) {
+  const ya = Math.max(0, (cy - 18) / height);
+  const yb = Math.min(1, (cy + 18) / height);
+  const full = await _render_page(page, rotation, refineScale);
+  try {
+    const top = full.height * ya;
+    const bh = Math.max(1, Math.round(full.height * (yb - ya)));
+    const band = document.createElement("canvas");
+    band.width = full.width;
+    band.height = bh;
+    band.getContext("2d").drawImage(full, 0, top, full.width, bh, 0, 0, band.width, band.height);
+    const r = await _ocr_canvas(worker, band);
+    const k = scale / refineScale;
+    const offset = cy - 18;
+    const rowWords = (r.words || [])
+      .map((w) => ({
+        t: w.t,
+        x0: w.x0 * k,
+        x1: w.x1 * k,
+        y0: w.y0 * k + offset,
+        y1: w.y1 * k + offset,
+      }))
+      .filter((w) => w.t && String(w.t).trim() !== "" && Math.abs((w.y0 + w.y1) / 2 - cy) <= 16)
+      .sort((a, b) => a.x0 - b.x0);
+    const skuIdx = rowWords.findIndex((w) => w.t === sku);
+    if (skuIdx < 0) return null;
+    for (let j = skuIdx + 1; j < rowWords.length; j++) {
+      const xf = (rowWords[j].x0 + rowWords[j].x1) / 2 / width;
+      if (xf < 0.24 || xf > 0.35) continue;
+      const d = _first_digits(rowWords[j].t);
+      if (d !== null && /^\d{1,3}$/.test(d)) return d;
+    }
+    return null;
+  } finally {
+    full.width = 0;
+    full.height = 0;
+  }
 }
 
 // ------------------------------------------------------------- lineas
@@ -801,6 +905,11 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
         doc.kv_pairs.push(..._kv_from_text(text));
         for (const p of pages) {
           const items = _pdf_table_items(p.words, p.w, p.scale);
+          if (p.qtyFix) {
+            for (const it of items) {
+              if (p.qtyFix[it.sku] != null) it.cantidad = p.qtyFix[it.sku];
+            }
+          }
           if (!items.length) continue;
           doc.tables.push({
             sheet: "página " + p.page,
