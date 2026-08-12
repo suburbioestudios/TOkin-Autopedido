@@ -522,6 +522,25 @@ function _pdf_build_rows(words, scale) {
 // Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/a) |
 // Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
 // producto (descripción), cantidad pedida y unidad (bulto/display).
+// Correcciones de OCR para las hojas escaneadas: Tesseract confunde glifos
+// similares (I/T) y deja la descripción con un token garbled (ej. "TOFI"
+// leído como "TOFT"). Se aplica por palabra sobre la descripción para que la
+// búsqueda del store use el nombre real del producto.
+const _OCR_FIX = {
+  "toft": "tofi", // TOFI (Tofi) leído con I->T
+};
+
+function _ocr_fix(text) {
+  if (!text) return text;
+  return String(text).replace(/[A-Za-z]+/g, (w) => {
+    const fix = _OCR_FIX[w.toLowerCase()];
+    if (fix == null) return w;
+    if (w === w.toUpperCase()) return fix.toUpperCase();
+    if (w[0] === w[0].toUpperCase()) return fix[0].toUpperCase() + fix.slice(1);
+    return fix;
+  });
+}
+
 function _pdf_row_info(width, row) {
   row.sort((a, b) => a.x0 - b.x0);
     // SKU extraction: primary look for 4-6 digit numbers, fallback to any numeric token >=4 digits.
@@ -594,7 +613,7 @@ function _pdf_row_info(width, row) {
     if (desc) desc += " ";
     desc += row[j].t;
   }
-  desc = desc
+  desc = _ocr_fix(desc)
     .replace(/^[\|\[\]\(\)]+/, "")
     .replace(/[\|\[\]\(\)]+$/, "")
     .replace(/\s{2,}/g, " ")
