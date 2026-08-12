@@ -432,11 +432,11 @@
 
   // Extrae el código ARC-XXXX de una card y devuelve sus dígitos (o null).
   function tokArcCode(text) {
-    const m = String(text || "").match(/ARC-?(\d+)/i);
+    const m = String(text || "").match(/ARC-(\d+)/i);
     return m ? m[1] : null;
   }
 
-  // Empatar el código del pedido con el de la card: el SKU del archivo ("13357",
+  // Empareja el código del pedido con el de la card: el SKU del archivo ("13357",
   // "11913" o "ARC-1013357") es sufijo del ARC del store ("ARC-1013357").
   function tokSkuMatch(cardText, sku) {
     const d = String(sku || "").replace(/\D+/g, "");

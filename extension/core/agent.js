@@ -524,17 +524,29 @@ function _pdf_build_rows(words, scale) {
 // producto (descripción), cantidad pedida y unidad (bulto/display).
 function _pdf_row_info(width, row) {
   row.sort((a, b) => a.x0 - b.x0);
-  let sku = null;
-  let sku_i = -1;
-  for (let i = 0; i < row.length; i++) {
-    const w = row[i];
-    if (w.x0 / width < 0.1 && /^\d{4,6}$/.test(w.t)) {
-      sku = w.t;
-      sku_i = i;
-      break;
+    // SKU extraction: primary look for 4-6 digit numbers, fallback to any numeric token >=4 digits.
+    let sku = null;
+    let sku_i = -1;
+    for (let i = 0; i < row.length; i++) {
+      const w = row[i];
+      if (w.x0 / width < 0.1 && /^\d{4,6}$/.test(w.t)) {
+        sku = w.t;
+        sku_i = i;
+        break;
+      }
     }
-  }
-  if (sku === null) return null;
+    // Fallback: if not found, look for any numeric token of sufficient length.
+    if (sku === null) {
+      for (let i = 0; i < row.length; i++) {
+        const w = row[i];
+        if (w.x0 / width < 0.2 && /^\d{4,}$/.test(w.t)) {
+          sku = w.t;
+          sku_i = i;
+          break;
+        }
+      }
+    }
+    if (sku === null) return null;
   let unit = null;
   let unit_i = -1;
   for (let i = sku_i + 1; i < row.length; i++) {
