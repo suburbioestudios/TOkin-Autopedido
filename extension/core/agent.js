@@ -742,7 +742,11 @@ async function _pdf_band_refine(worker, page, rotation, sku, cy, width, height, 
       const xf = (rowWords[j].x0 + rowWords[j].x1) / 2 / width;
       const d = _first_digits(rowWords[j].t);
       if (d === null || xf < 0.24) continue;
-      if (xf < 0.28 && xbul === null && /^\d{1,4}$/.test(d)) xbul = d;
+      // La columna "unid x bult" del proveedor está en x≈0.26 (el token @0.24,
+      // ej. "36|" en OSITOS 3D, es parte del área de descripción). Si se la
+      // agarraba como xBulto la derivación por importe daba 1.33 y la cantidad
+      // quedaba en el precio ("123251"). Ventana 0.25-0.28.
+      if (xf >= 0.25 && xf < 0.28 && xbul === null && /^\d{1,4}$/.test(d)) xbul = d;
       else if (xf >= 0.28 && xf <= 0.36 && pedida === null && /^[1-9]\d{0,2}$/.test(d)) pedida = d;
       else if (xf > 0.36 && xf < 0.43 && precio === null && /^\d{1,4}$/.test(d)) precio = _to_num(rowWords[j].t);
       else if (xf > 0.66 && xf < 0.74 && importe === null) importe = _to_num(rowWords[j].t);
