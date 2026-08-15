@@ -486,17 +486,31 @@ function _first_digits(t) {
 // Columna de unidad del proveedor: el OCR puede dar la letra (b/d/a) o la
 // nomenclatura UN/DI/BU (unidad/display/bulto). Devuelve siempre la letra
 // canónica que consume el carrito: a=unidad, b=bulto, d=display.
+// El OCR de las hojas escaneadas pega la unidad al xBulto o le inventa glifos
+// adelante (la "u" chica se lee "1u"/"lu"/"|b", la "a" como "la"), así que tras
+// quitar dígitos y el glifo confundido ([l1iI]) que puede preceder la letra
+// real, se re-evalúa. Solo aplica sobre tokens del rango de la columna de
+// unidad (0.25-0.31), nunca sobre la descripción.
 function _unit_letter(t) {
   let s = String(t || "")
     .trim()
     .toLowerCase()
-    .replace(/[|\[\]()*]/g, "")
+    .replace(/[|\[\]()*;:.,'"`~^]/g, "")
     .trim();
   if (/^(un|und|unid|unidad|u)$/.test(s)) return "a";
   if (/^(bu|bulto|bultos|b)$/.test(s)) return "b";
   if (/^(di|disp|disps|display|d)$/.test(s)) return "d";
+  s = s.replace(/^[0-9]+/, "").replace(/^[l1iI]+/, "");
+  if (/^(un|und|unid|unidad|u)$/.test(s)) return "a";
+  if (/^(bu|bulto|bultos|b)$/.test(s)) return "b";
+  if (/^(di|disp|disps|display|d)$/.test(s)) return "d";
   const m = /[bda]/.exec(s);
-  return m ? m[0] : null;
+  if (m) return m[0];
+  // En la columna de unidad el único token con "u" al final (tras quitar el
+  // ruido de OCR que se le inventa adelante: "oilu", "1u", "lu") es la "u" de
+  // unidad; la "a" suelta es ruido de separación y no se cuenta.
+  if (/u$/.test(s)) return "a";
+  return null;
 }
 
 function _pdf_build_rows(words, scale) {
@@ -523,11 +537,37 @@ function _pdf_build_rows(words, scale) {
 // Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
 // producto (descripción), cantidad pedida y unidad (bulto/display).
 // Correcciones de OCR para las hojas escaneadas: Tesseract confunde glifos
-// similares (I/T) y deja la descripción con un token garbled (ej. "TOFI"
-// leído como "TOFT"). Se aplica por palabra sobre la descripción para que la
-// búsqueda del store use el nombre real del producto.
+// similares y deja la descripción con tokens garbled (ej. "TOFI" leído como
+// "TOFT", "AGUILA" como "ACUILA", "MOGUL" como "MOCUL"/"IMOGUL", "GOMITAS"
+// como "COMITAS"). Se aplica por palabra sobre la descripción para que la
+// búsqueda del store use el nombre real del producto. La clave siempre va en
+// minúsculas (el token se normaliza antes de consultar).
 const _OCR_FIX = {
-  "toft": "tofi", // TOFI (Tofi) leído con I->T
+  // TOFI (Tofi) leído con I->T
+  "toft": "tofi",
+  // Marcas (C/G, O/U y prefijos I/J que el OCR inventa delante)
+  "acuila": "aguila",
+  "mocul": "mogul", "mocur": "mogul", "mocun": "mogul", "imogul": "mogul",
+  "imocul": "mogul", "iocul": "mogul", "iocun": "mogul", "iuocur": "mogul",
+  "jmogul": "mogul", "jmocul": "mogul", "jmocur": "mogul", "juogul": "mogul",
+  "saradrx": "saladix", "rocxuets": "rocklets",
+  "copler": "cofler", "jcopler": "cofler", "jcofler": "cofler",
+  "corler": "cofler", "wousse": "mousse", "topi": "tofi",
+  "goat": "tofi", "bacley": "bagley",
+  // Palabras de producto del catálogo de Arcor
+  "comitas": "gomitas", "comttas": "gomitas", "comrtas": "gomitas",
+  "omrtas": "gomitas",
+  "osttos": "ositos", "antllos": "anillos", "euttons": "buttons",
+  "exreme": "extreme",
+  "coorie": "cookie", "cooktes": "cookie",
+  "carmmelo": "caramelo", "carmelo": "caramelo", "carmeelo": "caramelo",
+  "mastt": "masti",
+  "tutii": "tutti", "prutilla": "frutilla", "amarco": "amargo",
+  "repo": "repostero",
+  "cros": "cross", "sornzadas": "horneadas", "travima": "traviata",
+  "arr": "air", "treple": "triple",
+  // "BON O BON" con B/N degradadas a m/n ("moN o noN", "BoN 0 BO")
+  "mon": "bon", "non": "bon", "bo": "bon",
 };
 
 function _ocr_fix(text) {
