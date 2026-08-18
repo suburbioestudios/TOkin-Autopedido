@@ -560,59 +560,90 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     }
   }
 
-  // Excel de cierre (v2.0.10): ítems del pedido + los que NO quedaron en el
-  // carrito (con su motivo). Regla de negocio: solo puede quedar fuera del
-  // pedido un ítem "sin stock"; los demás (no encontrado / sin confirmar /
-  // error) se marcan para revisión. Se genera con SheetJS (xlsx.full.min.js).
+  // Excel de cierre (v2.0.20): idéntico al popup — colores de fondo
+  // (verde/naranja/rojo), mensaje exacto del resultado, unidad encontrada,
+  // cantidad real agregada, card del store, y resumen con conteo por estado.
+  // Se genera con SheetJS (xlsx.full.min.js).
   function descargarExcel() {
     const items = ui.lineItems || [];
     const results = ((ui.cart && ui.cart.results) || []).slice();
     const baseName = (ui.cart && ui.cart.docName) || "informe";
     const isAdded = (r) => r.ok && String(r.message || "").indexOf("agregado") === 0;
-    const rows = [];
-    const pending = [];
-    items.forEach((it, i) => {
-      const r = results[i] || {};
-      const unidad = it.categoria || it.unidad || "";
-      let estado;
-      let motivo = r.message || "";
-      if (isAdded(r)) {
-        estado = "Agregado";
-        motivo = "";
-      } else if (/sin stock/i.test(r.message || "")) {
-        estado = "Sin stock (fuera del pedido)";
-      } else if (/no se encontró/i.test(r.message || "")) {
-        estado = "No encontrado";
-        motivo = "Falta cargar: no se encontró en el store";
-      } else if (String(r.message || "").indexOf("no se confirmó") === 0) {
-        estado = "Sin confirmar";
-        motivo = "Falta cargar: no se confirmó en el carrito";
-      } else if (r.message) {
-        estado = "Falta cargar";
-      } else {
-        estado = "Pendiente";
-      }
-      const row = {
-        "#": i + 1,
-        "Código": it.sku || "",
-        "Producto": it.producto || "",
-        "Cant.": it.cantidad || "",
-        "Unidad": unidad,
-        "Estado": estado,
-        "Detalle": motivo,
-      };
-      rows.push(row);
-      if (!isAdded(r)) pending.push(row);
+    const added = results.filter(isAdded).length;
+    const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
+    const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+    const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+
+    const GREEN = "C6EFCE";
+    const ORANGE = "FFE699";
+    const RED = "FFC7CE";
+    const GRAY_BG = "F2F2F2";
+
+    const headerStyle = { font: { bold: true, sz: 11 }, fill: { fgColor: { rgb: "D9E1F2" } } };
+    const greenStyle = { fill: { fgColor: { rgb: GREEN } } };
+    const orangeStyle = { fill: { fgColor: { rgb: ORANGE } } };
+    const redStyle = { fill: { fgColor: { rgb: RED } } };
+    const summaryStyle = { font: { bold: true, sz: 10 }, fill: { fgColor: { rgb: GRAY_BG } } };
+
+    function statusCls(r) {
+      if (isAdded(r)) return "ok";
+      return r.ok ? "warn" : "err";
+    }
+    function rowStyle(r) {
+      var c = statusCls(r);
+      return c === "ok" ? greenStyle : c === "warn" ? orangeStyle : redStyle;
+    }
+
+    var summaryParts = ["Pedido cargado: " + added + " de " + results.length + "."];
+    if (sinStock) summaryParts.push("Sin stock: " + sinStock);
+    if (notFound) summaryParts.push("No encontrados: " + notFound);
+    if (notConfirmed) summaryParts.push("Sin confirmar: " + notConfirmed);
+
+    var headers = ["#", "Código", "Producto", "Cant.", "Unidad", "Estado", "Mensaje", "Cant. real", "Unidad real", "Card store"];
+    var aoa = [];
+    var sumRow = [];
+    sumRow.push({ t: "s", v: summaryParts.join("  ·  "), s: summaryStyle });
+    for (var h = 1; h < headers.length; h++) sumRow.push({ t: "s", v: "", s: summaryStyle });
+    aoa.push(sumRow);
+    aoa.push(headers.map(function(h) { return { t: "s", v: h, s: headerStyle }; }));
+
+    var pendingAoa = [];
+    pendingAoa.push(headers.map(function(h) { return { t: "s", v: h, s: headerStyle }; }));
+
+    items.forEach(function(it, i) {
+      var r = results[i] || {};
+      var unidad = it.categoria || it.unidad || "";
+      var sty = rowStyle(r);
+      var msg = r.message || "";
+      var num = i + 1;
+      var addedQty = r.added || "";
+      var usedUnit = r.usedUnit || "";
+      var storeName = r.storeName || "";
+      var row = [
+        { t: "n", v: num, s: sty },
+        { t: "s", v: String(it.sku || ""), s: sty },
+        { t: "s", v: String(it.producto || ""), s: sty },
+        { t: "s", v: String(it.cantidad || ""), s: sty },
+        { t: "s", v: String(unidad), s: sty },
+        { t: "s", v: String(statusCls(r)), s: sty },
+        { t: "s", v: String(msg), s: sty },
+        { t: "n", v: addedQty, s: sty },
+        { t: "s", v: String(usedUnit), s: sty },
+        { t: "s", v: String(storeName), s: sty }
+      ];
+      aoa.push(row);
+      if (!isAdded(r)) pendingAoa.push(row.slice());
     });
+
     try {
-      const wb = XLSX.utils.book_new();
-      const ws = XLSX.utils.json_to_sheet(rows);
-      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 34 }, { wch: 46 }];
+      var wb = XLSX.utils.book_new();
+      var ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 44 }, { wch: 10 }, { wch: 10 }, { wch: 40 }];
       XLSX.utils.book_append_sheet(wb, ws, "Pedido");
-      const ws2 = XLSX.utils.json_to_sheet(pending);
-      ws2["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 34 }, { wch: 46 }];
+      var ws2 = XLSX.utils.aoa_to_sheet(pendingAoa);
+      ws2["!cols"] = ws["!cols"].slice();
       XLSX.utils.book_append_sheet(wb, ws2, "No cargados");
-      const name = String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "informe";
+      var name = String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "informe";
       XLSX.writeFile(wb, name + ".xlsx");
       setStatus("Excel descargado: " + name + ".xlsx", "ok");
     } catch (e) {

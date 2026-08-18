@@ -939,13 +939,19 @@ function _build_table_obj(sheet, rows, headerIdx) {
   const lineItems = [];
   for (const row of dataRows) {
     if (_is_line_row(row, idxSku, idxProd, idxQty, idxPrice, idxImport)) {
-      const cantidad = idxQty != null && idxQty < row.length ? String(row[idxQty]).trim() : "";
+      let cantidad = idxQty != null && idxQty < row.length ? String(row[idxQty]).trim() : "";
       let unidad = "";
       if (idxMed != null && idxMed < row.length && idxMed !== idxQty && String(row[idxMed]).trim()) {
         unidad = String(row[idxMed]).trim();
-      } else {
-        const q = parse_qty(cantidad);
-        if (q && q.unit) unidad = q.unit;
+      }
+      // Always try parse_qty on the cantidad cell: it may contain UNIT+QTY combined
+      // (e.g. "b 2", "d 4", "DI 6") even when there's a separate U.M column.
+      const q = parse_qty(cantidad);
+      if (q) {
+        // If we don't have a unit from the U.M column, use the one from the cell
+        if (!unidad && q.unit) unidad = q.unit;
+        // Always use the clean numeric quantity (strip any unit prefix/suffix)
+        cantidad = String(q.num);
       }
       lineItems.push({
         sku: idxSku != null && idxSku < row.length ? clean_value(row[idxSku]) : "",

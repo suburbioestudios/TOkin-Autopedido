@@ -58,14 +58,25 @@ export function is_numeric(v) {
 }
 
 // "24 B" -> {num:24, unit:"B"}, "6 D" -> {num:6, unit:"D"}, "24" -> {num:24, unit:""}
+// Also handles UNIT before NUMBER: "B 24" -> {num:24, unit:"B"}, "DI 6" -> {num:6, unit:"DI"}
 export function parse_qty(v) {
   if (v == null) return null;
   const s = String(v).trim();
-  const m = s.match(/^(\d+(?:[.,]\d+)?)\s*([A-Za-z]*)$/);
-  if (!m) return null;
-  const num = parseFloat(m[1].replace(",", "."));
-  if (isNaN(num)) return null;
-  return { num, unit: m[2].toUpperCase() };
+  // NUMBER first: "4 d", "2B", "6 DI", "12"
+  let m = s.match(/^(\d+(?:[.,]\d+)?)\s*([A-Za-z]*)$/);
+  if (m) {
+    const num = parseFloat(m[1].replace(",", "."));
+    if (isNaN(num)) return null;
+    return { num, unit: m[2].toUpperCase() };
+  }
+  // UNIT first: "d 4", "B 2", "DI 6", "bulto 2", "display 4"
+  m = s.match(/^([A-Za-z]+)\s*(\d+(?:[.,]\d+)?)$/);
+  if (m) {
+    const num = parseFloat(m[2].replace(",", "."));
+    if (isNaN(num)) return null;
+    return { num, unit: m[1].toUpperCase() };
+  }
+  return null;
 }
 
 // Columna de unidad -> categoria del store: "bulto" | "display" | "unidad".
