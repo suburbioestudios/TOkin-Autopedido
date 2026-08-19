@@ -469,6 +469,24 @@
     return "";
   }
 
+  // Parsea el texto de la card para extraer la conversión de unidad (v2.0.21).
+  // Formato del store: "Display: 10 Uds / Bulto: 80 Uds = 8 Disp"
+  // Retorna el factor de conversión (ej: 10) o 0 si no encuentra nada.
+  function tokParseUnitConversion(cardText, wantType) {
+    if (!cardText || !wantType) return 0;
+    const norm = tokNorm(cardText);
+    const typeAliases = TOK_UNIT_ALIASES[wantType] || [wantType];
+    for (const alias of typeAliases) {
+      const re = new RegExp(alias + "[:\\s]+(\\d+)\\s*Uds", "i");
+      const m = norm.match(re);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (n > 0 && n <= 999) return n;
+      }
+    }
+    return 0;
+  }
+
   // Una card de producto real tiene precio, SKU ARC-*, botones de unidad o de
   // Agregar (o dice "sin stock"). Los <article> del footer/Institucional no.
   function tokIsProductCard(a) {
@@ -1158,13 +1176,35 @@
     } else if (btns.length) {
       if (cand.codeMatch) {
         // Producto confirmado por CÓDIGO: la card no ofrece la unidad pedida.
-        // Se agrega en la primera unidad disponible (no se usa otro producto).
+        // v2.0.21: si la card muestra la conversión (ej. "Display: 10 Uds"),
+        // se piden las unidades convertidas en vez de 1 unidad suelta.
         const uName = tokUnitLabelFromBtn(btns[0].innerText || "");
-        unitBtn = btns[0];
-        usedUnit = uName || wantUnit;
-        unitNote = " (la card solo ofrece " + (uName || "otra unidad") + ")";
-        unitBtn.click();
-        await toksleep(1500);
+        const conv = tokParseUnitConversion(cardText, wantType);
+        if (conv > 0 && wantType !== "unidad" && wantType !== (uName || "").toLowerCase()) {
+          // La card tiene la conversión: wantQty Display/Bulto → wantQty * conv Unidades.
+          const convertedQty = wantQty * conv;
+          if (convertedQty > 999) {
+            out.ok = false;
+            out.message =
+              "no se agregó: " + wantQty + " " + wantUnit + " = " + convertedQty +
+              " unidades, supera el límite de 999 del store";
+            return out;
+          }
+          unitBtn = btns[0];
+          usedUnit = "Unidad";
+          unitNote = " (" + wantQty + " " + wantUnit + " = " + convertedQty + " Unidad)";
+          unitBtn.click();
+          await toksleep(1500);
+          // Reemplazar wantQty por la cantidad convertida para que se setee en el input.
+          wantQty = convertedQty;
+        } else {
+          // Sin conversión: se agrega en la primera unidad disponible.
+          unitBtn = btns[0];
+          usedUnit = uName || wantUnit;
+          unitNote = " (la card solo ofrece " + (uName || "otra unidad") + ")";
+          unitBtn.click();
+          await toksleep(1500);
+        }
       } else {
         // Sin código confirmado: NO se elige otra unidad, el pedido pide esa.
         out.message = "la card no ofrece el botón de " + wantUnit + " pedido";
@@ -1224,10 +1264,29 @@
     if (wantQty > 0) {
       for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, String(wantQty));
       await toksleep(600);
+      // v2.0.21: si hubo conversión (Display/Bulto → Unidades), verificar que
+      // el store aceptó la cantidad completa. Si el store capó la qty (stock
+      // insuficiente),.reportar el límite en vez de reportar "agregado".
+      let actualQty = wantQty;
+      if (unitNote && unitNote.indexOf("=") !== -1) {
+        for (const el of nums) {
+          if (el.offsetParent !== null) {
+            const v = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+            if (v > 0 && v < actualQty) actualQty = v;
+          }
+        }
+      }
       out.ok = true;
-      out.added = wantQty;
+      out.added = actualQty;
       out.usedUnit = usedUnit;
-      out.message = "agregado: " + wantQty + " " + usedUnit + unitNote;
+      if (actualQty < wantQty && unitNote && unitNote.indexOf("=") !== -1) {
+        out.ok = false;
+        out.message =
+          "no se agregó: el store solo tiene " + actualQty + " unidades" +
+          " (necesitaba " + wantQty + " para cubrir" + unitNote + ")";
+      } else {
+        out.message = "agregado: " + actualQty + " " + usedUnit + unitNote;
+      }
     } else {
       out.ok = true;
       out.message = "agregado sin cantidad" + unitNote;
