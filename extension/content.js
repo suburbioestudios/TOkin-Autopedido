@@ -1198,12 +1198,14 @@
           // Reemplazar wantQty por la cantidad convertida para que se setee en el input.
           wantQty = convertedQty;
         } else {
-          // Sin conversión: se agrega en la primera unidad disponible.
-          unitBtn = btns[0];
-          usedUnit = uName || wantUnit;
-          unitNote = " (la card solo ofrece " + (uName || "otra unidad") + ")";
-          unitBtn.click();
-          await toksleep(1500);
+          // v2.0.22: sin conversión y sin botón de la unidad pedida: NO se
+          // agrega en otra unidad. El usuario pide Display/Bulto y la card no
+          // ofrece esa unidad ni tiene info de conversión.
+          out.ok = false;
+          out.message =
+            "la card no ofrece " + wantUnit +
+            " ni conversión (solo " + (uName || "otra unidad") + ")";
+          return out;
         }
       } else {
         // Sin código confirmado: NO se elige otra unidad, el pedido pide esa.

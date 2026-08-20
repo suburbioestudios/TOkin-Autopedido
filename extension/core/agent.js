@@ -450,9 +450,14 @@ async function _pdf_text(data, onProgress, onCancel) {
             full
           );
           if (!fix) continue;
-          // La cantidad del re-OCR solo se aplica si la fila es sospechosa:
-          // para las filas normales el valor del parse global ya es correcto.
-          if (!s.suspect) delete fix.cantidad;
+          // v2.0.22: si el re-OCR de banda (scale 3.5) difiere del parse global
+          // (scale 2.0), el valor de la banda es más confiable para celdas
+          // pequeñas de tabla (Tesseract confunde dígitos cercanos: 3→31, 12→22).
+          // Solo se descarta la corrección si el parse global es sospechoso.
+          if (!s.suspect && fix.cantidad != null && s.pedida != null &&
+              fix.cantidad === s.pedida) {
+            delete fix.cantidad;
+          }
           if (fix.cantidad != null || fix.unidad != null || fix.sku != null) {
             fixes[s.sku] = fix;
             if (typeof console !== "undefined")
