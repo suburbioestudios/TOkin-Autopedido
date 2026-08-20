@@ -643,7 +643,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       var ws2 = XLSX.utils.aoa_to_sheet(pendingAoa);
       ws2["!cols"] = ws["!cols"].slice();
       XLSX.utils.book_append_sheet(wb, ws2, "No cargados");
-      var name = String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "informe";
+      var name = "reporte tokin " + String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "reporte tokin informe";
       XLSX.writeFile(wb, name + ".xlsx");
       setStatus("Excel descargado: " + name + ".xlsx", "ok");
     } catch (e) {
