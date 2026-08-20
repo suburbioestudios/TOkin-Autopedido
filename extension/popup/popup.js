@@ -599,7 +599,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     if (notFound) summaryParts.push("No encontrados: " + notFound);
     if (notConfirmed) summaryParts.push("Sin confirmar: " + notConfirmed);
 
-    var headers = ["#", "Código", "Producto", "Cant.", "Unidad", "Estado", "Mensaje", "Cant. real", "Unidad real", "Código store", "Card store"];
+    var headers = ["#", "Código", "Producto", "Cant. pedida", "Unidad", "Estado", "Mensaje"];
     var aoa = [];
     var sumRow = [];
     sumRow.push({ t: "s", v: summaryParts.join("  ·  "), s: summaryStyle });
@@ -616,10 +616,6 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       var sty = rowStyle(r);
       var msg = r.message || "";
       var num = i + 1;
-      var addedQty = r.added || "";
-      var usedUnit = r.usedUnit || "";
-      var storeArc = (String(r.storeText || "").match(/ARC-(\d+)/) || [])[1] || "";
-      var storeName = r.storeName || "";
       var row = [
         { t: "n", v: num, s: sty },
         { t: "s", v: String(it.sku || ""), s: sty },
@@ -627,11 +623,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
         { t: "s", v: String(it.cantidad || ""), s: sty },
         { t: "s", v: String(unidad), s: sty },
         { t: "s", v: String(statusCls(r)), s: sty },
-        { t: "s", v: String(msg), s: sty },
-        { t: "n", v: addedQty, s: sty },
-        { t: "s", v: String(usedUnit), s: sty },
-        { t: "s", v: String(storeArc), s: sty },
-        { t: "s", v: String(storeName), s: sty }
+        { t: "s", v: String(msg), s: sty }
       ];
       aoa.push(row);
       if (!isAdded(r)) pendingAoa.push(row.slice());
@@ -640,7 +632,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     try {
       var wb = XLSX.utils.book_new();
       var ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 44 }, { wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 40 }];
+      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 50 }];
       XLSX.utils.book_append_sheet(wb, ws, "Pedido");
       var ws2 = XLSX.utils.aoa_to_sheet(pendingAoa);
       ws2["!cols"] = ws["!cols"].slice();
