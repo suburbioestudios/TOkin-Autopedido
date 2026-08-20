@@ -1521,11 +1521,28 @@
     } catch (e) {}
   }
 
+  // v2.0.23: vaciar el carrito del store (setear qty a 0 en cada card).
+  async function tokEmptyCart() {
+    try {
+      const cards = document.querySelectorAll("article[data-id=cart-product-card]");
+      for (const card of cards) {
+        const inp = card.querySelector("input[type=number]");
+        if (inp && inp.offsetParent !== null) {
+          tokSetValue(inp, "0");
+          await toksleep(400);
+        }
+      }
+    } catch (e) {}
+  }
+
   async function tokAbortCart(job, interrupted) {
     await tokStoreRemove(CART_JOB_KEY);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
-    tokToastSet(interrupted ? "Tarea interrumpida (pestaña o sesión cerrada)." : "Carga cancelada.", "");
+    // v2.0.23: vaciar el carrito al cancelar/interrumpir para que el usuario
+    // pueda reanudar limpio (sin productos viejos mezclados).
+    await tokEmptyCart();
+    tokToastSet(interrupted ? "Tarea interrumpida — carrito vaciado." : "Carga cancelada — carrito vaciado.", "");
     try {
       // interrupted: la pestaña/sesión se cerró o el lote quedó huérfano → el
       // offscreen vuelve al paso de líneas capturadas (CART_STOP), no a
