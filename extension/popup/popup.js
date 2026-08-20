@@ -134,7 +134,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     if (!st) return "";
     if (st.status === "error") return "err";
     if (st.status === "parsed" || st.status === "done") return "ok";
-    if (st.status === "canceled") return "warn";
+    if (st.status === "canceled" || st.status === "paused") return "warn";
     return "";
   }
 
@@ -204,6 +204,14 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
         resetPanels();
         setStatus(st.progress || "Proceso cancelado.", "warn");
       }
+    } else if (st.status === "paused") {
+      showEl("#items-box", true);
+      showEl("#done-summary", false);
+      showEl("#cart-results-final", false);
+      showEl("#done-hint", false);
+      setAction("cancelCart");
+      renderCartItems(st.cartProgress, st.cart && st.cart.total);
+      setStatus(st.progress || "Tarea pausada — reanudá cuando tengas señal.", "warn");
     } else if (st.status === "error") {
       resetPanels();
       setStatus(st.error || st.progress || "Ocurrió un error.", "err");
@@ -565,7 +573,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   // cantidad real agregada, card del store, y resumen con conteo por estado.
   // Se genera con SheetJS (xlsx.full.min.js).
   function descargarExcel() {
-    const items = ui.lineItems || [];
+    const allItems = (ui.cart && ui.cart.allLineItems) || ui.lineItems || [];
     const results = ((ui.cart && ui.cart.results) || []).slice();
     const baseName = (ui.cart && ui.cart.docName) || "informe";
     const isAdded = (r) => r.ok && String(r.message || "").indexOf("agregado") === 0;
@@ -608,9 +616,10 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     pendingAoa.push(headers.map(function(h) { return { t: "s", v: h, s: headerStyle }; }));
 
     var pendIdx = 0;
-    items.forEach(function(it, i) {
+    allItems.forEach(function(it, i) {
       var r = results[i] || {};
       if (isAdded(r)) return;
+      if (!(it.producto || it.sku || "").trim()) return;
       pendIdx++;
       var unidad = it.categoria || it.unidad || "";
       var msg = r.message || "(sin mensaje)";

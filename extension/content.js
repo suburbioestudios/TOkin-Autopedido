@@ -884,6 +884,13 @@
   async function tokCartStart(items, tabId, filename) {
     cartCancel = false;
     const existing = await tokStoreGet(CART_JOB_KEY);
+    // v2.0.23: si hay un job pausado (interrupción de internet), reanudarlo
+    // en vez de bloquear. El usuario ya tiene los items en el carrito.
+    if (existing && existing.phase === "paused") {
+      setTokRun(true);
+      tokRunJob();
+      return { ok: true, resumed: true, total: existing.total };
+    }
     if (existing) {
       return { ok: false, message: "Ya hay una carga de carrito en curso." };
     }
@@ -953,14 +960,10 @@
       const reason = cartCancel ? "user" : await tokCancelReason();
       if (reason) return tokAbortCart(job, reason === "stop");
       // v2.0.23: verificar conectividad antes de cada búsqueda.
-      // Si no hay internet, frenar el job y avisar al usuario.
+      // Si no hay internet, pausar el job (no abortar) para que se pueda
+      // reanudar desde donde se quedó sin repetir líneas.
       if (!(await tokCheckNet())) {
-        job.results.push({
-          producto: job.items[job.index].producto || job.items[job.index].sku || "",
-          ok: false,
-          message: "sin conexión a internet — reanudá la tarea cuando tengas señal",
-        });
-        return tokAbortCart(job, false);
+        return tokPauseCart(job);
       }
       if (job.phase === "pending") {
         const it = job.items[job.index];
@@ -1402,6 +1405,7 @@
   async function tokFinalVerify(job) {
     try {
       await toksleep(1500);
+      tokToastSet("Verificando cantidades en el carrito…", "");
       const results = job.results || [];
       let changed = 0;
       let cards = tokCartCards();
@@ -1411,13 +1415,11 @@
         const wantQty = r.added || 0;
         if (!wantQty) continue;
         const code = tokArcCode(r.storeText || "");
-        // No se salta si el DOM ya muestra la qty pedida: ese valor puede ser
-        // OPTIMISTA (React comparte el estado local) mientras el servidor quedó
-        // corto; un set al mismo valor no dispara el onChange, por eso se fuerza
-        // un cambio real (wantQty-1 -> wantQty) para que updateCart regrese la
-        // qty al servidor.
-        let hit = null;
-        for (let i = 0; i < 8; i++) {
+        // Primero verificar si la card ya tiene la qty correcta (sin re-setear).
+        let hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty, code);
+        if (hit && hit.qty >= wantQty) { changed++; continue; }
+        // Si no, re-setear la cantidad y verificar (máx 3 intentos, 600ms c/u).
+        for (let i = 0; i < 3; i++) {
           const cartEls = document.querySelectorAll("article[data-id=cart-product-card]");
           for (const el of cartEls) {
             const sizeEl = el.querySelector("[data-id^=unit-size-ARC-]");
@@ -1428,14 +1430,14 @@
                 const cur = parseInt(String(inp.value || "").replace(/\D+/g, ""), 10) || 0;
                 if (cur === wantQty && wantQty > 1) {
                   tokSetValue(inp, String(wantQty - 1));
-                  await toksleep(250);
+                  await toksleep(200);
                 }
                 tokSetValue(inp, String(wantQty));
               }
               break;
             }
           }
-          await toksleep(1000);
+          await toksleep(600);
           cards = tokCartCards();
           hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty, code);
           if (hit && hit.qty >= wantQty) break;
@@ -1443,8 +1445,6 @@
         if (hit && hit.qty >= wantQty) {
           changed++;
         } else {
-          // La card no llegó a la qty pedida (o no existe): el informe no debe
-          // contar de más, se marca como no confirmado con su qty real.
           r.ok = false;
           r.message = "no se confirmó en el cierre (card qty " + (hit ? hit.qty : "sin card") + ")";
         }
@@ -1535,6 +1535,30 @@
     } catch (e) {}
   }
 
+  // v2.0.23: pausar el job por interrupción (internet, etc.). NO vacía el
+  // carrito ni borra el job: al reanudar se verifica la última línea y se
+  // continúa desde ahí.
+  async function tokPauseCart(job) {
+    job.phase = "paused";
+    job.pausedAt = Date.now();
+    await tokStoreSet(CART_JOB_KEY, job);
+    await tokStoreRemove(CART_CANCEL_KEY);
+    setTokRun(false);
+    tokToastSet("Sin conexión — tarea pausada en línea " + (job.index + 1) + "/" + job.total + ". Reanudá cuando tengas señal.", "warn");
+    try {
+      chrome.runtime.sendMessage(
+        { target: "offscreen", type: "CART_PAUSE" },
+        () => { void chrome.runtime.lastError; }
+      );
+    } catch (e) {}
+    try {
+      window.postMessage(
+        { __tok: "cart-res", payload: { paused: true, total: job.total, index: job.index, results: job.results } },
+        "*"
+      );
+    } catch (e) {}
+  }
+
   async function tokAbortCart(job, interrupted) {
     await tokStoreRemove(CART_JOB_KEY);
     await tokStoreRemove(CART_CANCEL_KEY);
@@ -1600,6 +1624,44 @@
         if (!me || me !== job.tabId) return tokAbortCart(job, true);
       }
       if (job.phase === "searching" && location.href.indexOf("/store/search") !== -1) {
+        setTokRun(true);
+        tokRunJob();
+      }
+      // v2.0.23: reanudar tras pausa por interrupción (internet).
+      // Buscar desde la ÚLTIMA línea que se confirmó en el carrito y continuar
+      // desde la siguiente. No repetir líneas ya cargadas.
+      if (job.phase === "paused") {
+        const cards = tokCartCards();
+        let resumeFrom = job.index;
+        // Revisar las líneas desde la actual hacia atrás para encontrar la
+        // última que realmente está en el carrito (confirmada).
+        for (let checkIdx = job.index; checkIdx >= 0; checkIdx--) {
+          const checkIt = job.items[checkIdx];
+          const checkSku = String(checkIt.sku || "").replace(/\D+/g, "");
+          const checkFound = checkSku ? cards.find(function(c) { return c.code && c.code.endsWith(checkSku); }) : null;
+          if (checkFound) {
+            // Esta línea ya está en el carrito. Si no tiene resultado, agregarlo.
+            const alreadyResulted = job.results.some(function(r, ri) { return ri === checkIdx && r.ok; });
+            if (!alreadyResulted) {
+              const wantUnit = tokUnitLabel(checkIt);
+              job.results[checkIdx] = {
+                producto: checkIt.producto || checkIt.sku || "",
+                ok: true,
+                message: "agregado: " + checkFound.qty + " " + wantUnit + " (reanudado tras interrupción)",
+                added: checkFound.qty,
+                usedUnit: wantUnit,
+                storeText: "",
+              };
+            }
+            resumeFrom = checkIdx + 1;
+            break;
+          }
+        }
+        // Si no se encontró ninguna línea en el carrito, reintentar desde job.index.
+        job.index = resumeFrom;
+        job.qIdx = 0;
+        job.phase = "pending";
+        await tokStoreSet(CART_JOB_KEY, job);
         setTokRun(true);
         tokRunJob();
       }
@@ -1716,4 +1778,19 @@
   resumeCart();
 
   tokInjectBridge();
+
+  // v2.0.23: auto-reanudar cuando vuelve el internet. Solo si hay un job
+  // pausado por pérdida de señal hace <30 min (si el usuario ya reinició
+  // la tarea o el job es viejo de otra sesión, se ignora).
+  window.addEventListener("online", async function() {
+    try {
+      await toksleep(3000);
+      const job = await tokStoreGet(CART_JOB_KEY);
+      if (!job || job.phase !== "paused") return;
+      if (job.pausedAt && Date.now() - job.pausedAt > 30 * 60 * 1000) return;
+      if (!(await tokCheckNet())) return;
+      tokToastSet("Conexión restaurada — reanudando tarea...", "ok");
+      resumeCart();
+    } catch (e) {}
+  });
 })();

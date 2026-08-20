@@ -216,9 +216,7 @@ async function runCart() {
 }
 
 function applyCartDone(msg) {
-  // Si ya se ingresó otro documento mientras corría el lote, el resultado
-  // viejo NO pisa la sesión nueva.
-  if (state.status !== "loading_cart") return;
+  if (state.status !== "loading_cart" && state.status !== "paused") return;
   const results = (msg && msg.results) || [];
   // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
   // "agregado"). "sin stock" / "no se encontró" / "no se confirmó" no suman al
@@ -255,6 +253,7 @@ function applyCartDone(msg) {
     // las "sin stock" y las "no se confirmó". Los resultados llegan en el mismo
     // orden que cartItems() (líneas no vacías).
     const all = state.line_items || [];
+    state.cart.allLineItems = all;
     const pending = [];
     let idx = 0;
     for (const it of all) {
@@ -515,6 +514,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: true });
       break;
+    case "CART_PAUSE":
+      // v2.0.23: pausa por interrupción (internet). NO limpia nada:
+      // conserva line_items, cart y cartResults para que el usuario
+      // pueda reanudar desde donde se quedó.
+      if (state.status === "loading_cart") {
+        setStatus("paused", "Tarea pausada — reanudá cuando tengas señal.", 3);
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
     case "CART_DONE":
       applyCartDone(msg);
       persist();
@@ -574,30 +584,45 @@ setInterval(() => {
 
 // Al recrear el offscreen (Chrome lo cierra y se vuelve a abrir) se restaura la
 // sesión previa: el formulario queda en el paso donde estaba. Un lote a medias
-// no se resume: si la sesión persistida quedó "cargando", vuelve a "idle"
-// (las líneas capturadas quedan y "Enviar a carrito" queda disponible).
+// no se resume: si la sesión persistida quedó "loading_cart", verificá si hay
+// un job pausado en chrome.storage.local — si lo hay, conservá todo (líneas,
+// carrito, resultados parciales) para que el usuario pueda reanudar.
 function restoreSession() {
   sendSw({ type: "GET_STATE" }).then((res) => {
     try {
       const s = (res && res.ok && res.state) || null;
       if (!s) return;
       if (s.status === "loading_cart") {
-        state.status = "idle";
-        state.step = 1;
-        state.progress = "";
-        state.cart = null;
-        state.cartProgress = null;
-      } else {
-        state.status = s.status || "idle";
-        state.step = s.step || 1;
-        state.progress = s.progress || "";
-        state.filename = s.filename || "";
-        state.error = s.error || "";
-        state.summary = s.summary || null;
-        state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
-        state.cart = s.cart || null;
-        state.cartProgress = s.cartProgress || null;
+        chrome.storage.local.get(["tokinCartJob"], function(d) {
+          var pausedJob = d && d.tokinCartJob && d.tokinCartJob.phase === "paused";
+          if (pausedJob) {
+            state.status = "paused";
+            state.step = 3;
+            state.progress = "Tarea pausada — reanudá cuando tengas señal.";
+            state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
+            state.cart = s.cart || null;
+            state.cartProgress = s.cartProgress || null;
+          } else {
+            state.status = "idle";
+            state.step = 1;
+            state.progress = "";
+            state.cart = null;
+            state.cartProgress = null;
+          }
+          persist();
+          emitState();
+        });
+        return;
       }
+      state.status = s.status || "idle";
+      state.step = s.step || 1;
+      state.progress = s.progress || "";
+      state.filename = s.filename || "";
+      state.error = s.error || "";
+      state.summary = s.summary || null;
+      state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
+      state.cart = s.cart || null;
+      state.cartProgress = s.cartProgress || null;
       persist();
       emitState();
     } catch (e) {}
