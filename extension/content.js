@@ -340,6 +340,25 @@
     }
   }
 
+  // v2.0.23: verificación de conectividad antes de cada búsqueda.
+  // Si no hay internet, se frena el job y se avisa al usuario.
+  async function tokCheckNet() {
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(function() { ctrl.abort(); }, 5000);
+      const r = await fetch("https://tokintienda.com.ar/store", {
+        method: "HEAD",
+        mode: "no-cors",
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      clearTimeout(tid);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function tokSetValue(el, value) {
     try {
       const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -933,6 +952,16 @@
       if (job.email && getSessionInfo().email !== job.email) return tokAbortCart(job, true);
       const reason = cartCancel ? "user" : await tokCancelReason();
       if (reason) return tokAbortCart(job, reason === "stop");
+      // v2.0.23: verificar conectividad antes de cada búsqueda.
+      // Si no hay internet, frenar el job y avisar al usuario.
+      if (!(await tokCheckNet())) {
+        job.results.push({
+          producto: job.items[job.index].producto || job.items[job.index].sku || "",
+          ok: false,
+          message: "sin conexión a internet — reanudá la tarea cuando tengas señal",
+        });
+        return tokAbortCart(job, false);
+      }
       if (job.phase === "pending") {
         const it = job.items[job.index];
         const queries = tokBuildQueries(it);

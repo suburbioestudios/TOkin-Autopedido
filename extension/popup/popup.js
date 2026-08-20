@@ -599,44 +599,36 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     if (notFound) summaryParts.push("No encontrados: " + notFound);
     if (notConfirmed) summaryParts.push("Sin confirmar: " + notConfirmed);
 
-    var headers = ["#", "Código", "Producto", "Cant. pedida", "Unidad", "Estado", "Mensaje"];
-    var aoa = [];
+    var headers = ["#", "Código", "Producto", "Cant. pedida", "Unidad", "Mensaje"];
+    var pendingAoa = [];
     var sumRow = [];
     sumRow.push({ t: "s", v: summaryParts.join("  ·  "), s: summaryStyle });
     for (var h = 1; h < headers.length; h++) sumRow.push({ t: "s", v: "", s: summaryStyle });
-    aoa.push(sumRow);
-    aoa.push(headers.map(function(h) { return { t: "s", v: h, s: headerStyle }; }));
-
-    var pendingAoa = [];
+    pendingAoa.push(sumRow);
     pendingAoa.push(headers.map(function(h) { return { t: "s", v: h, s: headerStyle }; }));
 
+    var pendIdx = 0;
     items.forEach(function(it, i) {
       var r = results[i] || {};
+      if (isAdded(r)) return;
+      pendIdx++;
       var unidad = it.categoria || it.unidad || "";
-      var sty = rowStyle(r);
-      var msg = r.message || "";
-      var num = i + 1;
-      var row = [
-        { t: "n", v: num, s: sty },
-        { t: "s", v: String(it.sku || ""), s: sty },
-        { t: "s", v: String(it.producto || ""), s: sty },
-        { t: "s", v: String(it.cantidad || ""), s: sty },
-        { t: "s", v: String(unidad), s: sty },
-        { t: "s", v: String(statusCls(r)), s: sty },
-        { t: "s", v: String(msg), s: sty }
-      ];
-      aoa.push(row);
-      if (!isAdded(r)) pendingAoa.push(row.slice());
+      var msg = r.message || "(sin mensaje)";
+      pendingAoa.push([
+        { t: "n", v: pendIdx, s: redStyle },
+        { t: "s", v: String(it.sku || ""), s: redStyle },
+        { t: "s", v: String(it.producto || ""), s: redStyle },
+        { t: "s", v: String(it.cantidad || ""), s: redStyle },
+        { t: "s", v: String(unidad), s: redStyle },
+        { t: "s", v: String(msg), s: redStyle }
+      ]);
     });
 
     try {
       var wb = XLSX.utils.book_new();
-      var ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 50 }];
-      XLSX.utils.book_append_sheet(wb, ws, "Pedido");
-      var ws2 = XLSX.utils.aoa_to_sheet(pendingAoa);
-      ws2["!cols"] = ws["!cols"].slice();
-      XLSX.utils.book_append_sheet(wb, ws2, "No cargados");
+      var ws = XLSX.utils.aoa_to_sheet(pendingAoa);
+      ws["!cols"] = [{ wch: 4 }, { wch: 12 }, { wch: 42 }, { wch: 10 }, { wch: 10 }, { wch: 55 }];
+      XLSX.utils.book_append_sheet(wb, ws, "No cargados");
       var name = "Reporte_Autotokin " + String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "Reporte_Autotokin informe";
       XLSX.writeFile(wb, name + ".xlsx");
       setStatus("Excel descargado: " + name + ".xlsx", "ok");
