@@ -1286,8 +1286,13 @@
         out.message =
           "no se agregó: el store solo tiene " + actualQty + " unidades" +
           " (necesitaba " + wantQty + " para cubrir" + unitNote + ")";
+      } else if (actualQty !== qty) {
+        // productTotals fusionó líneas duplicadas: el carrito tiene la suma,
+        // pero el mensaje refleja lo que ESTA línea pidió.
+        out.message = "agregado: " + qty + " " + usedUnit + unitNote +
+          " (acumulado en carrito: " + actualQty + ")";
       } else {
-        out.message = "agregado: " + actualQty + " " + usedUnit + unitNote;
+        out.message = "agregado: " + qty + " " + usedUnit + unitNote;
       }
     } else {
       out.ok = true;
