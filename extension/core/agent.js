@@ -557,6 +557,8 @@ const _OCR_FIX = {
   "toft": "tofi",
   // Marcas (C/G, O/U y prefijos I/J que el OCR inventa delante)
   "acuila": "aguila",
+  // Prefijo J que el OCR inventa delante de AGUILA ("JAGUILA", "JACUILA")
+  "jaguila": "aguila", "jacuila": "aguila",
   "mocul": "mogul", "mocur": "mogul", "mocun": "mogul", "imogul": "mogul",
   "imocul": "mogul", "iocul": "mogul", "iocun": "mogul", "iuocur": "mogul",
   "jmogul": "mogul", "jmocul": "mogul", "jmocur": "mogul", "juogul": "mogul",
@@ -682,7 +684,14 @@ function _pdf_row_info(width, row) {
     if (desc) desc += " ";
     desc += row[j].t;
   }
-  desc = _ocr_fix(desc)
+  // El OCR lee la "G" del gramaje como símbolo euro ("x150 €") o como el
+  // dígito "6" suelto ("14 6"): normalizar ambos a g SOLO dentro de la
+  // descripción (token aislado; nunca toca cantidades ni códigos).
+  desc = _ocr_fix(
+    String(desc)
+      .replace(/€/g, "g")
+      .replace(/(^|\s)6(?=\s|$)/g, "$1g")
+  )
     .replace(/^[\|\[\]\(\)]+/, "")
     .replace(/[\|\[\]\(\)]+$/, "")
     .replace(/\s{2,}/g, " ")

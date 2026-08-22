@@ -459,7 +459,9 @@
   // "11913" o "ARC-1013357") es sufijo del ARC del store ("ARC-1013357").
   function tokSkuMatch(cardText, sku) {
     const d = String(sku || "").replace(/\D+/g, "");
-    if (!d) return false;
+    // v2.0.26: exigir 4+ dígitos. Un código degradado tipo "ama3" queda reducido
+    // a d="3": sin este guard matchearía CUALQUIER card cuyo ARC termine en 3.
+    if (d.length < 4) return false;
     const arc = tokArcCode(cardText);
     return !!arc && (arc.endsWith(d) || d.endsWith(arc));
   }
@@ -832,7 +834,19 @@
   // se descarta dejando el gramaje ("40g"), porque el store busca mejor por
   // gramos; si no aparece nada se prueba sin números y por marca.
   function tokBuildQueries(item) {
-    const raw = String(item.producto || item.sku || "").trim();
+    // v2.0.26: si la línea trae un CÓDIGO legible (4+ dígitos), SOLO se busca
+    // por código: es el gate real (v2.0.14) y navegar por nombre con texto OCR
+    // crudo ("jaguila…", símbolos) confunde al usuario y nunca podría agregar
+    // otra card distinta. Un código degradado por el OCR (letras+basura, ej.
+    // "ama3") NO se busca: con menos de 4 dígitos no hay matcheo seguro contra
+    // el ARC del store, así que la línea se reporta para corregir en la tabla.
+    const skuRaw = String(item.sku || "").trim();
+    const skuDigits = skuRaw.replace(/\D+/g, "");
+    if (skuRaw) {
+      if (skuDigits.length >= 4) return [skuRaw];
+      return [];
+    }
+    const raw = String(item.producto || "").trim();
     if (!raw) return [];
     const out = [];
     const seen = new Set();
@@ -969,10 +983,30 @@
         const it = job.items[job.index];
         const queries = tokBuildQueries(it);
         if (job.qIdx >= queries.length) {
+          // v2.0.26: mensajes diferenciados según haya código o no. Las líneas
+          // con código válido solo prueban la búsqueda por código; si la SPA no
+          // terminó de renderizar las cards (carrito grande), se reintenta UNA
+          // vez antes de dar la línea por no encontrada.
+          const skuD = String(it.sku || "").replace(/\D+/g, "");
+          if (!job.codeRetried && skuD.length >= 4) {
+            job.codeRetried = true;
+            job.qIdx = 0;
+            job.phase = "pending";
+            await tokStoreSet(CART_JOB_KEY, job);
+            await toksleep(1200);
+            return tokRunJob();
+          }
+          let msg = "no se encontró el producto en el store";
+          if (String(it.sku || "").trim()) {
+            msg = skuD.length >= 4
+              ? "no se encontró card con el código " + String(it.sku).trim() + " en el store"
+              // El prefijo "no se encontró" lo cuenta el desglose del informe.
+              : "no se encontró: código «" + String(it.sku).trim() + "» ilegible (corregilo en la tabla)";
+          }
           job.results.push({
             producto: it.producto || it.sku || "",
             ok: false,
-            message: "no se encontró el producto en el store",
+            message: msg,
           });
           return tokAdvance(job, false);
         }
@@ -1113,7 +1147,7 @@
 
       const cand = await waitForTokin(
         () => tokBestArticle(target, wantType, wantedGrams, it.sku),
-        12000,
+        20000,
         350
       );
       if (!cand || !tokAccept(cand)) {
@@ -1199,6 +1233,22 @@
     let usedUnit = wantUnit;
     let unitNote = "";
     const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
+    // v2.0.26: detección TEMPRANA de "sin stock". Una card sin botones de
+    // unidad, sin input y sin botón Agregar que además dice "sin stock" no tiene
+    // nada que procesar: reportarlo acá evita esperar los timeouts de
+    // inputs/Agregar (~11 s) y evita que un mensaje de unidad oculte el dato
+    // real: el producto SÍ existe en el store, solo no está disponible.
+    if (
+      /sin stock/i.test(cardText) &&
+      !btns.length &&
+      !card.querySelector("input[type=number]") &&
+      !card.querySelector("[data-id=add-to-cart-button]")
+    ) {
+      const arc = tokArcCode(cardText);
+      out.ok = true;
+      out.message = "encontrado pero sin stock" + (arc ? " (" + arc + ")" : "");
+      return out;
+    }
     if (wantType && btns.length) {
       unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType)) || null;
     }
@@ -1378,6 +1428,7 @@
     );
     job.index++;
     job.qIdx = 0;
+    job.codeRetried = false;
     job.phase = "pending";
     if (job.index >= job.total) {
       job.phase = "done";
