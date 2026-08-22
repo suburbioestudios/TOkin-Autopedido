@@ -459,9 +459,14 @@ async function _pdf_text(data, onProgress, onCancel) {
             delete fix.cantidad;
           }
           if (fix.cantidad != null || fix.unidad != null || fix.sku != null) {
-            fixes[s.sku] = fix;
+            // Clave por POSICIÓN de fila (cy) y no por sku: las filas con
+            // código degradado entran al refinado con un token provisional que
+            // puede repetirse entre filas, y además dos líneas pueden compartir
+            // el mismo código real en el PDF del proveedor (ej. CUENCA: 14800
+            // listado en dos productos distintos).
+            fixes[String(s.cy)] = fix;
             if (typeof console !== "undefined")
-              console.log("[tokin] refine sku=%s pedida=%s -> %j", s.sku, s.pedida, fix);
+              console.log("[tokin] refine cy=%s sku=%s pedida=%s -> %j", s.cy, s.sku, s.pedida, fix);
           }
         }
         full.width = 0;
@@ -600,12 +605,31 @@ function _pdf_row_info(width, row) {
       }
     }
     // Fallback: if not found, look for any numeric token of sufficient length.
+    let garbled = false;
     if (sku === null) {
       for (let i = 0; i < row.length; i++) {
         const w = row[i];
         if (w.x0 / width < 0.2 && /^\d{4,}$/.test(w.t)) {
           sku = w.t;
           sku_i = i;
+          break;
+        }
+      }
+    }
+    // Último recurso: la celda de código puede degradar a un token alfanumérico
+    // a escala 2.0 (ej. "4713" leído como "ama3" en PEDIDO ARCOR ROSARIO 18
+    // AGO). Se conserva la fila con ese token PROVISIONAL en vez de descartarla:
+    // si se retorna null acá, la fila desaparece del pedido Y del re-OCR de
+    // banda (la lista de filas a refinar sale del mismo _pdf_row_info), así que
+    // el refinado a escala 3.5 —que sí lee el código real— nunca la rescata.
+    // El token provisorio exige al menos un dígito para no capturar encabezados.
+    if (sku === null) {
+      for (let i = 0; i < row.length; i++) {
+        const w = row[i];
+        if (w.x0 / width < 0.1 && /\d/.test(String(w.t))) {
+          sku = w.t;
+          sku_i = i;
+          garbled = true;
           break;
         }
       }
@@ -682,9 +706,14 @@ function _pdf_row_info(width, row) {
       cantidad: pedida || "",
       unidad: unit || "",
       categoria: medida_categoria(unit),
+      // Posición de la fila en la página: clave para aplicar los fixes del
+      // re-OCR de banda (p.qtyFix) sin depender del sku, que puede ser un
+      // token degradado o repetirse entre filas.
+      cy,
     },
     sku,
     cy,
+    garbled,
     pedida,
     unit,
     suspect,
@@ -1091,7 +1120,8 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
           const items = _pdf_table_items(p.words, p.w, p.scale);
           if (p.qtyFix) {
             for (const it of items) {
-              const f = p.qtyFix[it.sku];
+              // Los fixes se keyean por posición de fila (cy); ver _pdf_text.
+              const f = it.cy != null ? p.qtyFix[String(it.cy)] : p.qtyFix[it.sku];
               if (!f) continue;
               if (f.sku) it.sku = f.sku;
               if (f.cantidad != null) it.cantidad = f.cantidad;
