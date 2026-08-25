@@ -583,22 +583,26 @@ setInterval(() => {
 }, 20000);
 
 // Al recrear el offscreen (Chrome lo cierra y se vuelve a abrir) se restaura la
-// sesión previa: el formulario queda en el paso donde estaba. Un lote a medias
-// no se resume: si la sesión persistida quedó "loading_cart", verificá si hay
-// un job pausado en chrome.storage.local — si lo hay, conservá todo (líneas,
-// carrito, resultados parciales) para que el usuario pueda reanudar.
+// sesión previa: el formulario queda en el paso donde estaba. Si había un lote
+// en curso (v2.0.27: corriendo O pausado), la sesión vuelve a ese estado para
+// que el popup refleje la tarea restaurada; solo se vuelve a idle si ya no hay
+// job vivo (la tarea terminó mientras el offscreen estaba muerto).
 function restoreSession() {
   sendSw({ type: "GET_STATE" }).then((res) => {
     try {
       const s = (res && res.ok && res.state) || null;
       if (!s) return;
-      if (s.status === "loading_cart") {
+      if (s.status === "loading_cart" || s.status === "paused") {
         chrome.storage.local.get(["tokinCartJob"], function(d) {
-          var pausedJob = d && d.tokinCartJob && d.tokinCartJob.phase === "paused";
-          if (pausedJob) {
-            state.status = "paused";
+          var job = d && d.tokinCartJob;
+          var liveJob = job && job.phase && job.phase !== "done";
+          if (liveJob) {
+            var paused = job.phase === "paused";
+            state.status = paused ? "paused" : "loading_cart";
             state.step = 3;
-            state.progress = "Tarea pausada — reanudá cuando tengas señal.";
+            state.progress = paused
+              ? "Tarea pausada — se reanuda sola cuando vuelva la señal."
+              : (s.progress || "Cargando carrito…");
             state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
             state.cart = s.cart || null;
             state.cartProgress = s.cartProgress || null;

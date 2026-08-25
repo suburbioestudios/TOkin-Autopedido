@@ -48,6 +48,116 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// ------------------------------------------------------------- watchdog (v2.0.27)
+// Recuperación AUTÓNOMA del lote tras un corte de señal, sin que el usuario
+// refresque nada. El service worker se despierta dos veces por minuto y:
+//   1. Si no hay job vivo, no hace nada.
+//   2. Le pega un PING al content script de la pestaña del lote.
+//   3. Si responde: el content script gestiona su propia recuperación
+//      (watchdog interno + reintento del evento online). Nada que hacer.
+//   4. Si NO responde, es que la pestaña está muerta para la extensión:
+//      página de error de Chrome (se cortó la señal justo al navegar), renderer
+//      colgado o pestaña descartada por el ahorro de memoria. En ese caso,
+//      cuando HAY señal de verdad (fetch HEAD desde el SW), se RECARGA la
+//      pestaña: al bootear, resumeCart() encuentra el job y continúa donde
+//      quedó (el lote está diseñado para sobrevivir navegaciones).
+const TOK_STORE_URL = "https://tokintienda.com.ar/store";
+const TOK_JOB_MAX_MS = 60 * 60 * 1000;   // vida máxima del job (igual que content)
+const TOK_PAUSE_MAX_MS = 30 * 60 * 1000; // pausa auto-reanudable (igual que content)
+
+try {
+  chrome.alarms.create("tokin-watchdog", { periodInMinutes: 0.5 });
+} catch (e) {}
+
+function tokSwNetOk() {
+  return new Promise((resolve) => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      fetch(TOK_STORE_URL, { method: "HEAD", mode: "no-cors", cache: "no-store", signal: ctrl.signal })
+        .then(() => { clearTimeout(t); resolve(true); })
+        .catch(() => { clearTimeout(t); resolve(false); });
+    } catch (e) { resolve(false); }
+  });
+}
+
+function tokPingTab(tabId) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (!done) { done = true; resolve(v); }
+    };
+    // Si el renderer está colgado (no muerto) el callback puede no llegar
+    // nunca: timeout corto y se considera pestaña irrecuperable.
+    const t = setTimeout(() => finish(false), 4000);
+    try {
+      chrome.tabs.sendMessage(tabId, { type: "TOKIN_PING" }, (res) => {
+        clearTimeout(t);
+        void chrome.runtime.lastError;
+        finish(!!(res && res.ok));
+      });
+    } catch (e) { clearTimeout(t); finish(false); }
+  });
+}
+
+function tokStoreGetAsync(key) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(key, (d) => resolve(d || {}));
+    } catch (e) { resolve({}); }
+  });
+}
+
+// El job todavía merece recuperación automática: no vencido y, si está en
+// pausa, dentro de la ventana de auto-reanudación.
+async function tokJobRecoverable() {
+  const d = await tokStoreGetAsync(CART_JOB_KEY);
+  const job = d[CART_JOB_KEY];
+  if (!job || job.phase === "done") return false;
+  if (job.started && Date.now() - job.started > TOK_JOB_MAX_MS) return false;
+  if (job.phase === "paused" && job.pausedAt && Date.now() - job.pausedAt > TOK_PAUSE_MAX_MS) return false;
+  return true;
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm || alarm.name !== "tokin-watchdog") return;
+  (async () => {
+    if (!(await tokJobRecoverable())) return;
+    const d = await tokStoreGetAsync(CART_RUNNING_TAB_KEY);
+    const tabId = d[CART_RUNNING_TAB_KEY];
+    if (!tabId) return;
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (e) {}
+    if (!tab) {
+      // La pestaña del lote ya no existe: frenar limpio (red de seguridad por
+      // si el evento onRemoved no alcanzó a correr).
+      stopRunningCart();
+      return;
+    }
+    if (await tokPingTab(tabId)) return; // viva: se recupera sola en la página
+    // Pestaña sin content script. Solo recargar si hay red REAL ahora mismo y
+    // el job sigue vivo (podría haber cambiado durante el ping).
+    if (!(await tokSwNetOk())) return;
+    if (!(await tokJobRecoverable())) return;
+    try {
+      chrome.tabs.reload(tabId, {}, () => { void chrome.runtime.lastError; });
+    } catch (e) {}
+  })().catch(() => {});
+});
+
+// La pestaña del lote terminó de cargar (recarga manual, vuelta de una página
+// de error, SPA remontada): darle un nudge al content script para que retome
+// el job enseguida, sin esperar el próximo tick del watchdog.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
+  chrome.storage.local.get(CART_RUNNING_TAB_KEY, (d) => {
+    if (!d || d[CART_RUNNING_TAB_KEY] !== tabId) return;
+    try {
+      chrome.tabs.sendMessage(tabId, { type: "TOKIN_RESUME_NUDGE" }, () => { void chrome.runtime.lastError; });
+    } catch (e) {}
+  });
+});
+
 function tokMainBridge() {
   try {
     if (window.__TOKIN_AUTOPEDIDO__) return;

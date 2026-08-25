@@ -369,6 +369,73 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
 
   // ------------------------------------------------------------- init
 
+  // v2.0.27: sincronización del popup con el JOB REAL del store. La sesión del
+  // offscreen puede estar limpia (idle) mientras en chrome.storage.local vive
+  // un lote corriendo o pausado (ej.: se cortó la señal, se limpió el
+  // formulario, cambió el renderer). En ese caso el popup muestra la tarea
+  // restaurada (documento, líneas restantes, progreso), nunca un formulario
+  // vacío que esconde una tarea activa.
+  const JOB_KEY = "tokinCartJob";
+
+  function jobToState(job) {
+    const paused = job.phase === "paused";
+    const idx = typeof job.index === "number" ? Math.max(0, job.index) : 0;
+    return {
+      status: paused ? "paused" : "loading_cart",
+      step: 3,
+      filename: job.docName || "",
+      progress: paused
+        ? "Sin conexión — tarea pausada en línea " + (idx + 1) + "/" + (job.total || 0) +
+          ". Se reanuda sola cuando vuelva la señal."
+        : "",
+      line_items: (job.items || []).map((it) => ({
+        producto: it.producto || "",
+        cantidad: it.cantidad || "",
+        unidad: it.unidad || "",
+        categoria: it.categoria || "",
+        sku: it.sku || "",
+      })),
+      cart: { total: job.total || 0, docName: job.docName || "" },
+      // Igual semántica que CART_PROGRESS: index = última línea intentada.
+      cartProgress: { index: Math.max(0, idx - 1), total: job.total || 0 },
+    };
+  }
+
+  async function syncFromJob() {
+    let res;
+    try {
+      res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+    } catch (e) {
+      return false;
+    }
+    const job = res[JOB_KEY];
+    if (job && job.phase && job.phase !== "done") {
+      ui.synthFromJob = true;
+      applyState(jobToState(job));
+      return true;
+    }
+    if (ui.synthFromJob) {
+      // El job desapareció mientras el popup mostraba la vista sintetizada:
+      // la tarea terminó en el store (el offscreen suele avisar antes con su
+      // propio STATE done; esto cubre el caso sin offscreen).
+      ui.synthFromJob = false;
+      resetPanels();
+      $("#file-name").textContent = "";
+      $("#dropzone").classList.remove("has-file");
+      setStatus("La tarea del store terminó. Revisá el carrito o cargá otro pedido.", "ok");
+    }
+    return false;
+  }
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes[JOB_KEY]) return;
+    // Solo maneja la vista cuando el popup está mostrando la vista sintetizada
+    // o no tiene sesión activa; si hay sesión real del offscreen, ella manda.
+    if (ui.synthFromJob || !ui.sessionState || ui.sessionState.status === "idle") {
+      syncFromJob();
+    }
+  });
+
   async function init() {
     const tab = await getStoreTab();
     const tabId = tab && tab.id;
@@ -428,6 +495,13 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
         // cerrado o minimizado; solo «Reanudar» o «Terminar» limpian el
         // formulario.
         applyState(st.state);
+        // v2.0.27: si la sesión del offscreen está vacía pero hay un lote vivo
+        // en el store (corriendo o pausado), mostrar la tarea restaurada.
+        if (!st.state || st.state.status === "idle") {
+          await syncFromJob();
+        }
+      } else {
+        await syncFromJob();
       }
     }
   }
@@ -656,6 +730,31 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   }
 
   async function reanudar() {
+    // v2.0.27: si hay una tarea activa o pausada en el store (job vivo), 
+    // «Reanudar» RETOMA esa tarea; NO limpia el formulario. Antes hacía CLEAR
+    // incondicional: con la tarea pausada por señal, el usuario tocaba
+    // «Reanudar», el formulario quedaba vacío y la tarea seguía su curso en la
+    // pestaña sin reflejo en el popup.
+    const res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+    const job = res[JOB_KEY];
+    if (job && job.phase && job.phase !== "done") {
+      const tab = await getStoreTab();
+      if (!tab || !tab.id) {
+        setStatus("Abrí tokintienda.com.ar/store para reanudar la tarea.", "warn");
+        return;
+      }
+      setStatus("Reanudando la tarea en el store…", "");
+      const pong = await sendTab(tab.id, { type: "TOKIN_RESUME_NUDGE" });
+      if (!pong || !pong.ok) {
+        // Sin content script (página de error tras el corte de señal):
+        // recargar la pestaña reanuda el lote solo al bootear.
+        try {
+          chrome.tabs.reload(tab.id, {}, () => { void chrome.runtime.lastError; });
+        } catch (e) {}
+      }
+      await syncFromJob();
+      return;
+    }
     await toOff({ type: "CLEAR" });
     resetUi();
     setStatus("Formulario limpio. Cargá un archivo para empezar.", "ok");

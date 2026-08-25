@@ -257,7 +257,12 @@
 
   // ------------------------------------------------------------- carrito
 
+  // v2.0.27: latido del lote. El watchdog lo usa para distinguir "la cadena de
+  // ejecución sigue viva y avanzando" de "el loop murió sin dejar rastro"
+  // (service worker reiniciado, excepción tragada, pestaña a medio cargar).
+  let tokLastBeat = Date.now();
   function toksleep(ms) {
+    tokLastBeat = Date.now();
     return new Promise((r) => setTimeout(r, ms));
   }
 
@@ -331,6 +336,7 @@
     const start = Date.now();
     interval = interval || 250;
     for (;;) {
+      tokLastBeat = Date.now();
       try {
         const v = fn();
         if (v) return v;
@@ -785,6 +791,12 @@
 
   const CART_JOB_KEY = "tokinCartJob";
   const CART_CANCEL_KEY = "tokinCartCancel";
+  // v2.0.27: pausa máxima que se auto-reanuda sola (30 min) y umbral de
+  // inactividad a partir del cual el watchdog considera muerto el loop del
+  // lote (todos los waits del flujo quedan muy por debajo de este valor).
+  const TOK_PAUSE_MAX_MS = 30 * 60 * 1000;
+  const TOK_STALE_MS = 15000;
+  let tokChainAlive = false;
 
   function tokStoreGet(key) {
     return new Promise((resolve) => {
@@ -901,8 +913,7 @@
     // v2.0.23: si hay un job pausado (interrupción de internet), reanudarlo
     // en vez de bloquear. El usuario ya tiene los items en el carrito.
     if (existing && existing.phase === "paused") {
-      setTokRun(true);
-      tokRunJob();
+      tokStartChain();
       return { ok: true, resumed: true, total: existing.total };
     }
     if (existing) {
@@ -951,9 +962,8 @@
     };
     await tokStoreRemove(CART_CANCEL_KEY);
     await tokStoreSet(CART_JOB_KEY, job);
-    setTokRun(true);
+    tokStartChain();
     tokToastSet("Preparando carrito (0/" + job.total + ")", "");
-    tokRunJob();
     return { ok: true, started: true, total: clean.length };
   }
 
@@ -963,6 +973,21 @@
   async function tokCancelReason() {
     const v = await tokStoreGet(CART_CANCEL_KEY);
     return v === "stop" ? "stop" : v ? "user" : "";
+  }
+
+  // v2.0.27: único punto de arranque de la cadena del lote. Si ya hay una
+  // cadena viva, los kicks extra (watchdog, evento online, nudge del
+  // background) se ignoran: nunca corren dos loops en paralelo procesando el
+  // mismo job. El finally de la promesa exterior cubre TODA la recursión
+  // interna (tokRunJob → tokProcessCurrentItem → tokAdvance → tokRunJob…).
+  function tokStartChain() {
+    if (tokChainAlive) return;
+    tokChainAlive = true;
+    setTokRun(true);
+    Promise.resolve()
+      .then(tokRunJob)
+      .catch(() => {})
+      .finally(() => { tokChainAlive = false; });
   }
 
   async function tokRunJob() {
@@ -1674,9 +1699,22 @@
         const me = await tokGetTabId();
         if (!me || me !== job.tabId) return tokAbortCart(job, true);
       }
-      if (job.phase === "searching" && location.href.indexOf("/store/search") !== -1) {
-        setTokRun(true);
-        tokRunJob();
+      // v2.0.27: cualquier fase activa se reanuda al cargar la página. Antes
+      // solo se continuaba si phase="searching" Y ya estábamos en la página de
+      // búsqueda: un lote que quedó "pending" (o "searching" en otra URL,
+      // ej. página de error de Chrome por falta de señal) quedaba trabado para
+      // siempre hasta que el usuario refrescara justo sobre la búsqueda.
+      if (job.phase === "searching") {
+        if (location.href.indexOf("/store/search") === -1) {
+          job.phase = "pending";
+          await tokStoreSet(CART_JOB_KEY, job);
+        }
+        tokStartChain();
+        return;
+      }
+      if (job.phase === "pending") {
+        tokStartChain();
+        return;
       }
       // v2.0.23: reanudar tras pausa por interrupción (internet).
       // Buscar desde la ÚLTIMA línea que se confirmó en el carrito y continuar
@@ -1713,8 +1751,7 @@
         job.qIdx = 0;
         job.phase = "pending";
         await tokStoreSet(CART_JOB_KEY, job);
-        setTokRun(true);
-        tokRunJob();
+        tokStartChain();
       }
     } catch (e) {}
   }
@@ -1762,6 +1799,18 @@
     switch (msg && msg.type) {
       case "PING":
         sendResponse({ ok: true, session: getSessionInfo() });
+        break;
+      case "TOKIN_PING":
+        // Sondeo del watchdog del background: responde solo para confirmar que
+        // este content script está vivo (si no responde, el background puede
+        // recargar la pestaña cuando haya señal).
+        sendResponse({ ok: true });
+        break;
+      case "TOKIN_RESUME_NUDGE":
+        // La pestaña terminó de cargar (o el popup lo pidió) con un lote
+        // vivo/pausado: intentar retomarlo ya.
+        sendResponse({ ok: true });
+        resumeCart();
         break;
       case "GET_FIELDS":
         sendResponse({ ok: true, fields: discoverFields() });
@@ -1830,18 +1879,71 @@
 
   tokInjectBridge();
 
-  // v2.0.23: auto-reanudar cuando vuelve el internet. Solo si hay un job
-  // pausado por pérdida de señal hace <30 min (si el usuario ya reinició
-  // la tarea o el job es viejo de otra sesión, se ignora).
-  window.addEventListener("online", async function() {
+  // v2.0.27: WATCHDOG del lote. Cada pocos segundos revisa el job y actúa:
+  //   - phase="paused": poll real de conectividad (fetch al store); en cuanto
+  //     hay señal de verdad (<30 min de pausa), reanuda solo. Esto cubre el
+  //     caso típico de corte de señal: el evento "online" puede no dispararse
+  //     nunca (WiFi conectada, router sin internet) o dispararse ANTES de que
+  //     la ruta funcione.
+  //   - phase="pending"/"searching" con cadena muerta (sin latido reciente):
+  //     relanza el loop. Cubre excepciones tragadas y reinicios que dejaron el
+  //     lote trabado sin navegar ni procesar.
+  setInterval(function () {
+    tokWatchdogTick();
+  }, 7000);
+
+  async function tokWatchdogTick() {
     try {
-      await toksleep(3000);
       const job = await tokStoreGet(CART_JOB_KEY);
-      if (!job || job.phase !== "paused") return;
-      if (job.pausedAt && Date.now() - job.pausedAt > 30 * 60 * 1000) return;
-      if (!(await tokCheckNet())) return;
-      tokToastSet("Conexión restaurada — reanudando tarea...", "ok");
-      resumeCart();
+      if (!job || job.phase === "done") return;
+      if (cartCancel || (await tokCancelReason())) {
+        resumeCart();
+        return;
+      }
+      if (job.phase === "paused") {
+        if (job.pausedAt && Date.now() - job.pausedAt > TOK_PAUSE_MAX_MS) return;
+        if (!(await tokCheckNet())) return;
+        tokToastSet("Conexión restaurada — reanudando tarea…", "ok");
+        resumeCart();
+        return;
+      }
+      if (job.phase === "pending" || job.phase === "searching") {
+        if (tokChainAlive) return;
+        // Cadena muerta: exigir además inactividad real (sin latidos) para no
+        // pisar un procesamiento normal que recién arranca.
+        if (Date.now() - tokLastBeat < TOK_STALE_MS) return;
+        resumeCart();
+      }
     } catch (e) {}
+  }
+
+  // v2.0.23/27: auto-reanudar cuando vuelve el internet. El evento se usa como
+  // PISTA (dispara el primer intento antes), pero la recuperación real la hace
+  // el reintento con poll de red: "online" suele llegar antes de que DNS/ruta
+  // funcionen, así que se reintenta ~90 s (el watchdog sigue de refuerzo).
+  window.addEventListener("online", function () {
+    tokOnlineRetry();
   });
+
+  let tokOnlinePolling = false;
+  async function tokOnlineRetry() {
+    if (tokOnlinePolling) return;
+    tokOnlinePolling = true;
+    try {
+      for (let i = 0; i < 18; i++) {
+        await toksleep(5000);
+        const job = await tokStoreGet(CART_JOB_KEY);
+        if (!job || job.phase !== "paused") return;
+        if (job.pausedAt && Date.now() - job.pausedAt > TOK_PAUSE_MAX_MS) return;
+        if (await tokCheckNet()) {
+          tokToastSet("Conexión restaurada — reanudando tarea…", "ok");
+          resumeCart();
+          return;
+        }
+      }
+    } catch (e) {
+    } finally {
+      tokOnlinePolling = false;
+    }
+  }
 })();

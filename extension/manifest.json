@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Tokin AutoPedido",
-  "version": "2.0.26",
+  "version": "2.0.27",
   "description": "Ingesta de pedidos desde Excel/PDF/DOCX y autollenado del formulario de Tokin Store. 100% local en el navegador.",
-  "permissions": ["storage", "activeTab", "tabs", "scripting", "clipboardWrite", "offscreen"],
+  "permissions": ["storage", "activeTab", "tabs", "scripting", "clipboardWrite", "offscreen", "alarms"],
   "host_permissions": [
     "https://tokintienda.com.ar/*",
     "https://raw.githubusercontent.com/*",
