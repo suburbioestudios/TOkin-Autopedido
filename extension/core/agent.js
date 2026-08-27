@@ -269,17 +269,18 @@ async function _parallel(pool, items, fn) {
 const OCR_WORKERS = 3;
 
 // Detectar en que orientacion estan dibujadas las hojas (contenido girado dentro
-// de una hoja vertical). Prueba 0/90/180/270 y puntua cada una por confianza de
-// Tesseract + legibilidad (proporcion de palabras reales): el texto girado da
-// confianza y legibilidad mucho mas bajas que el texto derecho. Devuelve las
-// rotaciones ordenadas de mejor a peor para poder reintentar desde la vertical.
-// Las hojas del pedido son gráficos vectoriales (cada carácter es un trazado,
-// sin capa de texto). 2.0 (144 DPI) es el mínimo que mantiene SKU/cantidades
-// legibles; 1.5 (~108 DPI) degrada el OCR. La detección de orientación corre a
-// 1.2 para ser rápida (solo discrimina izquierda/derecha).
-const OCR_SCALE = 2.0;
-const OCR_DETECT_SCALE = 1.2;
-const ROT_CANDIDATES = [0, 90, 180, 270];
+// de una hoja vertical). Prueba 270/0/90/180 (empieza por 270° porque los
+// pedidos de Arcor suelen estar girados 90° a la derecha) y puntua cada una por
+// confianza de Tesseract + legibilidad (proporcion de palabras reales): el texto
+// girado da confianza y legibilidad mucho mas bajas que el texto derecho.
+// Devuelve las rotaciones ordenadas de mejor a peor para poder reintentar desde
+// la vertical. Las hojas del pedido son gráficos vectoriales (cada carácter es
+// un trazado, sin capa de texto). 3.5 es la escala más precisa (evita errores de
+// transcripción: Tesseract confunde dígitos cercanos a escalas bajas, 3→31,
+// 12→22), así que TODO el OCR corre a 3.5, incluida la detección de orientación.
+const OCR_SCALE = 3.5;
+const OCR_DETECT_SCALE = 3.5;
+const ROT_CANDIDATES = [270, 0, 90, 180];
 
 // Palabras funcionales y claves del documento de pedido. El texto girado produce
 // basura alfanumérica que un chequeo genérico no distingue; estas claves solo
@@ -450,9 +451,9 @@ async function _pdf_text(data, onProgress, onCancel) {
             full
           );
           if (!fix) continue;
-          // v2.0.22: si el re-OCR de banda (scale 3.5) difiere del parse global
-          // (scale 2.0), el valor de la banda es más confiable para celdas
-          // pequeñas de tabla (Tesseract confunde dígitos cercanos: 3→31, 12→22).
+          // Todo el OCR corre a 3.5 (escala más precisa). El re-OCR de banda se
+          // aplica igualmente por posición para celdas pequeñas de tabla (la
+          // confusión de Tesseract de dígitos cercanos baja con la escala alta).
           // Solo se descarta la corrección si el parse global es sospechoso.
           if (!s.suspect && fix.cantidad != null && s.pedida != null &&
               fix.cantidad === s.pedida) {
