@@ -685,13 +685,24 @@ function _pdf_row_info(width, row) {
     if (desc) desc += " ";
     desc += row[j].t;
   }
-  // El OCR lee la "G" del gramaje como símbolo euro ("x150 €") o como el
-  // dígito "6" suelto ("14 6"): normalizar ambos a g SOLO dentro de la
-  // descripción (token aislado; nunca toca cantidades ni códigos).
+  // Cuando el OCR deja SOLO la "G" de gramos después de "X <número>", a veces
+  // alucina en esa posición un símbolo o una letra suelta distinta: el € o el
+  // dígito "6" (la G degradada), o cualquier otra letra única. La nomenclatura
+  // del producto EXIGE que después de "x/× <dígitos>" el único token aislado de
+  // una letra sea "g", y que NO quede ninguna otra letra suelta ahí: es clave
+  // cuando la búsqueda por código falla y se cae a la búsqueda por nombre (el
+  // gramaje debe quedar bien formado para que el store encuentre la card). Se
+  // normaliza ese token a una sola «g» (con o sin espacio, con o sin dígitos de
+  // separación y signos de puntuación pegados), SOLO dentro de la descripción;
+  // nunca toca cantidades ni códigos, y si tras el número viene una PALABRA (≥2
+  // letras, parte real de la descripción) no se toca.
   desc = _ocr_fix(
     String(desc)
-      .replace(/€/g, "g")
-      .replace(/(^|\s)6(?=\s|$)/g, "$1g")
+      .replace(/(\b[x×]\s*\d+)\s*[€]\b/gi, "$1 g")
+      .replace(/(\b[x×]\s*\d+)\s*6\b/gi, "$1 g")
+      // Token de UNA letra suelta tras el marcador de gramaje (x/× + número):
+      // forzarlo a g salvo que ya sea g. Cubre "x150 T", "x150T", "x150 g".
+      .replace(/\b[x×]\s*(\d+)[\s.,;:]?([a-záéíóúüñ])\b/gi, (m, n, l) => (/g/i.test(l) ? m : "x" + n + "g"))
   )
     .replace(/^[\|\[\]\(\)]+/, "")
     .replace(/[\|\[\]\(\)]+$/, "")

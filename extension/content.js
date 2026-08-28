@@ -542,7 +542,7 @@
   // "topline", palabras repetidas). El gramaje es señal de desempate con
   // redondeo (73 ≈ 73,5). Entre cards válidos gana el que comparte más palabras
   // y mejor puntaje; el CÓDIGO del pedido (sku) es desempate principal.
-  function tokBestArticle(target, wantType, wantedGrams, sku) {
+  function tokBestArticle(target, wantType, wantedGrams, sku, byName) {
     const arts = Array.from(document.querySelectorAll("article")).filter(
       (a) => a.getAttribute("data-id") !== "cart-product-card" && tokIsProductCard(a)
     );
@@ -573,7 +573,12 @@
     // nunca sustituye un producto distinto (ej. TOFI 2848 no está en el store).
     // Las líneas SIN sku (Excel sin columna código) siguen matcheando por nombre.
     const byCode = parsed.filter((p) => p.codeMatch);
-    const pool = String(sku || "").trim() ? byCode : parsed.filter((p) => p.shared > 0);
+    // v2.0.29: con sku el CÓDIGO es GATE ESTRICTO y el pool es solo byCode.
+    // Pero cuando la búsqueda por código NO encontró la card (fallback a
+    // nombre), byName=true desactiva el gate: se matchea por nombre + unidad
+    // aunque la línea traiga sku. Es seguro porque en ese punto ya verificamos
+    // que el código no existe en el store.
+    const pool = !byName && String(sku || "").trim() ? byCode : parsed.filter((p) => p.shared > 0);
     if (!pool.length) return null;
     let best = null;
     for (let i = 0; i < pool.length; i++) {
@@ -846,21 +851,10 @@
   // se descarta dejando el gramaje ("40g"), porque el store busca mejor por
   // gramos; si no aparece nada se prueba sin números y por marca.
   function tokBuildQueries(item) {
-    // v2.0.26: si la línea trae un CÓDIGO legible (4+ dígitos), SOLO se busca
-    // por código: es el gate real (v2.0.14) y navegar por nombre con texto OCR
-    // crudo ("jaguila…", símbolos) confunde al usuario y nunca podría agregar
-    // otra card distinta. Un código degradado por el OCR (letras+basura, ej.
-    // "ama3") NO se busca: con menos de 4 dígitos no hay matcheo seguro contra
-    // el ARC del store, así que la línea se reporta para corregir en la tabla.
     const skuRaw = String(item.sku || "").trim();
     const skuDigits = skuRaw.replace(/\D+/g, "");
-    if (skuRaw) {
-      if (skuDigits.length >= 4) return [skuRaw];
-      return [];
-    }
     const raw = String(item.producto || "").trim();
-    if (!raw) return [];
-    const out = [];
+    let out = [];
     const seen = new Set();
     const push = (q) => {
       q = String(q || "").replace(/\s+/g, " ").trim();
@@ -870,6 +864,19 @@
         out.push(q);
       }
     };
+    // v2.0.29: si la línea trae un CÓDIGO legible (4+ dígitos), la PRIMERA
+    // búsqueda es SOLO por código (gate real v2.0.14): nunca agrega un producto
+    // distinto cuando el pedido existe en el store. Pero si el código NO se
+    // encuentra en el store (producto no cargado o código mal leído), se cae a
+    // la búsqueda por NOMBRE con las queries de más abajo, para que la línea
+    // igualmente pueda cargarse. Con un código degradado por el OCR
+    // ("ama3", <4 dígitos) no hay matcheo seguro contra el ARC: se va directo a
+    // BUSCAR POR NOMBRE (sin query de código), nunca a abortar.
+    if (skuRaw && !skuDigits.length) {
+      // código pero sin ningún dígito: no matchea ARC de todos modos → por nombre
+    } else if (skuDigits.length >= 4) {
+      push(skuRaw);
+    }
     const unitWord = tokNorm(tokUnitLabel(item)); // bulto|display|unidad
     const grams = tokGrams(raw);
     const g0 = grams.length ? grams[0] : null;
@@ -1008,25 +1015,17 @@
         const it = job.items[job.index];
         const queries = tokBuildQueries(it);
         if (job.qIdx >= queries.length) {
-          // v2.0.26: mensajes diferenciados según haya código o no. Las líneas
-          // con código válido solo prueban la búsqueda por código; si la SPA no
-          // terminó de renderizar las cards (carrito grande), se reintenta UNA
-          // vez antes de dar la línea por no encontrada.
+          // v2.0.29: se agotaron TODAS las queries. Con código válido se probó
+          // el código (con su reintento por render lento) y, como fallback, las
+          // queries por nombre. El mensaje lo deja claro: si había código, no
+          // se encontró la card por el código NI por el nombre del producto.
           const skuD = String(it.sku || "").replace(/\D+/g, "");
-          if (!job.codeRetried && skuD.length >= 4) {
-            job.codeRetried = true;
-            job.qIdx = 0;
-            job.phase = "pending";
-            await tokStoreSet(CART_JOB_KEY, job);
-            await toksleep(1200);
-            return tokRunJob();
-          }
           let msg = "no se encontró el producto en el store";
           if (String(it.sku || "").trim()) {
             msg = skuD.length >= 4
-              ? "no se encontró card con el código " + String(it.sku).trim() + " en el store"
+              ? "no se encontró card con el código " + String(it.sku).trim() + " ni por nombre en el store"
               // El prefijo "no se encontró" lo cuenta el desglose del informe.
-              : "no se encontró: código «" + String(it.sku).trim() + "» ilegible (corregilo en la tabla)";
+              : "no se encontró: código «" + String(it.sku).trim() + "» ilegible por nombre en el store";
           }
           job.results.push({
             producto: it.producto || it.sku || "",
@@ -1169,19 +1168,37 @@
       // Cantidad total del producto en el pedido (suma de líneas duplicadas).
       const wantKey = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(wantUnit);
       const wantQty = (job.productTotals || {})[wantKey] || 0;
+      // v2.0.29: byName=true cuando NO estamos en la query de código (qIdx 0 con
+      // sku válido) — es decir, cuando caemos al fallback por NOMBRE. En ese
+      // modo tokBestArticle matchea por nombre+unidad aunque la línea traiga
+      // sku (el código ya no existe en el store).
+      const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
+      const byName = !(job.qIdx === 0 && validSku);
 
       const cand = await waitForTokin(
-        () => tokBestArticle(target, wantType, wantedGrams, it.sku),
+        () => tokBestArticle(target, wantType, wantedGrams, it.sku, byName),
         20000,
         350
       );
       if (!cand || !tokAccept(cand)) {
+        // v2.0.29: la PRIMERA query es la del código. Si la SPA tardó en
+        // renderizar las cards (carrito grande) esa query pudo fallar sin ser
+        // real: se reintenta UNA vez la misma query de código antes de caer a
+        // las de nombre. qIdx===0 solo identifica la query de código cuando la
+        // línea trae un sku válido (tokBuildQueries lo pone primero).
+        if (job.qIdx === 0 && String(it.sku || "").replace(/\D+/g, "").length >= 4 && !job.codeRetried) {
+          job.codeRetried = true;
+          job.phase = "pending";
+          await tokStoreSet(CART_JOB_KEY, job);
+          await toksleep(1200);
+          return tokRunJob();
+        }
         job.qIdx++;
         job.phase = "pending";
         await tokStoreSet(CART_JOB_KEY, job);
         return tokRunJob();
       }
-      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty);
+      const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName);
       Object.assign(r, out);
       const storeText = cand.el.innerText || "";
       r.storeText = storeText;
@@ -1219,7 +1236,7 @@
             // 2) re-aplicar la cantidad sobre la card del store (fallback previo).
             const els = await waitForTokin(
               () => {
-                const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
+                const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
                 if (!c) return null;
                 const ins = Array.from(c.el.querySelectorAll("input[type=number]")).filter(
                   (e) => e.offsetParent !== null
@@ -1249,7 +1266,8 @@
     return tokAdvance(job, r.ok);
   }
 
-  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty) {
+  async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName) {
+    byName = !!byName;
     const card = cand.el;
     const cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
     const out = { ok: false, message: "", storeName: cardText.slice(0, 90), added: 0, usedUnit: wantUnit };
@@ -1334,7 +1352,7 @@
     }
 
     let nums = await waitForTokin(() => {
-      const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
+      const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
       if (!c) return null;
       const els = c.el.querySelectorAll("input[type=number]");
       return els.length ? els : null;
@@ -1342,7 +1360,7 @@
 
     if (!nums) {
       const addBtn = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
+        const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
         if (!c) return null;
         const b = c.el.querySelector("[data-id=add-to-cart-button]");
         return b && !b.disabled ? b : null;
@@ -1356,7 +1374,7 @@
       }
       addBtn.click();
       nums = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams, it.sku);
+        const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
         if (!c) return null;
         const els = c.el.querySelectorAll("input[type=number]");
         return els.length ? els : null;
