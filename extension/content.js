@@ -1275,6 +1275,7 @@
     let unitBtn = null;
     let usedUnit = wantUnit;
     let unitNote = "";
+    let convertedQty = 0;
     const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
     // v2.0.26: detección TEMPRANA de "sin stock". Una card sin botones de
     // unidad, sin input y sin botón Agregar que además dice "sin stock" no tiene
@@ -1307,7 +1308,7 @@
         const conv = tokParseUnitConversion(cardText, wantType);
         if (conv > 0 && wantType !== "unidad" && wantType !== (uName || "").toLowerCase()) {
           // La card tiene la conversión: wantQty Display/Bulto → wantQty * conv Unidades.
-          const convertedQty = wantQty * conv;
+          convertedQty = wantQty * conv;
           if (convertedQty > 999) {
             out.ok = false;
             out.message =
@@ -1317,7 +1318,7 @@
           }
           unitBtn = btns[0];
           usedUnit = "Unidad";
-          unitNote = " (" + wantQty + " " + wantUnit + " = " + convertedQty + " Unidad)";
+          unitNote = " (" + convertedQty + " " + usedUnit + ")";
           unitBtn.click();
           await toksleep(1500);
           // Reemplazar wantQty por la cantidad convertida para que se setee en el input.
@@ -1395,7 +1396,7 @@
       // el store aceptó la cantidad completa. Si el store capó la qty (stock
       // insuficiente),.reportar el límite en vez de reportar "agregado".
       let actualQty = wantQty;
-      if (unitNote && unitNote.indexOf("=") !== -1) {
+      if (convertedQty > 0) {
         for (const el of nums) {
           if (el.offsetParent !== null) {
             const v = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
@@ -1406,18 +1407,21 @@
       out.ok = true;
       out.added = actualQty;
       out.usedUnit = usedUnit;
-      if (actualQty < wantQty && unitNote && unitNote.indexOf("=") !== -1) {
+      if (actualQty < wantQty && convertedQty > 0) {
         out.ok = false;
         out.message =
           "no se agregó: el store solo tiene " + actualQty + " unidades" +
-          " (necesitaba " + wantQty + " para cubrir" + unitNote + ")";
+          " (necesitaba " + wantQty + " para cubrir " + qty + " " + wantUnit + ")";
+      } else if (convertedQty > 0) {
+        // Mensaje conciso de conversión: ejemplo "agregado: 2 Display (40 Unidad)".
+        out.message = "agregado: " + qty + " " + wantUnit +
+          " (" + convertedQty + " " + usedUnit + ")";
+        out.unitNote = qty + " " + wantUnit + " (" + convertedQty + " " + usedUnit + ")";
       } else if (actualQty !== qty) {
-        // productTotals fusionó líneas duplicadas: el carrito tiene la suma,
-        // pero el mensaje refleja lo que ESTA línea pidió.
-        out.message = "agregado: " + qty + " " + usedUnit + unitNote +
-          " (acumulado en carrito: " + actualQty + ")";
+        // productTotals fusionó líneas duplicadas: el carrito tiene la suma.
+        out.message = "agregado: " + wantQty + " " + usedUnit;
       } else {
-        out.message = "agregado: " + qty + " " + usedUnit + unitNote;
+        out.message = "agregado: " + qty + " " + usedUnit;
       }
     } else {
       out.ok = true;
@@ -1552,8 +1556,9 @@
         const hit = tokCartFindUnique(cards, r.storeText || "", r.usedUnit || "", wantQty, r.storeText);
         if (!hit) continue;
         r.ok = true;
-        r.message =
-          "agregado: " + wantQty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
+        r.message = r.unitNote
+          ? "agregado: " + r.unitNote + " (confirmado en el cierre)"
+          : "agregado: " + wantQty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
         changed++;
       }
       if (changed) await tokStoreSet(CART_JOB_KEY, job);
