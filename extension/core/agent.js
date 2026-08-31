@@ -356,10 +356,24 @@ async function _pdf_text(data, onProgress, onCancel) {
   let text = "";
   const pages = [];
   const needOcr = [];
+  // v2.0.30: detectar páginas con texto embedded CORRUPTO (encoding de fonts
+  // no estándar, glifos basura tipo óîÇõñÇ). Si la proporción de caracteres
+  // latinos imprimibles es <50%, la página se trata como escaneada y se manda
+  // a OCR, en vez de generar basura que nunca produce line_items.
+  const _isReadable = (tc) => {
+    const s = (tc.items || []).map((it) => it.str || "").join(" ");
+    if (!s.length) return false;
+    let latin = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if ((c >= 32 && c <= 126) || (c >= 160 && c <= 255) || c === 10 || c === 13) latin++;
+    }
+    return latin / s.length >= 0.5;
+  };
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const tc = await page.getTextContent();
-    if (tc.items.length > 0) {
+    if (tc.items.length > 0 && _isReadable(tc)) {
       text += _text_items_to_lines(tc) + "\n";
     } else {
       needOcr.push(i);
