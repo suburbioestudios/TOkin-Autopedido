@@ -605,8 +605,15 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   }
 
   async function cancelar() {
+    // Cancelar TODA la actividad y reiniciar la herramienta de cero:
+    // 1) CANCEL frena el job (el content script aborta y VACÍA el carrito del
+    //    store al detectar la bandera),
+    // 2) CLEAR + resetUi limpian la sesión del offscreen y la UI del popup,
+    //    dejando la herramienta lista para cargar un documento nuevo.
     await toOff({ type: "CANCEL" });
-    setStatus("Cancelando…");
+    await toOff({ type: "CLEAR" });
+    resetUi();
+    setStatus("Carga cancelada — carrito vaciado y herramienta reiniciada. Cargá un archivo para empezar.", "ok");
   }
 
   // ------------------------------------------------------------- carrito
