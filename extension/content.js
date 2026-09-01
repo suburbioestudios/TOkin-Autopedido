@@ -847,10 +847,12 @@
   }
 
   // Queries candidatas para el buscador del store, de la más específica a la más
-  // amplia, siempre filtradas por la unidad de venta pedida. El pack ("18x40g")
-  // se descarta dejando el gramaje ("40g"), porque el store busca mejor por
-  // gramos; si no aparece nada se prueba sin números y por marca.
-  function tokBuildQueries(item) {
+  // amplia. La BÚSQUEDA POR NOMBRE (cuando el código no matcheó o no hay código)
+  // se hace SIN la unidad de venta: solo nombre del producto + gramaje, porque
+  // el buscador del store exige AND de todos los términos y "bulto"/"display"/
+  // "unidad" rompen la búsqueda. El pack ("18x40g") se descarta dejando el
+  // gramaje ("40g"), porque el store busca mejor por gramos.
+  function tokBuildQueries(item, withUnit) {
     const skuRaw = String(item.sku || "").trim();
     const skuDigits = skuRaw.replace(/\D+/g, "");
     const raw = String(item.producto || "").trim();
@@ -877,26 +879,29 @@
     } else if (skuDigits.length >= 4) {
       push(skuRaw);
     }
-    const unitWord = tokNorm(tokUnitLabel(item)); // bulto|display|unidad
+    // Unidad SOLO en la pestaña de la query de nombre "generosa" inicial; en los
+    // fallbacks por nombre (withUnit=false) se omite. La query de código y la
+    // primera de nombre llevan unidad solo cuando corresponda.
+    const unitWord = withUnit ? tokNorm(tokUnitLabel(item)) : ""; // bulto|display|unidad
     const grams = tokGrams(raw);
     const g0 = grams.length ? grams[0] : null;
     const gramToken = g0 != null && Number.isInteger(g0) ? String(g0) + "g" : "";
     // 1) SKU exacto del pedido (ARC-XXXX), si existe: es la búsqueda más precisa
     const sku = String(item.sku || "").trim();
     if (sku) push(sku);
-    // 2) con el gramaje limpio ("ROCKLETS CONFITADOS 18x40g" -> "... 40g") + unidad
+    // 2) con el gramaje limpio ("ROCKLETS CONFITADOS 18x40g" -> "... 40g")
     push(
       raw.replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g") +
         (unitWord ? " " + unitWord : "")
     );
-    // 3) palabras núcleo + gramaje + unidad
+    // 3) palabras núcleo + gramaje
     const words = tokNorm(raw)
       .replace(/\d+/g, " ")
       .split(" ")
       .filter((w) => w.length >= 3 && !TOK_STOP.has(w))
       .join(" ");
     push(words + (gramToken ? " " + gramToken : "") + (unitWord ? " " + unitWord : ""));
-    // 4) primera palabra núcleo + unidad (amplia)
+    // 4) primera palabra núcleo (amplia)
     push((words.split(" ")[0] || "") + (unitWord ? " " + unitWord : ""));
     // 5-7) sin unidad ni gramaje: el buscador del store exige AND de todos los
     // términos, así que "display"/"14g" rompen la búsqueda; al final quedan las
@@ -1021,7 +1026,11 @@
       }
       if (job.phase === "pending") {
         const it = job.items[job.index];
-        const queries = tokBuildQueries(it);
+        // Búsqueda por nombre SIN unidad cuando hay código válido y pasamos al
+        // fallback (qIdx>0): solo nombre del producto + gramaje. La query de
+        // código (qIdx 0) no usa unidad igual.
+        const hasValidSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
+        const queries = tokBuildQueries(it, !hasValidSku);
         if (job.qIdx >= queries.length) {
           // v2.0.29: se agotaron TODAS las queries. Con código válido se probó
           // el código (con su reintento por render lento) y, como fallback, las
@@ -1172,16 +1181,15 @@
       const wantUnit = tokUnitLabel(it);
       const wantType = tokNorm(wantUnit);
       const wantedGrams = tokGrams(String(it.producto || "") + " " + String(it.unidad || ""));
-      const queries = tokBuildQueries(it);
+      // byName=true cuando NO estamos en la query de código (qIdx 0 con sku
+      // válido). En ese modo la búsqueda es por NOMBRE SIN unidad (solo nombre +
+      // gramaje): la unidad se elige después al procesar la card.
+      const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
+      const byName = !(job.qIdx === 0 && validSku);
+      const queries = tokBuildQueries(it, !validSku);
       // Cantidad total del producto en el pedido (suma de líneas duplicadas).
       const wantKey = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(wantUnit);
       const wantQty = (job.productTotals || {})[wantKey] || 0;
-      // v2.0.29: byName=true cuando NO estamos en la query de código (qIdx 0 con
-      // sku válido) — es decir, cuando caemos al fallback por NOMBRE. En ese
-      // modo tokBestArticle matchea por nombre+unidad aunque la línea traiga
-      // sku (el código ya no existe en el store).
-      const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
-      const byName = !(job.qIdx === 0 && validSku);
 
       const cand = await waitForTokin(
         () => tokBestArticle(target, wantType, wantedGrams, it.sku, byName),

@@ -3,7 +3,7 @@
 // corren en el documento offscreen, que sigue vivo aunque este popup se cierre
 // al minimizar la pestaña. Al reabrir, se restaura la sesión desde allí.
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
-import { getAllowedUsers, isAllowed } from "../core/access.js";
+import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAccess } from "../core/access.js";
 (function () {
   "use strict";
 
@@ -482,8 +482,30 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
     }
     $("#cfg-session").textContent = "Tu email de sesión: " + pong.session.email;
 
+    const granted = await checkCachedAccess(pong.session.email);
+    if (granted) {
+      // Ya fue autorizado en esta sesión: no volver a bloquear aunque la lista
+      // remota tarde o falle. Mantener el acceso y restaurar el estado.
+      ui.allowed = { ok: true, emails: (ui.allowed && ui.allowed.emails) || [], cached: true };
+      setBadge("ok", "Autorizado", "Acceso ya verificado en esta sesión.");
+      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      if (ens && ens.ok) {
+        const st = await toOff({ type: "GET_STATE" });
+        if (st && st.ok) {
+          applyState(st.state);
+          if (!st.state || st.state.status === "idle") {
+            await syncFromJob();
+          }
+        } else {
+          await syncFromJob();
+        }
+      }
+      return;
+    }
+
     await checkAccess(pong.session.email);
-    if (ui.allowed && ui.allowed.ok && (await isAllowed(pong.session.email, ui.allowed.hashes))) {
+    if (ui.allowed && ui.allowed.ok && isAllowed(pong.session.email, ui.allowed.emails)) {
+      await grantAccess(pong.session.email);
       const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
       if (!ens || !ens.ok) {
         setStatus("No se pudo iniciar el procesador de fondo: " + ((ens && ens.message) || "error"), "err");
@@ -520,7 +542,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
       );
       return;
     }
-    if (await isAllowed(email, ui.allowed.hashes)) {
+    if (isAllowed(email, ui.allowed.emails)) {
       setBadge("ok", "Autorizado");
       return;
     }
@@ -605,15 +627,25 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
   }
 
   async function cancelar() {
-    // Cancelar TODA la actividad y reiniciar la herramienta de cero:
-    // 1) CANCEL frena el job (el content script aborta y VACÍA el carrito del
-    //    store al detectar la bandera),
-    // 2) CLEAR + resetUi limpian la sesión del offscreen y la UI del popup,
-    //    dejando la herramienta lista para cargar un documento nuevo.
+    // CANCEL frena el job: el content script aborta y VACÍA el carrito del
+    // store, y el offscreen conserva el REPORTE PARCIAL (hasta dónde llegó) en
+    // estado "canceled". No se limpia la sesión ni la UI: el reporte queda en
+    // pantalla para que el usuario vea qué se cargó. La herramienta solo se
+    // reinicia de cero con «Reanudar»/«Terminar».
     await toOff({ type: "CANCEL" });
-    await toOff({ type: "CLEAR" });
-    resetUi();
-    setStatus("Carga cancelada — carrito vaciado y herramienta reiniciada. Cargá un archivo para empezar.", "ok");
+    // Esperar a que el offscreen asiente el estado "canceled" (el content
+    // script aborta y deja el reporte parcial) antes de pintarlo.
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const st = await toOff({ type: "GET_STATE" });
+      if (st && st.ok && st.state && st.state.status === "canceled") {
+        applyState(st.state);
+        return;
+      }
+    }
+    const st = await toOff({ type: "GET_STATE" });
+    if (st && st.ok) applyState(st.state);
+    setStatus("Carga cancelada — quedó el reporte parcial.", "warn");
   }
 
   // ------------------------------------------------------------- carrito
@@ -825,12 +857,14 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
           }
         }
         if (email) {
-          if (await isAllowed(email, ui.allowed.hashes)) {
+          if (isAllowed(email, ui.allowed.emails)) {
+            await grantAccess(email);
             $("#access-screen").classList.add("hidden");
             $("#main-screen").classList.remove("hidden");
             setBadge("ok", "Autorizado");
             setStatus("Acceso habilitado. Podés usar la herramienta.", "ok");
           } else {
+            await revokeAccess();
             setBadge("err", "No autorizado");
             setStatus("Tu usuario aún no está en la lista.", "err");
           }
@@ -883,7 +917,7 @@ import { getAllowedUsers, isAllowed } from "../core/access.js";
 if (new URLSearchParams(location.search).get("debug") === "1") {
   window.__TOKIN_CORE__ = {
     parseDocument, mapFields, summarize,
-    getAllowedUsers, isAllowed,
+    getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAccess,
     ocrProbe: async () => {
       const out = { steps: [], tesseract: !!window.Tesseract };
       if (!window.Tesseract) return out;

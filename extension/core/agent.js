@@ -278,9 +278,23 @@ const OCR_WORKERS = 3;
 // un trazado, sin capa de texto). 3.5 es la escala más precisa (evita errores de
 // transcripción: Tesseract confunde dígitos cercanos a escalas bajas, 3→31,
 // 12→22), así que TODO el OCR corre a 3.5, incluida la detección de orientación.
+// Elige la rotación probando de a una (desde 270°, la estándar de los pedidos
+// de Arcor, que están girados 90° a la derecha) con CORTE TEMPRANO: si 270°
+// da evidencia casi perfecta (confianza alta + legibilidad alta, ver el
+// umbral abajo) se usa directamente y NO se prueban las otras 3 direcciones
+// — antes se corría OCR de las 4 rotaciones en paralelo y re-OCR de cada una
+// para la evidencia, lo que demoraba mucho en cada pedido. El texto girado
+// da confianza y legibilidad mucho más bajas que el texto derecho.
+// Devuelve { best, all } con las rotaciones ordenadas de mejor a peor.
 const OCR_SCALE = 3.5;
 const OCR_DETECT_SCALE = 3.5;
 const ROT_CANDIDATES = [270, 0, 90, 180];
+// Umbral de "buena evidencia" para cortar sin probar las demás rotaciones:
+// confianza media-alta + mayoría de palabras reales (legibilidad > 0.6).
+// Con texto derecho Tesseract suele dar conf 55-90 y legibilidad 0.7-1.0;
+// girado da conf <30 y legibilidad <0.3. Un valor conservador (30 + 20*0.6)
+// solo corta cuando 270° es claramente la orientación correcta.
+const ROT_GOOD_SCORE = 45;
 
 // Palabras funcionales y claves del documento de pedido. El texto girado produce
 // basura alfanumérica que un chequeo genérico no distingue; estas claves solo
@@ -325,12 +339,43 @@ function _legibility(text) {
 async function _detect_one(worker, page, rot) {
   const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
   const r = await _ocr_canvas(worker, canvas);
-  return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w };
+  const scale = OCR_DETECT_SCALE;
+  const items = _pdf_table_items(r.words, r.w, scale);
+  const score = r.conf + 20 * _legibility(r.text);
+  canvas.width = 0;
+  canvas.height = 0;
+  return {
+    rot,
+    conf: r.conf,
+    text: r.text,
+    words: r.words,
+    w: r.w,
+    h: r.h,
+    scale,
+    score,
+    // Evidencia combinada: confianza + legibilidad (diccionario) + bonus por
+    // encontrar items de tabla. Igual que la usada por el caller para elegir.
+    evidence: score + (items.length > 0 ? 50 : 0),
+  };
 }
 
+// Detección de orientación con CORTE TEMPRANO: probamos de a UNA rotación
+// empezando por 270° (la ORIENTACIÓN ESTÁNDAR de los pedidos de Arcor, escaneados
+// girados 90° a la derecha). Si la rotación probada alcanza ROT_GOOD_SCORE
+// (confianza media-alta + mayoría de palabras reales) se corta y NO se prueban
+// 0/90/180. Antes se corría OCR de las 4 rotaciones en paralelo y después el
+// caller volvía a renderizar y OCRear CADA rotación a escala completa para la
+// evidencia (≈8 OCRs de página por pedido) — por eso cada pedido demoraba. El
+// texto girado da conf <30 y legibilidad <0.3; el derecho conf 55-90 y
+// legibilidad 0.7-1.0, así que 270° corta apenas es la orientación correcta.
 async function _detect_rotations(pool, page) {
-  const results = await _parallel(pool, ROT_CANDIDATES, (worker, rot) => _detect_one(worker, page, rot));
-  results.sort((a, b) => b.score - a.score);
+  const results = [];
+  for (const rot of ROT_CANDIDATES) {
+    const r = await _detect_one(pool[0], page, rot);
+    results.push(r);
+    if (r.score >= ROT_GOOD_SCORE) break;
+  }
+  results.sort((a, b) => b.evidence - a.evidence);
   return results;
 }
 
@@ -392,27 +437,13 @@ async function _pdf_text(data, onProgress, onCancel) {
         console.log("[tokin] rotation=%s conf=%s ocr_pages=%d t_detect=%dms", best.rot, best.conf, needOcr.length, Date.now() - t0);
       }
 
-      // Elegir la rotación con mayor evidencia combinada: confianza de Tesseract
-      // + legibilidad (diccionario) + items de tabla del probe. Antes se cortaba
-      // en el primer candidato "legible" y la métrica aceptaba basura alfanumérica,
-      // eligiendo 0° cuando la hoja estaba girada 90° (ej: pedidos de Arcor).
-      // El probe de la rotación elegida se reutiliza como OCR de la página 1.
-      let chosen = null;
-      let firstDone = null;
-      let bestEvidence = -1;
-      for (const cand of rots) {
-        if (onCancel && onCancel()) throw new CancelError();
-        if (onProgress) onProgress("Probando orientación " + cand.rot + "°…");
-        const probePage = await pdf.getPage(needOcr[0]);
-        const probe = await _ocr_page(pool[0], probePage, cand.rot);
-        const items = _pdf_table_items(probe.words, probe.w, probe.scale);
-        const evidence = probe.conf + 25 * _legibility(probe.text) + (items.length > 0 ? 50 : 0);
-        if (!chosen || evidence > bestEvidence) {
-          chosen = cand;
-          firstDone = probe;
-          bestEvidence = evidence;
-        }
-      }
+      // La evidencia combinada (confianza + legibilidad diccionario + items de
+      // tabla) ya quedó calculada en `_detect_rotations`, que ahora corta
+      // temprano por 270° sin probar las demás. chosen = el mejor candidato; su
+      // OCR (misma escala, 3.5) se REUTILIZA como OCR de la página 1 — antes se
+      // volvía a renderizar y OCRear cada rotación para la evidencia (doble OCR).
+      const chosen = rots[0];
+      const firstDone = chosen;
 
       // Página 1: se reutiliza el probe (misma rotación y escala).
       text += firstDone.text + "\n";
