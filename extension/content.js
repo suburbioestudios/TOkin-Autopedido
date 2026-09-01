@@ -982,6 +982,14 @@
     return v === "stop" ? "stop" : v ? "user" : "";
   }
 
+  // Devuelve la razón de cancel si el usuario pidió cancelar (o el sistema
+  // interrumpió), para abortar cuanto antes DENTRO del procesamiento de un ítem
+  // (el drawer del carrito grande hace cada ítem lento; esperar al checkpoint
+  // entre líneas hace que el cancel parezca que no funciona).
+  async function tokAbortIfRequested() {
+    return cartCancel ? "user" : await tokCancelReason();
+  }
+
   // v2.0.27: único punto de arranque de la cadena del lote. Si ya hay una
   // cadena viva, los kicks extra (watchdog, evento online, nudge del
   // background) se ignoran: nunca corren dos loops en paralelo procesando el
@@ -1215,6 +1223,9 @@
         let hit = null;
         let confirmed = false;
         for (let i = 0; i < 8 && !confirmed; i++) {
+          if (i > 0 && (await tokAbortIfRequested())) {
+            return tokAbortCart(job, false);
+          }
           if (i > 0) {
             // 1) re-aplicar la qty en la card del carrito por su CÓDIGO (la card
             // real puede estar sin nombre de producto, pero conserva el ARC).
@@ -1466,6 +1477,7 @@
   }
 
   async function tokAdvance(job, ok) {
+    if (await tokAbortIfRequested()) return tokAbortCart(job, false);
     tokProgress(
       "Cargando carrito: " + (job.index + 1) + " de " + job.total + " — " +
         String(job.items[job.index].producto || "").slice(0, 30),
@@ -1543,8 +1555,25 @@
         if (hit && hit.qty >= wantQty) {
           changed++;
         } else {
-          r.ok = false;
-          r.message = "no se confirmó en el cierre (card qty " + (hit ? hit.qty : "sin card") + ")";
+          // La card puede estar cargada pero con la qty SIN asentar (el re-render
+          // de React del drawer saturado la resetea / la muestra distinta a lo
+          // pedido) o con la qty que el store realmente aceptó (tope). Si la card
+          // del CÓDIGO existe en el carrito (qty > 0), el ítem SÍ se cargó: no
+          // degradar a un "no se confirmó" falso (el reporte debe reflejar el
+          // carrito real). Confirmamos con la qty que quedó y anotamos si quedó
+          // parcial. Solo cuando la card está AUSENTE del carrito es un fallo real.
+          const present = cards.find(
+            (c) => c.code && (c.code === code || c.code.endsWith(code) || code.endsWith(c.code)) && c.qty > 0
+          );
+          if (present) {
+            r.message = "agregado: " + present.qty + " " + (r.usedUnit || "").trim() +
+              (present.qty < wantQty ? " (qty parcial " + present.qty + "/" + wantQty + ")" : "") +
+              " (confirmado en el cierre)";
+            changed++;
+          } else {
+            r.ok = false;
+            r.message = "no se confirmó en el cierre (sin card del código en el carrito)";
+          }
         }
       }
 
@@ -1620,17 +1649,37 @@
     } catch (e) {}
   }
 
-  // v2.0.23: vaciar el carrito del store (setear qty a 0 en cada card).
+  // v2.0.23/32: vaciar el carrito del store (setear qty a 0 en cada card).
+  // Las cards del drawer están SIEMPRE en el DOM, pero si el drawer está
+  // cerrado su offsetParent es null: antes se filtraban y el carrito NO se
+  // vaciaba al cancelar. Ahora se abre el drawer si ninguna card está visible
+  // (para que los inputs sean interactuables y el set persista contra el
+  // servidor), se setea 0 en cada card con cantidad y se cierra.
   async function tokEmptyCart() {
+    const openDrawer = async () => {
+      let visible = false;
+      document.querySelectorAll("article[data-id=cart-product-card]").forEach((c) => {
+        if (c.querySelector("input[type=number]") && c.offsetParent !== null) visible = true;
+      });
+      if (visible) return;
+      const btn = document.querySelector("[data-id=navbar-minicart-button]");
+      if (!btn) return;
+      btn.click();
+      await toksleep(900);
+    };
     try {
+      await openDrawer();
       const cards = document.querySelectorAll("article[data-id=cart-product-card]");
       for (const card of cards) {
         const inp = card.querySelector("input[type=number]");
-        if (inp && inp.offsetParent !== null) {
-          tokSetValue(inp, "0");
-          await toksleep(400);
-        }
+        if (!inp) continue;
+        const cur = parseInt(String(inp.value || "").replace(/\D+/g, ""), 10) || 0;
+        if (cur === 0) continue;
+        tokSetValue(inp, "0");
+        await toksleep(300);
       }
+      const close = document.querySelector("[data-id=cart-close-button], [data-id=minicart-close-button]");
+      if (close) close.click();
     } catch (e) {}
   }
 
