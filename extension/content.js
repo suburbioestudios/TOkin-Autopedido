@@ -846,17 +846,53 @@
     return location.origin + "/store/search?q=" + encodeURIComponent(query);
   }
 
+  // Solo las palabras alfabéticas del nombre limpio (sin packs/gramajes/dígitos
+  // y sin stopwords), para las queries "solo nombre" del fallback.
+  function wordsOnly(clean) {
+    return String(clean || "")
+      .split(" ")
+      .filter((w) => w.length >= 3 && !/^\d/.test(w) && !TOK_STOP.has(w))
+      .join(" ");
+  }
+
+  // Limpia el nombre del producto para la búsqueda por nombre: colapsa el pack
+  // a su gramaje ("18x40g"→"40g", "x810 g"→"810g", "x61 g"→"61g"), saca letras
+  // huérfanas que el OCR deja sueltas (ej. "GOMITAS T" → "gomitas"; la única
+  // letra suelta permitida es "g" de gramos), y dedupé palabras repetidas.
+  function tokCleanName(raw) {
+    const pre = String(raw || "")
+      .replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g")
+      .replace(/\b[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)\b/gi, "$1g");
+    const tokens = pre.split(/\s+/).filter(Boolean);
+    const seen = new Set();
+    const out = [];
+    for (const t of tokens) {
+      const n = tokNorm(t);
+      if (!n || n.length < 1) continue;
+      // letra huérfana del OCR: se descarta siempre que NO sea "g" de gramos
+      // ("TOFI x40 G" → el gramaje queda; el resto de letras sueltas se limpia).
+      if (n.length === 1 && /^[a-z]$/.test(n) && n !== "g") continue;
+      // Dedupe por RAÍZ: no pueden convivir singular y plural de la misma
+      // palabra (redundancia que rompe el AND del buscador del store). Se toma
+      // el stem sin "s"/"es" final y si ya apareció, se salta la variante.
+      const stem = n.replace(/(es|s)$/, "");
+      const key = stem.length >= 3 ? stem : n;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(n);
+    }
+    return out.join(" ");
+  }
+
   // Queries candidatas para el buscador del store, de la más específica a la más
-  // amplia. La BÚSQUEDA POR NOMBRE (cuando el código no matcheó o no hay código)
-  // se hace SIN la unidad de venta: solo nombre del producto + gramaje, porque
-  // el buscador del store exige AND de todos los términos y "bulto"/"display"/
-  // "unidad" rompen la búsqueda. El pack ("18x40g") se descarta dejando el
-  // gramaje ("40g"), porque el store busca mejor por gramos.
-  function tokBuildQueries(item, withUnit) {
+  // amplia. Cuando hay un código válido va primero SOLO ese; si no, cae al
+  // nombre (limpio): nombre del producto + gramaje/pack, sin unidad y sin
+  // letras sueltas del OCR. El buscador del store exige AND de todos los
+  // términos, así que "bulto"/"display" romperían la búsqueda.
+  function tokBuildQueries(item) {
     const skuRaw = String(item.sku || "").trim();
     const skuDigits = skuRaw.replace(/\D+/g, "");
-    const raw = String(item.producto || "").trim();
-    let out = [];
+    const out = [];
     const seen = new Set();
     const push = (q) => {
       q = String(q || "").replace(/\s+/g, " ").trim();
@@ -866,49 +902,18 @@
         out.push(q);
       }
     };
-    // v2.0.29: si la línea trae un CÓDIGO legible (4+ dígitos), la PRIMERA
-    // búsqueda es SOLO por código (gate real v2.0.14): nunca agrega un producto
-    // distinto cuando el pedido existe en el store. Pero si el código NO se
-    // encuentra en el store (producto no cargado o código mal leído), se cae a
-    // la búsqueda por NOMBRE con las queries de más abajo, para que la línea
-    // igualmente pueda cargarse. Con un código degradado por el OCR
-    // ("ama3", <4 dígitos) no hay matcheo seguro contra el ARC: se va directo a
-    // BUSCAR POR NOMBRE (sin query de código), nunca a abortar.
-    if (skuRaw && !skuDigits.length) {
-      // código pero sin ningún dígito: no matchea ARC de todos modos → por nombre
-    } else if (skuDigits.length >= 4) {
-      push(skuRaw);
-    }
-    // Unidad SOLO en la pestaña de la query de nombre "generosa" inicial; en los
-    // fallbacks por nombre (withUnit=false) se omite. La query de código y la
-    // primera de nombre llevan unidad solo cuando corresponda.
-    const unitWord = withUnit ? tokNorm(tokUnitLabel(item)) : ""; // bulto|display|unidad
-    const grams = tokGrams(raw);
-    const g0 = grams.length ? grams[0] : null;
-    const gramToken = g0 != null && Number.isInteger(g0) ? String(g0) + "g" : "";
-    // 1) SKU exacto del pedido (ARC-XXXX), si existe: es la búsqueda más precisa
-    const sku = String(item.sku || "").trim();
-    if (sku) push(sku);
-    // 2) con el gramaje limpio ("ROCKLETS CONFITADOS 18x40g" -> "... 40g")
-    push(
-      raw.replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g") +
-        (unitWord ? " " + unitWord : "")
-    );
-    // 3) palabras núcleo + gramaje
-    const words = tokNorm(raw)
-      .replace(/\d+/g, " ")
-      .split(" ")
-      .filter((w) => w.length >= 3 && !TOK_STOP.has(w))
-      .join(" ");
-    push(words + (gramToken ? " " + gramToken : "") + (unitWord ? " " + unitWord : ""));
-    // 4) primera palabra núcleo (amplia)
-    push((words.split(" ")[0] || "") + (unitWord ? " " + unitWord : ""));
-    // 5-7) sin unidad ni gramaje: el buscador del store exige AND de todos los
-    // términos, así que "display"/"14g" rompen la búsqueda; al final quedan las
-    // palabras clave, dos palabras y la marca sola (ej: "sonrisas", "top line").
-    push(words);
-    push(words.split(" ").slice(0, 2).join(" "));
-    push(words.split(" ")[0] || "");
+    // 0) SKU exacto si es legible (4+ dígitos). Es la búsqueda más precisa y
+    // única que usa el GATE ESTRICTO por código. Código degradado ("ama3") se
+    // saltea y va directo al nombre.
+    if (skuDigits.length >= 4) push(skuRaw);
+    // Nombre: limpia packs/letras sueltas, sin unidad y sin redundancias.
+    const clean = tokCleanName(item.producto);
+    if (!clean) return out;
+    push(clean);
+    push(wordsOnly(clean) + " " + (tokGrams(item.producto).length ? tokGrams(item.producto)[0] + "g" : ""));
+    push(wordsOnly(clean).split(" ").slice(0, 3).join(" "));
+    push(wordsOnly(clean).split(" ").slice(0, 2).join(" "));
+    push(wordsOnly(clean).split(" ")[0] || "");
     return out;
   }
 
@@ -1026,11 +1031,9 @@
       }
       if (job.phase === "pending") {
         const it = job.items[job.index];
-        // Búsqueda por nombre SIN unidad cuando hay código válido y pasamos al
-        // fallback (qIdx>0): solo nombre del producto + gramaje. La query de
-        // código (qIdx 0) no usa unidad igual.
-        const hasValidSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
-        const queries = tokBuildQueries(it, !hasValidSku);
+        // Búsqueda por nombre SIN unidad: solo nombre del producto + gramaje
+        // (la unidad se resuelve al procesar la card).
+        const queries = tokBuildQueries(it);
         if (job.qIdx >= queries.length) {
           // v2.0.29: se agotaron TODAS las queries. Con código válido se probó
           // el código (con su reintento por render lento) y, como fallback, las
@@ -1186,7 +1189,7 @@
       // gramaje): la unidad se elige después al procesar la card.
       const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
       const byName = !(job.qIdx === 0 && validSku);
-      const queries = tokBuildQueries(it, !validSku);
+      const queries = tokBuildQueries(it);
       // Cantidad total del producto en el pedido (suma de líneas duplicadas).
       const wantKey = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(wantUnit);
       const wantQty = (job.productTotals || {})[wantKey] || 0;
@@ -1288,14 +1291,14 @@
   async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName) {
     byName = !!byName;
     const card = cand.el;
-    const cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
+    let cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
     const out = { ok: false, message: "", storeName: cardText.slice(0, 90), added: 0, usedUnit: wantUnit };
 
     let unitBtn = null;
     let usedUnit = wantUnit;
     let unitNote = "";
     let convertedQty = 0;
-    const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
+    let btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
     // v2.0.26: detección TEMPRANA de "sin stock". Una card sin botones de
     // unidad, sin input y sin botón Agregar que además dice "sin stock" no tiene
     // nada que procesar: reportarlo acá evita esperar los timeouts de
@@ -1307,10 +1310,31 @@
       !card.querySelector("input[type=number]") &&
       !card.querySelector("[data-id=add-to-cart-button]")
     ) {
-      const arc = tokArcCode(cardText);
-      out.ok = true;
-      out.message = "encontrado pero sin stock" + (arc ? " (" + arc + ")" : "");
-      return out;
+      // v2.0.37: la SPA del store a veces renderiza primero la card como "sin
+      // stock" mientras carga la disponibilidad de forma asíncrona (reporte
+      // falso-sin-stock de códigos que SÍ tienen stock, ej. 11860 / 1782).
+      // Esperar a que la card se estabilice: si en ~2,5 s aparecen un input,
+      // el botón Agregar o botones de unidad, la card TIENE stock y hay que
+      // procesarla con el flujo normal; si no cambia, es sin stock real.
+      const late = await waitForTokin(
+        () =>
+          card.querySelector("input[type=number]") ||
+          card.querySelector("[data-id=add-to-cart-button]") ||
+          card.querySelector("[data-id=sku-selector-button]") ||
+          null,
+        2500,
+        250
+      );
+      if (!late) {
+        const arc = tokArcCode(cardText);
+        out.ok = true;
+        out.message = "encontrado pero sin stock" + (arc ? " (" + arc + ")" : "");
+        return out;
+      }
+      // La card quedó cargada: refrescar sus datos y seguir el flujo normal.
+      btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]"));
+      cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
+      out.storeName = cardText.slice(0, 90);
     }
     if (wantType && btns.length) {
       unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType)) || null;
@@ -1626,11 +1650,28 @@
       return code ? "c:" + code : "t:" + String(x.producto || "").trim();
     };
     const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
+    // v2.0.37: el número "En el carrito" se toma del CARRITO REAL (cards del
+    // drawer con qty>0), no del conteo derivado de los results. Antes, si una
+    // card quedaba cargada pero su línea se reportó "no se encontró"/"no se
+    // confirmó" (o el store la renderizó después de tokFinalVerify), el resumen
+    // mostraba menos productos de los que realmente había en el carrito
+    // (ej. decía 50 y el carrito tenía 51). Se cuenta por identidad real:
+    // código ARC de la card, o su nombre si no trae código.
+    let realCartCount = 0;
+    try {
+      const realKeys = new Set();
+      for (const c of tokCartCards()) {
+        if (!(c.qty > 0)) continue;
+        realKeys.add(c.code ? "c:" + c.code : "t:" + (c.name || ""));
+      }
+      realCartCount = realKeys.size;
+    } catch (e) {}
+    const prodAddedReal = realCartCount > prodAdded ? realCartCount : prodAdded;
     const sinStock = results.filter((x) => !isAdded(x) && /sin stock/i.test(x.message || "")).length;
     const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
     const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;
     const docName = job.docName || "";
-    const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded };
+    const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded: prodAddedReal };
     try {
       window.__TOKIN_RES__ = summary;
     } catch (e) {}
@@ -1646,7 +1687,7 @@
       chrome.runtime.sendMessage(
         {
           target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName,
-          sinStock, notFound, notConfirmed, prodAdded,
+          sinStock, notFound, notConfirmed, prodAdded: prodAddedReal,
         },
         () => { void chrome.runtime.lastError; }
       );
@@ -1801,33 +1842,41 @@
       // desde la siguiente. No repetir líneas ya cargadas.
       if (job.phase === "paused") {
         const cards = tokCartCards();
-        let resumeFrom = job.index;
-        // Revisar las líneas desde la actual hacia atrás para encontrar la
-        // última que realmente está en el carrito (confirmada).
-        for (let checkIdx = job.index; checkIdx >= 0; checkIdx--) {
-          const checkIt = job.items[checkIdx];
-          const checkSku = String(checkIt.sku || "").replace(/\D+/g, "");
-          const checkFound = checkSku ? cards.find(function(c) { return c.code && c.code.endsWith(checkSku); }) : null;
-          if (checkFound) {
-            // Esta línea ya está en el carrito. Si no tiene resultado, agregarlo.
-            const alreadyResulted = job.results.some(function(r, ri) { return ri === checkIdx && r.ok; });
-            if (!alreadyResulted) {
-              const wantUnit = tokUnitLabel(checkIt);
-              job.results[checkIdx] = {
-                producto: checkIt.producto || checkIt.sku || "",
-                ok: true,
-                message: "agregado: " + checkFound.qty + " " + wantUnit + " (reanudado tras interrupción)",
-                added: checkFound.qty,
-                usedUnit: wantUnit,
-                storeText: "",
-              };
+        const inCart = cards.filter((c) => c.qty > 0);
+        // v2.0.39: si el carrito quedó vacío (lo vació «Reanudar»), reiniciar
+        // el lote desde la línea 0 para cargar TODO el pedido de nuevo.
+        if (inCart.length === 0) {
+          job.index = 0;
+          job.results = [];
+        } else {
+          let resumeFrom = job.index;
+          // Revisar las líneas desde la actual hacia atrás para encontrar la
+          // última que realmente está en el carrito (confirmada).
+          for (let checkIdx = job.index; checkIdx >= 0; checkIdx--) {
+            const checkIt = job.items[checkIdx];
+            const checkSku = String(checkIt.sku || "").replace(/\D+/g, "");
+            const checkFound = checkSku ? cards.find(function(c) { return c.code && c.code.endsWith(checkSku); }) : null;
+            if (checkFound) {
+              // Esta línea ya está en el carrito. Si no tiene resultado, agregarlo.
+              const alreadyResulted = job.results.some(function(r, ri) { return ri === checkIdx && r.ok; });
+              if (!alreadyResulted) {
+                const wantUnit = tokUnitLabel(checkIt);
+                job.results[checkIdx] = {
+                  producto: checkIt.producto || checkIt.sku || "",
+                  ok: true,
+                  message: "agregado: " + checkFound.qty + " " + wantUnit + " (reanudado tras interrupción)",
+                  added: checkFound.qty,
+                  usedUnit: wantUnit,
+                  storeText: "",
+                };
+              }
+              resumeFrom = checkIdx + 1;
+              break;
             }
-            resumeFrom = checkIdx + 1;
-            break;
           }
+          // Si no se encontró ninguna línea en el carrito, reintentar desde job.index.
+          job.index = resumeFrom;
         }
-        // Si no se encontró ninguna línea en el carrito, reintentar desde job.index.
-        job.index = resumeFrom;
         job.qIdx = 0;
         job.phase = "pending";
         await tokStoreSet(CART_JOB_KEY, job);
@@ -1911,6 +1960,11 @@
         tokStoreSet(CART_CANCEL_KEY, "user");
         sendResponse({ ok: true });
         break;
+      case "EMPTY_CART":
+        tokEmptyCart()
+          .then(() => sendResponse({ ok: true }))
+          .catch((e) => sendResponse({ ok: false, message: String(e) }));
+        return true;
       case "OPEN_CART":
         // El botón "Abrir store" del popup abre el CARRITO (drawer del store).
         try {

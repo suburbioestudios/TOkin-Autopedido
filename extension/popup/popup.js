@@ -783,6 +783,8 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         return;
       }
       setStatus("Reanudando la tarea en el store…", "");
+      // Vaciar el carrito del store antes de reanudar para empezar limpio.
+      await sendTab(tab.id, { type: "EMPTY_CART" });
       const pong = await sendTab(tab.id, { type: "TOKIN_RESUME_NUDGE" });
       if (!pong || !pong.ok) {
         // Sin content script (página de error tras el corte de señal):
@@ -796,6 +798,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     }
     await toOff({ type: "CLEAR" });
     resetUi();
+    // Vaciar el carrito del store también si no hay job activo.
+    const tab = await getStoreTab();
+    if (tab && tab.id) {
+      try { await sendTab(tab.id, { type: "EMPTY_CART" }); } catch (e) {}
+    }
     setStatus("Formulario limpio. Cargá un archivo para empezar.", "ok");
   }
 

@@ -280,7 +280,7 @@ const OCR_WORKERS = 3;
 // 12→22), así que TODO el OCR corre a 3.5, incluida la detección de orientación.
 const OCR_SCALE = 3.5;
 const OCR_DETECT_SCALE = 3.5;
-const ROT_CANDIDATES = [270, 0, 90, 180];
+const ROT_CANDIDATES = [270, 0, 90];
 
 // Palabras funcionales y claves del documento de pedido. El texto girado produce
 // basura alfanumérica que un chequeo genérico no distingue; estas claves solo
@@ -325,7 +325,9 @@ function _legibility(text) {
 async function _detect_one(worker, page, rot) {
   const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
   const r = await _ocr_canvas(worker, canvas);
-  return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w };
+  // OCR_DETECT_SCALE === OCR_SCALE: el probe de detección ya es OCR a escala
+  // completa, reutilizable directo como OCR de página 1 (sin re-OCR).
+  return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w, h: r.h, scale: OCR_DETECT_SCALE };
 }
 
 async function _detect_rotations(pool, page) {
@@ -385,36 +387,35 @@ async function _pdf_text(data, onProgress, onCancel) {
       if (onCancel && onCancel()) throw new CancelError();
       for (let k = 0; k < OCR_WORKERS; k++) pool.push(await _ocr_worker());
       if (typeof console !== "undefined") console.log("[tokin] t_workers=%dms", Date.now() - t0);
-      if (onProgress) onProgress("Detectando orientación de las hojas…");
+      if (onProgress) onProgress("Leyendo las páginas…");
+      // v2.0.37: se vuelve a la DETECCIÓN AUTOMÁTICA de rotación (4 ángulos).
+      // Forzar 270° fijo hacía que los PDFs que necesitan otra orientación dieran
+      // OCR basura y "0 líneas". Acá se elige la rotación con mayor evidencia
+      // v2.0.37: la rotación se decide UNA SOLA VEZ con la página 1 y se aplica
+      // igual a todas las demás (no se busca hoja por hoja). Se testean solo
+      // 270/0/90 en paralelo (180° nunca ocurre en pedidos) y la evidencia se
+      // calcula SOBRE los probes ya OCR-eados por _detect_rotations: como
+      // OCR_DETECT_SCALE === OCR_SCALE, el ganador ES el OCR de página 1 y no
+      // hay re-OCR extra (antes eran 4 OCR de detección + 4 OCR del loop).
       const rots = await _detect_rotations(pool, await pdf.getPage(needOcr[0]));
       const best = rots[0];
       if (typeof console !== "undefined") {
         console.log("[tokin] rotation=%s conf=%s ocr_pages=%d t_detect=%dms", best.rot, best.conf, needOcr.length, Date.now() - t0);
       }
-
-      // Elegir la rotación con mayor evidencia combinada: confianza de Tesseract
-      // + legibilidad (diccionario) + items de tabla del probe. Antes se cortaba
-      // en el primer candidato "legible" y la métrica aceptaba basura alfanumérica,
-      // eligiendo 0° cuando la hoja estaba girada 90° (ej: pedidos de Arcor).
-      // El probe de la rotación elegida se reutiliza como OCR de la página 1.
       let chosen = null;
       let firstDone = null;
       let bestEvidence = -1;
       for (const cand of rots) {
-        if (onCancel && onCancel()) throw new CancelError();
-        if (onProgress) onProgress("Probando orientación " + cand.rot + "°…");
-        const probePage = await pdf.getPage(needOcr[0]);
-        const probe = await _ocr_page(pool[0], probePage, cand.rot);
-        const items = _pdf_table_items(probe.words, probe.w, probe.scale);
-        const evidence = probe.conf + 25 * _legibility(probe.text) + (items.length > 0 ? 50 : 0);
+        const items = _pdf_table_items(cand.words, cand.w, cand.scale);
+        const evidence = cand.conf + 25 * _legibility(cand.text) + (items.length > 0 ? 50 : 0);
         if (!chosen || evidence > bestEvidence) {
           chosen = cand;
-          firstDone = probe;
+          firstDone = cand;
           bestEvidence = evidence;
         }
       }
 
-      // Página 1: se reutiliza el probe (misma rotación y escala).
+      // Página 1: se reutiliza el OCR directo (misma rotación y escala).
       text += firstDone.text + "\n";
       if (firstDone.words.length)
         pages.push({ page: needOcr[0], words: firstDone.words, w: firstDone.w, h: firstDone.h, scale: firstDone.scale });
