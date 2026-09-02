@@ -24,3 +24,7 @@ Funciona 100% en tu navegador: los datos de tu pedido nunca salen de tu PC.
 La extensión busca cada producto, elige la unidad correcta
 (Unidad/Display/Bulto), fija la cantidad y agrega al carrito. Podés cancelar
 cuando quieras; al terminar o cancelar verás un resumen de lo procesado.
+
+> **Reanudar** vacía el carrito antes de seguir: si había una tarea pausada
+> (por ejemplo, por corte de internet), se relanza desde cero y re-carga todo
+> el pedido. Usalo cuando quieras empezar limpio.
