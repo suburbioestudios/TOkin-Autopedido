@@ -1,0 +1,9 @@
+﻿node_modules/
+package-lock.json
+package.json
+test_playwright.js
+test_snippet_raw.js
+gen_test_snippet.js
+crear_excel_npm.js
+PRUEBA_5_ITEMS.xlsx
+PRUEBA_5_ITEMS.csv

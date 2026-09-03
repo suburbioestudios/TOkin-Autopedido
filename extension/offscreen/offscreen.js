@@ -1,0 +1,476 @@
+// Tokin AutoPedido - documento offscreen (MV3)
+// Mantiene la sesión del pedido viva en segundo plano mientras el popup está
+// cerrado. Aquí corre el OCR (parseDocument) y la carga al carrito. El popup
+// solo muestra; este documento guarda estado en chrome.storage.session y
+// transmite progreso al popup cuando está abierto.
+//
+// Chrome cierra un offscreen tras ~30s de inactividad: se envía un heartbeat
+// al service worker cada 20s y se escribe progreso en storage.session, que
+// cuenta como actividad para mantener el documento vivo.
+
+import { parseDocument, summarize } from "../core/agent.js";
+
+// pdf.js programa el render de cada página con requestAnimationFrame, que NUNCA
+// se dispara en un documento offscreen (no recibe frames) y cuelga el OCR.
+// Se reemplaza por setTimeout para que el render avance.
+if (typeof window !== "undefined") {
+  window.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 16);
+  window.cancelAnimationFrame = (id) => clearTimeout(id);
+}
+
+const state = {
+  status: "idle", // idle|parsing|parsed|loading_cart|done|canceled|error
+  step: 1,
+  progress: "",
+  filename: "",
+  error: "",
+  doc: null,
+  summary: null,
+  line_items: [],
+  cart: null,
+  cartProgress: null,
+  cancelRequested: false,
+  cancellingCart: false,
+};
+
+function sessionView() {
+  return {
+    status: state.status,
+    step: state.step,
+    progress: state.progress,
+    filename: state.filename,
+    error: state.error,
+    summary: state.summary,
+    line_items: state.line_items,
+    cart: state.cart,
+    cartProgress: state.cartProgress,
+  };
+}
+
+// Un sendMessage con callback vacío sin leer chrome.runtime.lastError dispara
+// "Unchecked runtime.lastError: The message port closed before a response was
+// received." cuando el popup está cerrado o el service worker se suspende.
+// Este helper consume el lastError para silenciar el aviso.
+function safeSend(msg) {
+  try {
+    chrome.runtime.sendMessage(msg, () => { void chrome.runtime.lastError; });
+  } catch (e) {}
+}
+
+// El offscreen no expone chrome.storage: la persistencia la hace el service
+// worker (que sí tiene storage). La fuente viva de la sesión es este estado.
+function persist() {
+  safeSend({ target: "sw", type: "PERSIST", state: sessionView() });
+}
+
+function emitState() {
+  safeSend({ target: "popup", type: "STATE", state: sessionView() });
+}
+
+function setStatus(status, progress, step) {
+  state.status = status;
+  if (progress !== undefined) state.progress = progress;
+  if (step) state.step = step;
+  state.error = status === "error" ? state.error : "";
+  persist();
+  emitState();
+}
+
+function resetState() {
+  state.status = "idle";
+  state.step = 1;
+  state.progress = "";
+  state.filename = "";
+  state.error = "";
+  state.doc = null;
+  state.summary = null;
+  state.line_items = [];
+  state.cart = null;
+  state.cartProgress = null;
+  state.cancelRequested = false;
+  state.cancellingCart = false;
+}
+
+// Los mensajes de chrome.runtime se serializan como JSON: los binarios deben
+// viajar como base64 (un Uint8Array llegaría como objeto plano).
+function b64ToBytes(b64) {
+  const bin = atob(String(b64 || ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// El offscreen solo expone chrome.runtime (sin chrome.tabs ni chrome.storage):
+// el carrito y la persistencia los resuelve el service worker.
+function sendSw(msg) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ ...msg, target: "sw" }, (res) => {
+        if (chrome.runtime.lastError) resolve({ ok: false, message: chrome.runtime.lastError.message });
+        else resolve(res || { ok: false, message: "Sin respuesta" });
+      });
+    } catch (e) {
+      resolve({ ok: false, message: String(e) });
+    }
+  });
+}
+
+// ------------------------------------------------------------------ parse
+
+function summarizeMsg(doc) {
+  const kv = (doc.kv_pairs || []).length;
+  const items = (doc.line_items || []).length;
+  const base = kv + " dato(s) · " + items + " línea(s) de pedido.";
+  return (doc.error ? "Con advertencias: " + doc.error + " · " : "") + base;
+}
+
+async function runParse(filename, data) {
+  // Entrar un documento nuevo frena cualquier automatización de carrito que
+  // haya quedado corriendo de una tarea anterior.
+  if (state.status === "loading_cart") {
+    sendSw({ type: "CANCEL_CART" });
+    state.cart = null;
+    state.cartProgress = null;
+  }
+  state.cancelRequested = false;
+  state.filename = filename;
+  state.error = "";
+  setStatus("parsing", "Enviando archivo…", 1);
+  let lastPersist = 0;
+  try {
+    const doc = await parseDocument(
+      filename,
+      data,
+      (msg) => {
+        state.progress = msg;
+        const now = Date.now();
+        if (now - lastPersist > 1500) {
+          lastPersist = now;
+          persist();
+        }
+        try {
+          safeSend({ target: "popup", type: "PROGRESS", message: msg });
+        } catch (e) {}
+      },
+      () => state.cancelRequested
+    );
+    state.doc = doc;
+    state.line_items = doc.line_items || [];
+    state.summary = summarize(doc);
+    state.error = doc.error || "";
+    setStatus("parsed", summarizeMsg(doc), 2);
+    playBeep(!doc.error);
+  } catch (e) {
+    if (e && e.name === "CancelError") {
+      setStatus("canceled", "Proceso cancelado.", 1);
+    } else {
+      state.error = String((e && e.message) || e);
+      setStatus("error", state.error, 1);
+    }
+  } finally {
+    state.cancelRequested = false;
+  }
+}
+
+// ---------------------------------------------------------------- carrito
+
+function cartItems() {
+  return (state.line_items || [])
+    .map((it) => ({
+      producto: it.producto || "",
+      cantidad: it.cantidad || "",
+      unidad: it.unidad || "",
+      categoria: it.categoria || "",
+      sku: it.sku || "",
+    }))
+    .filter((it) => (it.producto || it.sku || "").trim());
+}
+
+async function runCart() {
+  state.cancellingCart = false;
+  const items = cartItems();
+  if (!items.length) {
+    setStatus("error", "No hay líneas de pedido para cargar.", 2);
+    return;
+  }
+  setStatus("loading_cart", "Cargando carrito (" + items.length + " líneas)…", 3);
+  state.cart = { total: items.length, ok: 0, results: [] };
+  state.cartProgress = null;
+  state.cartCanceled = false;
+  persist();
+  try {
+    // El content script corre un lote resumible (navega por cada búsqueda) y va
+    // reportando CART_PROGRESS; al terminar envía CART_DONE, que aplica el estado.
+    const out = await sendSw({ type: "ADD_TO_CART", items, filename: state.filename || "" });
+    if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
+  } catch (e) {
+    if (state.cancellingCart) {
+      setStatus("canceled", "Carga del carrito cancelada.", 3);
+    } else {
+      state.error = String((e && e.message) || e);
+      setStatus("error", state.error, 3);
+    }
+  } finally {
+    state.cancellingCart = false;
+  }
+}
+
+function applyCartDone(msg) {
+  if (state.status !== "loading_cart" && state.status !== "paused") return;
+  const results = (msg && msg.results) || [];
+  // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
+  // "agregado"). "sin stock" / "no se encontró" / "no se confirmó" no suman al
+  // conteo de cargado (el informe refleja el carrito, no las líneas ok).
+  const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+  const added = results.filter(isAdded).length;
+  // "En el carrito: N productos" por la IDENTIDAD del carrito (código ARC de la
+  // card donde cayó cada línea), no por el texto: dos líneas en la misma card
+  // son UN producto (SET). Caso real CUENCA: código 14800 en "SANDIA x500" y
+  // "FRUTILLA x500" (error del proveedor) -> ambas en ARC-1014800 -> 41 líneas
+  // "agregado" pero 40 cards.
+  const prodKey = (r) => {
+    const m = String(r.storeText || "").match(/ARC-?(\d+)/i);
+    return m ? "c:" + m[1] : "t:" + String(r.producto || "").trim();
+  };
+  const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
+  const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
+  const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+  const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  state.cart = {
+    total: (msg && msg.total) || results.length,
+    ok: added,
+    prodAdded: (msg && msg.prodAdded != null) ? msg.prodAdded : prodAdded,
+    sinStock,
+    notFound,
+    notConfirmed,
+    results,
+    docName: (msg && msg.docName) || state.filename || "",
+  };
+  if (!msg || !msg.canceled) {
+    // Las líneas que NO se agregaron al carrito quedan en las filas para
+    // corregir y reintentar; solo se quitan las confirmadas (message empieza
+    // con "agregado"), porque reenviarlas las duplicaría. Quedan las falladas,
+    // las "sin stock" y las "no se confirmó". Los resultados llegan en el mismo
+    // orden que cartItems() (líneas no vacías).
+    const all = state.line_items || [];
+    state.cart.allLineItems = all;
+    const pending = [];
+    let idx = 0;
+    for (const it of all) {
+      if (!(it.producto || it.sku || "").trim()) {
+        pending.push(it);
+        continue;
+      }
+      const r = results[idx];
+      idx++;
+      if (!isAdded(r)) pending.push(it);
+    }
+    state.line_items = pending;
+    const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
+    const parts = [];
+    if (sinStock) parts.push(sinStock + " sin stock");
+    if (notFound) parts.push(notFound + " no encontrados");
+    if (notConfirmed) parts.push(notConfirmed + " sin confirmar");
+    const other = Math.max(0, state.cart.total - added - sinStock - notFound - notConfirmed);
+    if (other) parts.push(other + " con error");
+    setStatus(
+      "done",
+      "Pedido cargado en el carrito: " + added + " de " + state.cart.total + "." +
+        docNote +
+        (parts.length ? " (" + parts.join(", ") + ")" : "") +
+        (pending.length ? " Quedaron " + pending.length + " líneas para revisar." : ""),
+      4
+    );
+    playBeep(true);
+  } else {
+    setStatus("canceled", "Carga del carrito cancelada.", 3);
+  }
+}
+
+function cancelCart() {
+  state.cancellingCart = true;
+  setStatus("loading_cart", "Cancelando carga del carrito…", 3);
+  sendSw({ type: "CANCEL_CART" });
+}
+
+// ---------------------------------------------------------------- sonido
+
+function playBeep(ok) {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    if (ctx.state === "suspended") ctx.resume();
+    const notes = ok ? [880, 1174.7] : [440, 330];
+    let t = ctx.currentTime + 0.05;
+    for (const f of notes) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = f;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+      osc.start(t);
+      osc.stop(t + 0.24);
+      t += 0.26;
+    }
+    setTimeout(() => {
+      try { ctx.close(); } catch (e) {}
+    }, t + 200);
+  } catch (e) {}
+}
+
+
+
+// --------------------------------------------------------- mensajes y vida
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.target !== "offscreen") return false;
+  switch (msg.type) {
+    case "PARSE":
+      runParse(msg.filename || "archivo", b64ToBytes(msg.b64))
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
+      return true;
+    case "CANCEL":
+      if (state.status === "loading_cart") {
+        cancelCart();
+      } else {
+        state.cancelRequested = true;
+      }
+      sendResponse({ ok: true });
+      break;
+    case "ADD_TO_CART":
+      runCart()
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
+      return true;
+    case "UPDATE_LINE_ITEMS":
+      // El popup permitió editar las filas (doble clic): se persisten los
+      // cambios en la sesión para que la carga al carrito use los valores
+      // corregidos por el usuario.
+      if (Array.isArray(msg.items) && state.status !== "loading_cart") {
+        state.line_items = msg.items;
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
+    case "GET_STATE":
+      sendResponse({ ok: true, state: sessionView() });
+      break;
+    case "CART_PROGRESS":
+      if (state.status === "loading_cart" || msg.message) {
+        state.progress = msg.message || state.progress;
+        if (typeof msg.index === "number") {
+          state.cartProgress = { index: msg.index, total: msg.total, ok: !!msg.ok };
+        }
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
+    case "CART_STOP":
+      // El lote quedó huérfano (pestaña o sesión cerrada): vuelve al paso de
+      // líneas capturadas. La tarea no terminó con confirmación del usuario,
+      // así que NO se marca "canceled" y NO se limpia la sesión.
+      if (state.status === "loading_cart") {
+        state.cart = null;
+        state.cartProgress = null;
+        state.cartCanceled = false;
+        setStatus("idle", "", 1);
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
+    case "CART_PAUSE":
+      // v2.0.23: pausa por interrupción (internet). NO limpia nada:
+      // conserva line_items, cart y cartResults para que el usuario
+      // pueda reanudar desde donde se quedó.
+      if (state.status === "loading_cart") {
+        setStatus("paused", "Tarea pausada — reanudá cuando tengas señal.", 3);
+        persist();
+        emitState();
+      }
+      sendResponse({ ok: true });
+      break;
+    case "CART_DONE":
+      applyCartDone(msg);
+      persist();
+      emitState();
+      sendResponse({ ok: true });
+      break;
+    case "CLEAR":
+      resetState();
+      sendSw({ type: "CLEAR_PERSIST" });
+      emitState();
+      sendResponse({ ok: true });
+      break;
+    default:
+      sendResponse({ ok: false, message: "Tipo de mensaje desconocido" });
+  }
+  return false;
+});
+
+// Mantener el documento vivo: Chrome cierra un offscreen tras ~30s sin
+// actividad. Un sendMessage al service worker cada 20s cuenta como actividad.
+setInterval(() => {
+  safeSend({ target: "sw", type: "HEARTBEAT" });
+}, 20000);
+
+// Al recrear el offscreen (Chrome lo cierra y se vuelve a abrir) se restaura la
+// sesión previa: el formulario queda en el paso donde estaba. Si había un lote
+// en curso (v2.0.27: corriendo O pausado), la sesión vuelve a ese estado para
+// que el popup refleje la tarea restaurada; solo se vuelve a idle si ya no hay
+// job vivo (la tarea terminó mientras el offscreen estaba muerto).
+function restoreSession() {
+  sendSw({ type: "GET_STATE" }).then((res) => {
+    try {
+      const s = (res && res.ok && res.state) || null;
+      if (!s) return;
+      if (s.status === "loading_cart" || s.status === "paused") {
+        chrome.storage.local.get(["tokinCartJob"], function(d) {
+          var job = d && d.tokinCartJob;
+          var liveJob = job && job.phase && job.phase !== "done";
+          if (liveJob) {
+            var paused = job.phase === "paused";
+            state.status = paused ? "paused" : "loading_cart";
+            state.step = 3;
+            state.progress = paused
+              ? "Tarea pausada — se reanuda sola cuando vuelva la señal."
+              : (s.progress || "Cargando carrito…");
+            state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
+            state.cart = s.cart || null;
+            state.cartProgress = s.cartProgress || null;
+          } else {
+            state.status = "idle";
+            state.step = 1;
+            state.progress = "";
+            state.cart = null;
+            state.cartProgress = null;
+          }
+          persist();
+          emitState();
+        });
+        return;
+      }
+      state.status = s.status || "idle";
+      state.step = s.step || 1;
+      state.progress = s.progress || "";
+      state.filename = s.filename || "";
+      state.error = s.error || "";
+      state.summary = s.summary || null;
+      state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
+      state.cart = s.cart || null;
+      state.cartProgress = s.cartProgress || null;
+      persist();
+      emitState();
+    } catch (e) {}
+  });
+}
+restoreSession();
+
