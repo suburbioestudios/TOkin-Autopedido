@@ -139,7 +139,7 @@ button {
 button svg { width: 14px; height: 14px; }
 button:hover { background: #f5f2fb; }
 button:active { transform: translateY(1px); }
-button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+button:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: grayscale(1); box-shadow: none; }
 button.primary {
   background: linear-gradient(135deg, var(--violet) 0%, var(--violet-dark) 100%);
   border-color: transparent; color: #fff;

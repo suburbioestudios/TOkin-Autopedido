@@ -1766,10 +1766,14 @@
     await tokStoreRemove(CART_JOB_KEY);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
-    // v2.0.23: vaciar el carrito al cancelar/interrumpir para que el usuario
-    // pueda reanudar limpio (sin productos viejos mezclados).
-    await tokEmptyCart();
-    tokToastSet(interrupted ? "Tarea interrumpida — carrito vaciado." : "Carga cancelada — carrito vaciado.", "");
+    // Al cancelar el USUARIO, lo que alcanzó a cargarse QUEDA en el carrito:
+    // solo se vacía si después toca «Reanudar» o «Terminar» en el popup (que
+    // mandan EMPTY_CART). Solo las interrupciones del sistema (pestaña o
+    // sesión cerrada, lote huérfano) vacían el carrito acá.
+    if (interrupted) {
+      await tokEmptyCart();
+    }
+    tokToastSet(interrupted ? "Tarea interrumpida — carrito vaciado." : "Carga cancelada — lo cargado quedó en el carrito.", "");
     try {
       // interrupted: la pestaña/sesión se cerró o el lote quedó huérfano → el
       // offscreen vuelve al paso de líneas capturadas (CART_STOP), no a

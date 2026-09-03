@@ -114,6 +114,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   function setAction(which) {
+    // «Enviar a carrito» vuelve habilitado salvo que el estado lo vuelva
+    // obsoleto (post-cancelación: reenviar duplicaría lo que ya quedó cargado).
+    const btnCart = $("#btn-cart");
+    if (btnCart) btnCart.disabled = false;
     showEl("#btn-cancel", which === "cancel");
     showEl("#btn-cart", which === "cart");
     showEl("#btn-cancel-cart", which === "cancelCart");
@@ -197,6 +201,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         showEl("#done-hint", false);
         showEl("#btn-excel", true);
         setAction("cart");
+        // Tras cancelar, lo que se cargó queda en el carrito del store y solo
+        // se vacía con «Reanudar» o «Terminar»: reenviar acá duplicaría
+        // productos. El botón queda visible pero obsoleto (gris, sin acción).
+        const btnCart = $("#btn-cart");
+        if (btnCart) btnCart.disabled = true;
         renderDone(st);
         const c = st.cart || { ok: 0, total: 0 };
         setStatus("Carga cancelada: " + (c.ok || 0) + " de " + (c.total || 0) + " en el carrito.", "warn");
@@ -632,11 +641,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   async function cancelar() {
-    // CANCEL frena el job: el content script aborta y VACÍA el carrito del
-    // store, y el offscreen conserva el REPORTE PARCIAL (hasta dónde llegó) en
-    // estado "canceled". No se limpia la sesión ni la UI: el reporte queda en
-    // pantalla para que el usuario vea qué se cargó. La herramienta solo se
-    // reinicia de cero con «Reanudar»/«Terminar».
+    // CANCEL frena el job: el content script aborta y lo que alcanzó a cargar
+    // QUEDA en el carrito del store (no se vacía). El offscreen conserva el
+    // REPORTE PARCIAL en estado "canceled". El carrito solo se vacía con
+    // «Reanudar» o «Terminar», que también reinician la herramienta de cero.
     await toOff({ type: "CANCEL" });
     // Esperar a que el offscreen asiente el estado "canceled" (el content
     // script aborta y deja el reporte parcial) antes de pintarlo.
@@ -783,9 +791,16 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
 
   async function terminar() {
     const res = await toOff({ type: "CLEAR" });
+    // «Terminar» (igual que «Reanudar») es de las únicas dos acciones que
+    // vacían el carrito del store: la carga cancelada o terminada deja lo
+    // cargado intacto hasta que el usuario decide cerrar la sesión.
+    const tab = await getStoreTab();
+    if (tab && tab.id) {
+      try { await sendTab(tab.id, { type: "EMPTY_CART" }); } catch (e) {}
+    }
     resetUi();
     setStatus(
-      (res && res.ok ? "Sesión terminada y datos limpiados. " : "") + "Cargá un archivo para empezar.",
+      (res && res.ok ? "Sesión terminada, carrito vaciado y datos limpiados. " : "") + "Cargá un archivo para empezar.",
       res && res.ok ? "ok" : "warn"
     );
   }
@@ -936,5 +951,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   initDropzone();
   initSettings();
   bind();
+  // Al abrir (o reabrir tras minimizar/cambiar de pestaña o ventana) restaura
+  // la sesión: el reporte final sigue en pantalla, el cartelito verde de
+  // acceso arriba y el usuario abajo.
+  init();
 })();
 
