@@ -694,6 +694,34 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     }
   }
 
+  // Clasificación honesta del estado de una línea a partir de su mensaje.
+  // Antes era un regex genérico /unidad/i que etiquetaba "ERROR UNIDAD" hasta
+  // la falta de stock ("el store solo tiene N unidades..."). Ahora cada caso
+  // real tiene su estado propio.
+  function estadoDe(r) {
+    const msg = String((r && r.message) || "");
+    if (r && r.ok && msg.indexOf("agregado") === 0) {
+      return /agregado parcialmente/.test(msg) ? "CARGADO PARCIAL" : "CARGADO";
+    }
+    if (/sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(msg)) {
+      return "SIN STOCK";
+    }
+    if (/no se encontr/.test(msg)) return "NO ENCONTRADO";
+    if (/no se pudo convertir|supera el límite/i.test(msg)) return "ERROR UNIDAD";
+    if (msg.indexOf("no se confirmó") === 0) return "NO CONFIRMADO";
+    return "NO CARGADO";
+  }
+
+  function estadoCounts(results) {
+    const res = results || [];
+    return {
+      added: res.filter((r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0).length,
+      sinStock: res.filter((r) => estadoDe(r) === "SIN STOCK").length,
+      notFound: res.filter((r) => estadoDe(r) === "NO ENCONTRADO").length,
+      notConfirmed: res.filter((r) => estadoDe(r) === "NO CONFIRMADO").length,
+    };
+  }
+
   // Excel de cierre (v2.0.40): 2 hojas:
   // 1) "Reporte General": todos los ítems (#, SKU, Producto, Cant, Unidad, Estado, Diagnóstico).
   // 2) "Faltantes y Observados": ítems no cargados con columnas de detalle adicionales.
@@ -701,11 +729,12 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const allItems = (ui.cart && ui.cart.allLineItems) || ui.lineItems || [];
     const results = ((ui.cart && ui.cart.results) || []).slice();
     const baseName = (ui.cart && ui.cart.docName) || "informe";
-    const isAdded = (r) => r && r.ok && String(r.message || "").indexOf("agregado") === 0;
-    const added = results.filter(isAdded).length;
-    const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
-    const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
-    const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+    const counts = estadoCounts(results);
+    const added = counts.added;
+    const sinStock = counts.sinStock;
+    const notFound = counts.notFound;
+    const notConfirmed = counts.notConfirmed;
+    const isAdded = (r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0;
 
     const summaryStr = `Pedido cargado: ${added} de ${results.length} | Sin stock: ${sinStock} | No encontrados: ${notFound} | Sin confirmar: ${notConfirmed}`;
 
@@ -721,13 +750,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       cleanIdx++;
       const r = results[i] || {};
       const unidad = it.categoria || it.unidad || "";
-      let estado = "CARGADO";
-      if (!isAdded(r)) {
-        if (/sin stock/i.test(r.message || "")) estado = "SIN STOCK";
-        else if (/no se encontró/i.test(r.message || "")) estado = "NO ENCONTRADO";
-        else if (/unidad/i.test(r.message || "")) estado = "ERROR UNIDAD";
-        else estado = "NO CARGADO";
-      }
+      const estado = estadoDe(r);
       generalAoa.push([
         cleanIdx,
         String(it.sku || "N/A"),
@@ -752,10 +775,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       if (!(it.producto || it.sku || "").trim()) return;
       pendIdx++;
       const unidad = it.categoria || it.unidad || "";
-      let estado = "NO CARGADO";
-      if (/sin stock/i.test(r.message || "")) estado = "SIN STOCK";
-      else if (/no se encontró/i.test(r.message || "")) estado = "NO ENCONTRADO";
-      else if (/unidad/i.test(r.message || "")) estado = "ERROR UNIDAD";
+      const estado = estadoDe(r);
+      const diagExtra =
+        (r.convFactor > 0 ? " | factor conv: " + r.convFactor + " (pedido " + r.usedUnit + ")" : "") +
+        (r.storeButtons ? " | botones card: " + r.storeButtons : "");
 
       pendingAoa.push([
         pendIdx,
@@ -766,7 +789,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         estado,
         String(r.storeName || r.storeText || "N/A"),
         String(r.usedUnit || unidad || "N/A"),
-        String(r.message || "Sin mensaje de respuesta")
+        String(r.message || "Sin mensaje de respuesta") + diagExtra
       ]);
     });
 

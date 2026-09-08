@@ -475,15 +475,6 @@
     return false;
   }
 
-  // Un boton de unidad coincide si alguna de sus palabras es el tipo o un sinonimo.
-  function tokUnitBtnMatch(btnText, type) {
-    const words = tokNorm(btnText).split(" ");
-    const aliases = TOK_UNIT_ALIASES[type] || [type];
-    return words.some((w) =>
-      aliases.some((al) => (al.length >= 3 ? w === al || w.indexOf(al) === 0 : w === al))
-    );
-  }
-
   // De un botón de unidad ("x Display", "10% OFF x Bulto") devuelve el nombre
   // de la unidad normalizado ("Display") o "" si no se reconoce.
   function tokUnitLabelFromBtn(btnText) {
@@ -498,26 +489,118 @@
     return "";
   }
 
-  // Parsea el texto de la card o la descripción para extraer el factor de conversión (v2.0.30).
-  function tokParseUnitConversion(cardText, wantType, itemTitle) {
-    if (!wantType) return 0;
-    const fullText = tokNorm((cardText || "") + " " + (itemTitle || ""));
+  // Multiplicador del pack del título ("12x61g" -> 12, "25x28g" -> 25). Es la
+  // ÚLTIMA fuente de factor (opción B): solo se usa cuando la card no declara
+  // la conversión.
+  function tokTitlePack(itemTitle) {
+    const m = String(itemTitle || "").match(/\b(\d{1,3})\s*[x×]\s*\d+/i);
+    if (!m) return 0;
+    const n = parseInt(m[1], 10);
+    return n > 0 && n <= 999 ? n : 0;
+  }
+
+  // Factor de unidades que declara el TEXTO de un botón ("Display =12 u",
+  // "12 Uds", "Display 12", "Bulto 24"). Devuelve 0 si no hay un número que
+  // sea un conteo de unidades (un "% OFF" NO cuenta: el número viene solo).
+  function tokFactorFromText(s) {
+    const t = String(s || "").replace(/\s+/g, " ").trim();
+    if (!t) return 0;
+    // 1) número + marcador de unidad: "=12 u", "12 uds", "12u", "24 unidades".
+    let m = t.match(/(?:=\s*|:\s*|x\s*)?(\d{1,3})\s*(?:ud|uds|u\.?d\.?s?|u(?:nidades?)?|unid|und)\b/i);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n <= 999) return n;
+    }
+    // 2) alias de unidad + número: "Display 12", "Bulto 24", "Display 12 u".
+    m = t.match(/(?:display|bulto|caja|paquete|pack|unidad|displays?|bultos?|cajas?|paquetes?)\s*[:\s=×x\-]*(\d{1,3})\b/i);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n <= 999) return n;
+    }
+    return 0;
+  }
+
+  // Lee los botones de unidad REALES de la card: normaliza la unidad y extrae
+  // el factor que la card declara. La card DICTA la conversión: si el pedido
+  // pide una unidad que la card no ofrece, se convierte a la que sí ofrece con
+  // el factor que sale de acá.
+  function tokCardUnits(card) {
+    if (!card) return [];
+    const out = [];
+    const seen = {};
+    const els = card.querySelectorAll("[data-id=sku-selector-button]") || [];
+    for (const el of els) {
+      const text = String((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim());
+      if (!text) continue;
+      const label = tokUnitLabelFromBtn(text) || "Unidad";
+      const unit = tokNorm(label) || "unidad";
+      const factor = tokFactorFromText(text);
+      if (seen[unit]) {
+        if (!(seen[unit].factor > 0) && factor > 0) {
+          seen[unit].factor = factor;
+          seen[unit].text = text;
+        }
+        continue;
+      }
+      const entry = { el, label, unit, factor, text };
+      seen[unit] = entry;
+      out.push(entry);
+    }
+    const base = seen["unidad"];
+    if (base && !(base.factor > 0)) base.factor = 1;
+    return out;
+  }
+
+  // Factor de conversión para un tipo de unidad ("bulto"/"display"/"unidad"):
+  // (1) botón de esa unidad en la card, (2) texto de la card, (3) pack del
+  // título. La "unidad" es la base (factor 1). Devuelve 0 si no se declara.
+  function tokConvFactor(units, cardText, itemTitle, wantType) {
+    if (!wantType || wantType === "unidad") return wantType === "unidad" ? 1 : 0;
+    const btn = (units || []).find((u) => u.unit === wantType);
+    if (btn && btn.factor > 0) return btn.factor;
+    const t = tokNorm(String(cardText || ""));
     const typeAliases = TOK_UNIT_ALIASES[wantType] || [wantType];
     for (const alias of typeAliases) {
-      const re = new RegExp(alias + "[:\\s]+(\\d+)\\s*Uds", "i");
-      const m = fullText.match(re);
+      // "el bulto trae 24 unidades", "bulto 24 uds", "Display 12 u".
+      const m = t.match(new RegExp(alias + "[^\\d]{0,16}(\\d{1,3})[^\\d]{0,4}(?:ud|uds|u\\.?d\\.?s?|u(?:nidades?)?|unid|und)\\b", "i"));
       if (m) {
         const n = parseInt(m[1], 10);
         if (n > 0 && n <= 999) return n;
       }
     }
-    // Intento secundario: extraer multiplicador del título (ej. "12x61g" -> 12, "25x28g" -> 25)
-    const packMatch = String(itemTitle || "").match(/\b(\d+)\s*[x×]\s*\d+/i);
-    if (packMatch) {
-      const p = parseInt(packMatch[1], 10);
-      if (p > 0 && p <= 999) return p;
+    return tokTitlePack(itemTitle);
+  }
+
+  // Decisión de conversión cuando la unidad pedida NO está entre los botones de
+  // la card: elige la unidad destino con factor conocido (preferentemente la
+  // más cercana al pedido y con conversión en paquetes enteros) y devuelve la
+  // cantidad convertida. La card dicta la conversión; el pack del título es la
+  // opción B cuando la card no declara nada.
+  function tokPickConversion(units, cardText, itemTitle, wantType, wantQty) {
+    const out = { convW: 0, unit: null, q: 0 };
+    if (!wantType || !(wantQty > 0)) return out;
+    out.convW = wantType === "unidad" ? 1
+      : (tokConvFactor(units, cardText, itemTitle, wantType) || tokTitlePack(itemTitle));
+    if (!(out.convW > 0)) return out;
+    const tierPrefs =
+      wantType === "bulto" ? ["display", "unidad", "caja"] :
+      wantType === "display" ? ["unidad", "bulto", "caja"] :
+      ["display", "unidad", "caja"];
+    let target = null;
+    let targetQ = 0;
+    let targetScore = -1;
+    for (const u of units || []) {
+      const uf = u.factor > 0 ? u.factor : (u.unit === "unidad" ? 1 : tokConvFactor(units, cardText, itemTitle, u.unit));
+      if (!(uf > 0)) continue;
+      const q = (wantQty * out.convW) / uf;
+      if (!(q >= 1) || q > 999) continue;
+      const tier = tierPrefs.indexOf(u.unit);
+      const score = (q === Math.round(q) ? 10 : 0) + (tier >= 0 ? 5 - tier : 0);
+      if (score > targetScore) { targetScore = score; targetQ = q; target = u; }
     }
-    return 0;
+    out.unit = target;
+    out.q = target && targetQ > 0 ? Math.round(targetQ * 100) / 100 : 0;
+    return out;
   }
 
   function tokIsProductCard(a) {
@@ -1269,7 +1352,10 @@
     byName = !!byName;
     const card = cand.el;
     let cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
-    const out = { ok: false, message: "", storeName: cardText.slice(0, 90), added: 0, usedUnit: wantUnit };
+    const out = { ok: false, message: "", storeName: cardText.slice(0, 90), added: 0, usedUnit: wantUnit, storeButtons: "", convFactor: 0 };
+    // Cantidad pedida original (en unidades de venta): wantQty se reescribe al
+    // convertir, y acá queda el valor para el diagnóstico de convFactor.
+    const wantQtyRaw = wantQty;
 
     let unitBtn = null;
     let usedUnit = wantUnit;
@@ -1313,38 +1399,87 @@
       cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
       out.storeName = cardText.slice(0, 90);
     }
-    if (wantType && btns.length) {
-      unitBtn = btns.find((x) => tokUnitBtnMatch(x.innerText || "", wantType)) || null;
-    }
-    if (unitBtn) {
-      unitBtn.click();
-      await toksleep(1500);
-    } else if (btns.length) {
-      // v2.0.30: La card no tiene el botón exacto de la unidad solicitada (ej: pidió Bulto y la card muestra Display/Unidad).
-      const uName = tokUnitLabelFromBtn(btns[0].innerText || "");
-      const conv = tokParseUnitConversion(cardText, wantType, it.producto);
-      if (conv > 0 && wantType !== (uName || "").toLowerCase()) {
-        convertedQty = wantQty * conv;
-        if (convertedQty > 999) {
-          out.ok = false;
-          out.message =
-            "no se agregó: " + wantQty + " " + wantUnit + " = " + convertedQty +
-            " unidades, supera el límite de 999 del store";
-          return out;
-        }
-        unitBtn = btns[0];
-        usedUnit = uName || "Unidad";
-        unitNote = " (" + convertedQty + " " + usedUnit + ")";
+    // v2.0.44: leer PRIMERO qué unidades ofrece la card (con su factor): el
+    // pedido viene en unidades de venta y la card puede tener botones de
+    // Unidad/Display pero NO siempre de Bulto, o un solo botón. La conversión
+    // la DICTA la card: nunca se vuelca la cantidad del pedido en una unidad
+    // distinta sin convertir.
+    const units = tokCardUnits(card);
+    out.storeButtons = units.map((u) => u.text).join(" | ");
+    const wantTypeNorm = wantType || "";
+    if (units.length) {
+      const want = wantTypeNorm ? units.find((u) => u.unit === wantTypeNorm) : null;
+      if (want) {
+        // Unidad pedida disponible -> botón directo, sin conversión.
+        unitBtn = want.el;
+        usedUnit = want.label;
         unitBtn.click();
         await toksleep(1500);
-        wantQty = convertedQty;
+      } else if (wantTypeNorm && wantQty > 0) {
+        // Unidad pedida NO disponible -> convertir a la unidad que la card
+        // ofrece con el factor que la card declara (o el pack del título,
+        // opción B, si la card no declara nada).
+        const pick = tokPickConversion(units, cardText, it.producto, wantTypeNorm, wantQty);
+        if (pick.unit && pick.q > 0) {
+          const qFinal = pick.q;
+          if (qFinal > 999) {
+            out.ok = false;
+            out.message =
+              "no se agregó: " + wantQty + " " + wantUnit + " = " + qFinal +
+              " " + pick.unit.label + ", supera el límite de 999 del store";
+            return out;
+          }
+          convertedQty = qFinal;
+          unitBtn = pick.unit.el;
+          usedUnit = pick.unit.label;
+          unitNote = " (" + qFinal + " " + usedUnit + ", de " + wantQty + " " + wantUnit + ")";
+          unitBtn.click();
+          await toksleep(1500);
+          wantQty = qFinal;
+        } else if (pick.convW > 0) {
+          out.ok = false;
+          out.message =
+            "no se pudo convertir " + wantQty + " " + wantUnit +
+            ": la card ofrece [" + units.map((u) => u.label).join(", ") +
+            "] sin factores compatibles. Corregí la unidad en la tabla.";
+          return out;
+        } else {
+          // opción B: sin factor de conversión, cargar la cantidad que ya viene
+          // en la primera unidad que la card ofrece.
+          unitBtn = units[0].el;
+          usedUnit = units[0].label;
+          unitBtn.click();
+          await toksleep(1500);
+        }
       } else {
-        // Fallback: Seleccionar la unidad disponible principal (btns[0]) y procesar la cantidad solicitada.
-        unitBtn = btns[0];
-        usedUnit = uName || "Unidad";
+        unitBtn = units[0].el;
+        usedUnit = units[0].label;
         unitBtn.click();
         await toksleep(1500);
       }
+    } else if (wantTypeNorm && wantTypeNorm !== "unidad" && wantQty > 0) {
+      // Sin botones de unidad: la card vende por unidad base (solo input).
+      // Convertir con el factor de la card o el pack del título.
+      const convW = tokConvFactor([], cardText, it.producto, wantTypeNorm) || tokTitlePack(it.producto);
+      if (convW > 0) {
+        const qFinal = wantQty * convW;
+        if (qFinal > 999) {
+          out.ok = false;
+          out.message =
+            "no se agregó: " + wantQty + " " + wantUnit + " = " + qFinal +
+            " unidades, supera el límite de 999 del store";
+          return out;
+        }
+        usedUnit = "Unidad";
+        unitNote = " (" + qFinal + " Unidad, de " + wantQty + " " + wantUnit + ")";
+        convertedQty = qFinal;
+        wantQty = qFinal;
+      } else {
+        usedUnit = "Unidad";
+      }
+    }
+    if (convertedQty > 0 && wantQtyRaw > 0) {
+      out.convFactor = Math.round((convertedQty / wantQtyRaw) * 1000) / 1000;
     }
 
     const isNoStock = /sin stock/i.test(cardText);
@@ -1431,7 +1566,10 @@
           out.ok = false;
           out.added = actualQty;
           out.usedUnit = usedUnit;
-          out.message = "no se agreg: el store solo tiene " + actualQty + " unidades (no alcanza para 1 " + wantUnit + " de " + conv + " un.)";
+          out.message =
+            "no se agregó por falta de stock: el store solo tiene " + actualQty +
+            " " + usedUnit + " y hace falta 1 " + wantUnit + " (" +
+            (Math.round((conv || 0) * 100) / 100) + " " + usedUnit + ")";
         }
       } else {
         out.ok = true;
@@ -1647,7 +1785,7 @@
       realCartCount = realKeys.size;
     } catch (e) {}
     const prodAddedReal = realCartCount > prodAdded ? realCartCount : prodAdded;
-    const sinStock = results.filter((x) => !isAdded(x) && /sin stock/i.test(x.message || "")).length;
+    const sinStock = results.filter((x) => !isAdded(x) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(x.message || "")).length;
     const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
     const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;
     const docName = job.docName || "";

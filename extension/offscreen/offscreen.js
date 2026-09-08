@@ -223,6 +223,10 @@ function applyCartDone(msg) {
   // conteo de cargado (el informe refleja el carrito, no las líneas ok).
   const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
   const added = results.filter(isAdded).length;
+  // v2.0.44: la falta de stock de una presentación ("el store solo tiene N
+  // unidades / no alcanza para 1 Bulto") cuenta como SIN STOCK, igual que el
+  // "sin stock" de la card; antes ese mensaje caía fuera del desglose.
+  const sinStock = results.filter((r) => !isAdded(r) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(r.message || "")).length;
   // "En el carrito: N productos" por la IDENTIDAD del carrito (código ARC de la
   // card donde cayó cada línea), no por el texto: dos líneas en la misma card
   // son UN producto (SET). Caso real CUENCA: código 14800 en "SANDIA x500" y
