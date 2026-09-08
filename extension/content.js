@@ -733,46 +733,26 @@
   let pickerOverlay = null;
   let pickerInput = null;
 
-  // Envía PARSE al offscreen con reintentos. Problema real: el content script
-  // NO puede asumir que el offscreen está vivo (Chrome lo mata tras ~30s
-  // inactivo). Si manda PARSE directo sin verificar, el canal de respuesta no
-  // existe y Chrome devuelve "The message port closed before a response was
-  // received.", perdiendo el archivo. Por eso primero se despierta el offscreen
-  // vía el service worker (ENSURE_OFFSCREEN ya espera el handshake PING) y
-  // recién después se manda PARSE esperando su ack.
-  function tokSend(msg) {
-    return new Promise((resolve) => {
-      try {
-        chrome.runtime.sendMessage(msg, (r) => {
-          if (chrome.runtime.lastError) {
-            resolve({ ok: false, message: chrome.runtime.lastError.message || "error de mensaje" });
-            return;
-          }
-          resolve(r || { ok: false, message: "sin respuesta" });
-        });
-      } catch (e) {
-        resolve({ ok: false, message: String((e && e.message) || e) });
-      }
-    });
-  }
-
-  function tokTransient(e) {
-    return /port closed before a response|Receiving end does not exist|Could not establish connection/i.test(String((e && e.message) || e));
-  }
-
+  // Envía PARSE al offscreen con reintentos: si el documento offscreen todavía
+  // no está creado, el canal no existe y se reintenta hasta que responda.
   function sendParseToOffscreen(filename, b64, tries) {
-    const attempt = async (n) => {
-      const ens = await tokSend({ target: "sw", type: "ENSURE_OFFSCREEN" });
-      if (!ens || !ens.ok) {
-        if (n > 0) { await toksleep(600); return attempt(n - 1); }
-        return { ok: false, message: (ens && ens.message) || "No se pudo iniciar el procesador de fondo." };
+    const attempt = (n) => {
+      try {
+        chrome.runtime.sendMessage(
+          { target: "offscreen", type: "PARSE", filename, b64 },
+          (res) => {
+            if (chrome.runtime.lastError) {
+              if (n > 0) setTimeout(() => attempt(n - 1), 600);
+              return;
+            }
+            void res;
+          }
+        );
+      } catch (e) {
+        if (n > 0) setTimeout(() => attempt(n - 1), 600);
       }
-      const res = await tokSend({ target: "offscreen", type: "PARSE", filename, b64 });
-      if (res && res.ok) return { ok: true };
-      if (n > 0 && tokTransient(res)) { await toksleep(600); return attempt(n - 1); }
-      return { ok: false, message: (res && res.message) || "El procesador no aceptó el archivo." };
     };
-    return attempt(tries || 5);
+    attempt(tries || 5);
   }
 
   function setPickerText(title, msg, kind) {
@@ -838,27 +818,14 @@
           reader.onload = () => {
             try {
               const b64 = tokToB64(reader.result);
-              // No se esconde el overlay ni se avisa "enviado" hasta que el
-              // offscreen confirma el PARSE: si el puerto se cierra o el
-              // procesador no arranca, se muestra el error real.
-              sendParseToOffscreen(file.name, b64).then((r) => {
-                if (r && r.ok) {
-                  setPickerText(
-                    "Pedido enviado a Tokin AutoPedido.",
-                    "Procesando «" + file.name + "». Abrí la extensión para ver las líneas y tocar «Enviar a carrito».",
-                    "ok"
-                  );
-                  setTimeout(() => { overlay.style.display = "none"; }, 2600);
-                } else {
-                  setPickerText(
-                    "No se pudo procesar «" + file.name + "».",
-                    String((r && r.message) || "Error desconocido"),
-                    "err"
-                  );
-                  setTimeout(() => { overlay.style.display = "none"; }, 6000);
-                }
-                done({ ok: true, picked: true, result: r });
-              });
+              sendParseToOffscreen(file.name, b64);
+              setPickerText(
+                "Pedido enviado a Tokin AutoPedido.",
+                "Procesando «" + file.name + "». Abrí la extensión para ver las líneas y tocar «Enviar a carrito».",
+                "ok"
+              );
+              setTimeout(() => { overlay.style.display = "none"; }, 2600);
+              done({ ok: true, picked: true });
             } catch (e) {
               setPickerText("No se pudo leer el archivo.", String((e && e.message) || e), "err");
               done({ ok: false, message: String((e && e.message) || e) });

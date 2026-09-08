@@ -167,28 +167,7 @@ async function ensureOffscreen() {
     justification:
       "Procesa el pedido (OCR del PDF) en segundo plano mientras el popup está cerrado y avisa con un sonido al finalizar.",
   });
-  // Esperar a que el offscreen registre su listener: createDocument resuelve
-  // cuando la página existe, no cuando sus scripts cargaron. Si el popup manda
-  // un PARSE en ese hueco, el mensaje se pierde ("The message port closed
-  // before a response was received.") y el archivo no se procesa.
-  for (let i = 0; i < 20; i++) {
-    const ok = await new Promise((resolve) => {
-      let done = false;
-      const finish = (v) => {
-        if (!done) { done = true; resolve(v); }
-      };
-      try {
-        chrome.runtime.sendMessage({ target: "offscreen", type: "PING" }, (r) => {
-          void chrome.runtime.lastError;
-          finish(!!(r && r.ok));
-        });
-      } catch (e) { finish(false); }
-      setTimeout(() => finish(false), 500);
-    });
-    if (ok) return { ok: true };
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  return { ok: false, message: "El procesador de fondo no respondió a tiempo." };
+  return { ok: true };
 }
 
 chrome.runtime.onInstalled.addListener(() => {
