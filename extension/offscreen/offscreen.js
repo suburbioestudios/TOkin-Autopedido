@@ -136,6 +136,7 @@ async function runParse(filename, data) {
   state.filename = filename;
   state.error = "";
   setStatus("parsing", "Enviando archivo…", 1);
+  startKeepAlive();
   let lastPersist = 0;
   try {
     const doc = await parseDocument(
@@ -169,6 +170,19 @@ async function runParse(filename, data) {
     }
   } finally {
     state.cancelRequested = false;
+    stopKeepAlive();
+  }
+}
+
+// Ejecuta runParse sin que un error síncrono escape del listener de mensajes
+// (que ya confirmó el ack y ya no puede devolverlo).
+function runParseSafe(filename, data) {
+  try {
+    Promise.resolve().then(() => runParse(filename, data)).catch((e) => {
+      setStatus("error", String((e && e.message) || e), 1);
+    });
+  } catch (e) {
+    setStatus("error", String((e && e.message) || e), 1);
   }
 }
 
@@ -194,6 +208,7 @@ async function runCart() {
     return;
   }
   setStatus("loading_cart", "Cargando carrito (" + items.length + " líneas)…", 3);
+  startKeepAlive();
   state.cart = { total: items.length, ok: 0, results: [] };
   state.cartProgress = null;
   state.cartCanceled = false;
@@ -212,6 +227,7 @@ async function runCart() {
     }
   } finally {
     state.cancellingCart = false;
+    stopKeepAlive();
   }
 }
 
@@ -299,6 +315,45 @@ function cancelCart() {
 
 // ---------------------------------------------------------------- sonido
 
+// Chrome cierra un offscreen document ANTES de lo esperado si no está
+// "activo": tras ~30s sin actividad puede matarlo. El OCR de un PDF y la
+// carga de un carrito largo superan eso con holgura, y los STATE intermedios
+// no cuentan como actividad para el clamp. Truco soportado por la razón
+// AUDIO_PLAYBACK: mientras el documento reproduce audio, Chrome no lo mata.
+// Este "audio" es un lazo silencioso (ganancia ~0): solo mantiene viva la
+// página sin sonar nada.
+let keepAliveCtx = null;
+let keepAliveSrc = null;
+
+function startKeepAlive() {
+  try {
+    if (keepAliveCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    if (ctx.state === "suspended") ctx.resume();
+    const sr = ctx.sampleRate || 44100;
+    const buf = ctx.createBuffer(1, sr, sr);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.0001;
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    src.start();
+    keepAliveCtx = ctx;
+    keepAliveSrc = src;
+  } catch (e) {}
+}
+
+function stopKeepAlive() {
+  try { if (keepAliveSrc) keepAliveSrc.stop(); } catch (e) {}
+  keepAliveSrc = null;
+  try { if (keepAliveCtx) keepAliveCtx.close(); } catch (e) {}
+  keepAliveCtx = null;
+}
+
 function playBeep(ok) {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -334,11 +389,27 @@ function playBeep(ok) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.target !== "offscreen") return false;
   switch (msg.type) {
-    case "PARSE":
-      runParse(msg.filename || "archivo", b64ToBytes(msg.b64))
-        .then(() => sendResponse({ ok: true }))
-        .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
-      return true;
+    case "PING":
+      sendResponse({ ok: true });
+      break;
+    case "PARSE": {
+      // Confirmar YA y procesar en segundo plano: el progreso llega por STATE.
+      // Antes de v2.0.45 el puerto quedaba abierto todo el OCR y Chrome podía
+      // cerrarlo ("The message port closed before a response was received.")
+      // dejando el archivo sin reconocer. El ack debe salir SÍ o SÍ en este
+      // mismo tick: si atob/b64ToBytes lanzan antes de sendResponse, el puerto
+      // queda colgado y Chrome lo cierra. Por eso el cuerpo va en try/catch.
+      let bytes;
+      try {
+        bytes = b64ToBytes(msg.b64);
+      } catch (e) {
+        sendResponse({ ok: false, message: "El archivo llegó dañado a la extensión: " + String((e && e.message) || e) });
+        break;
+      }
+      runParseSafe(msg.filename || "archivo", bytes);
+      sendResponse({ ok: true });
+      break;
+    }
     case "CANCEL":
       if (state.status === "loading_cart") {
         cancelCart();

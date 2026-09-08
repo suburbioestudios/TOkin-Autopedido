@@ -32,6 +32,26 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   function toSw(msg) { return send("sw", msg); }
   function toOff(msg) { return send("offscreen", msg); }
 
+  // Errores transitorios de mensajería (service worker reiniciándose o
+  // offscreen a medio arrancar): reintentables, no son fallas del archivo.
+  function isTransientPortErr(err) {
+    return /port closed before a response|Receiving end does not exist|Could not establish connection/i.test(
+      String(err || "")
+    );
+  }
+
+  // ENSURE_OFFSCREEN es idempotente (crea/verifica el offscreen): se reintenta
+  // porque Chrome puede cerrar el puerto justo cuando el SW se despierta.
+  async function ensureOffscreen() {
+    for (let i = 0; i < 3; i++) {
+      const res = await toSw({ type: "ENSURE_OFFSCREEN" });
+      if (res && res.ok) return { ok: true };
+      if (res && res.message && !isTransientPortErr(res.message)) return res;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return toSw({ type: "ENSURE_OFFSCREEN" });
+  }
+
   // ------------------------------------------------------------- util
 
   function setStatus(text, kind) {
@@ -497,7 +517,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       // remota tarde o falle. Mantener el acceso y restaurar el estado.
       ui.allowed = { ok: true, emails: (ui.allowed && ui.allowed.emails) || [], cached: true };
       setBadge("ok", "Autorizado", "Acceso ya verificado en esta sesión.");
-      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      const ens = await ensureOffscreen();
       if (ens && ens.ok) {
         const st = await toOff({ type: "GET_STATE" });
         if (st && st.ok) {
@@ -515,7 +535,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     await checkAccess(pong.session.email);
     if (ui.allowed && ui.allowed.ok && isAllowed(pong.session.email, ui.allowed.emails)) {
       await grantAccess(pong.session.email);
-      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      const ens = await ensureOffscreen();
       if (!ens || !ens.ok) {
         setStatus("No se pudo iniciar el procesador de fondo: " + ((ens && ens.message) || "error"), "err");
         return;
@@ -604,7 +624,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       return;
     }
     setStatus("Abriendo el selector de archivos…");
-    const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+    const ens = await ensureOffscreen();
     if (!ens || !ens.ok) {
       setStatus("No se pudo iniciar el procesador de fondo.", "err");
       return;
@@ -623,7 +643,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     $("#file-name").classList.add("big");
     $("#dropzone").classList.add("has-file");
     try {
-      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      const ens = await ensureOffscreen();
       if (!ens || !ens.ok) {
         setStatus("No se pudo despertar el procesador de fondo.", "err");
         return;
