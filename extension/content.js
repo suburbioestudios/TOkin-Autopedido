@@ -9,6 +9,7 @@
 
   let highlightStyleInjected = false;
   let cartCancel = false;
+  let tokRunningBatch = false;
 
   // ------------------------------------------------------------- utilidades
 
@@ -336,6 +337,10 @@
     const start = Date.now();
     interval = interval || 250;
     for (;;) {
+      // Cancelación en pleno lote: si el usuario pidió cancelar mientras la
+      // pestaña está en background (timers throttled), cada espera del lote
+      // corta en el próximo tick en vez de esperar al borde del ítem.
+      if (tokRunningBatch && cartCancel) return null;
       tokLastBeat = Date.now();
       try {
         const v = fn();
@@ -551,23 +556,75 @@
     return out;
   }
 
+  // Lee los factores de conversión que la card DECLARA EN TEXTO, debajo de los
+  // botones (ej.: "Display: 1 Uds / Bulto: 12 Uds = 12 Disp"). Devuelve
+  // {display:N, bulto:M, caja:K}: cuántas piezas base trae cada unidad que la
+  // card presenta. Reglas:
+  //  - "unidad" (1 N Uds) tras UNA unidad palabra fija su factor;
+  //  - la marca "= N <unidad>" final INFIERE el factor de esa unidad (12 Uds
+  //    = 12 Disp => 1 Disp = 1 Uds);
+  //  - los números sueltos (precios, %) NO cuentan: solo un número seguido de
+  //    uds/unidades/marca, o la "= N <unidad>", declara un factor.
+  function tokCaptFactors(cardText) {
+    const out = {};
+    const canonWord = {
+      display: ["display", "disp", "pack", "packs", "paquete", "paquetes"],
+      bulto: ["bulto", "bultos", "envase", "caja", "cajas"],
+      caja: ["caja", "cajas"],
+    };
+    const MARK = new Set(["ud", "uds", "und", "uni", "unid", "unidad", "unidades", "u"]);
+    const unitWord = {};
+    for (const unit of Object.keys(canonWord)) {
+      for (const w of canonWord[unit]) unitWord[w] = unit;
+    }
+    const toks = String(cardText || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9=]+/g, " ")
+      .split(" ")
+      .filter(Boolean);
+    let lastUnit = null;
+    let lastDeclCount = 0;
+    let afterEq = false;
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t === "=") { afterEq = true; continue; }
+      if (unitWord[t]) {
+        if (afterEq) {
+          const prevNum = parseInt(toks[i - 1] || "", 10);
+          if (lastDeclCount > 0 && prevNum > 0 && prevNum <= 999 && out[unitWord[t]] === undefined) {
+            out[unitWord[t]] = lastDeclCount / prevNum;
+          }
+          afterEq = false;
+        } else {
+          lastUnit = unitWord[t];
+        }
+        continue;
+      }
+      if (/^\d{1,3}$/.test(t) && MARK.has(toks[i + 1])) {
+        const n = parseInt(t, 10);
+        if (n > 0) {
+          lastDeclCount = n;
+          if (lastUnit && out[lastUnit] === undefined) out[lastUnit] = n;
+        }
+      }
+    }
+    return out;
+  }
+
   // Factor de conversión para un tipo de unidad ("bulto"/"display"/"unidad"):
-  // (1) botón de esa unidad en la card, (2) texto de la card, (3) pack del
-  // título. La "unidad" es la base (factor 1). Devuelve 0 si no se declara.
+  // (1) botón de esa unidad en la card, (2) texto de la card debajo de los
+  // botones (tokCaptFactors), (3) base: el Display es la unidad de venta
+  // ("Display: 1 Uds") -> factor 1, (4) pack del título como último recurso.
+  // La "unidad" es la base (factor 1). Devuelve 0 si no se declara.
   function tokConvFactor(units, cardText, itemTitle, wantType) {
     if (!wantType || wantType === "unidad") return wantType === "unidad" ? 1 : 0;
     const btn = (units || []).find((u) => u.unit === wantType);
     if (btn && btn.factor > 0) return btn.factor;
-    const t = tokNorm(String(cardText || ""));
-    const typeAliases = TOK_UNIT_ALIASES[wantType] || [wantType];
-    for (const alias of typeAliases) {
-      // "el bulto trae 24 unidades", "bulto 24 uds", "Display 12 u".
-      const m = t.match(new RegExp(alias + "[^\\d]{0,16}(\\d{1,3})[^\\d]{0,4}(?:ud|uds|u\\.?d\\.?s?|u(?:nidades?)?|unid|und)\\b", "i"));
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (n > 0 && n <= 999) return n;
-      }
-    }
+    const f = tokCaptFactors(cardText)[wantType] || 0;
+    if (f > 0) return f;
+    if (wantType === "display") return 1;
     return tokTitlePack(itemTitle);
   }
 
@@ -978,6 +1035,7 @@
   }
 
   function setTokRun(on) {
+    tokRunningBatch = !!on;
     try {
       window.__TOKIN_RUN__ = !!on;
       if (!on) window.__TOKIN_RES__ = null;
@@ -1478,6 +1536,14 @@
         usedUnit = "Unidad";
       }
     }
+    // Cancelación: corte inmediato también cuando ya se resolvió la unidad de
+    // la card, para que un content script vivo frene en el próximo commit (no
+    // recién al terminar el ítem).
+    if (await tokAbortIfRequested()) {
+      out.ok = false;
+      out.message = "cancelado por el usuario";
+      return out;
+    }
     if (convertedQty > 0 && wantQtyRaw > 0) {
       out.convFactor = Math.round((convertedQty / wantQtyRaw) * 1000) / 1000;
     }
@@ -1901,6 +1967,7 @@
   }
 
   async function tokAbortCart(job, interrupted) {
+    try { console.log("[Tokin] tokAbortCart interrupted=" + interrupted); } catch (e) {}
     await tokStoreRemove(CART_JOB_KEY);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
@@ -2106,6 +2173,7 @@
       case "CANCEL_CART":
         cartCancel = true;
         tokStoreSet(CART_CANCEL_KEY, "user");
+        try { console.log("[Tokin] CANCEL_CART recibido (cartCancel=" + cartCancel + ")"); } catch (e) {}
         sendResponse({ ok: true });
         break;
       case "EMPTY_CART":

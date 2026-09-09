@@ -364,7 +364,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     if (c.total) {
       html += "\nLíneas agregadas: " + c.ok + " de " + c.total + ".";
       if (c.prodAdded && c.prodAdded !== c.ok) {
-        html += " En el carrito: " + c.prodAdded + " productos (hay líneas repetidas que se suman en una card).";
+        html += " En el carrito: " + c.prodAdded + " productos.";
       }
     }
     const parts = [];
@@ -641,13 +641,62 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   async function cancelar() {
-    // CANCEL frena el job: el content script aborta y lo que alcanzó a cargar
-    // QUEDA en el carrito del store (no se vacía). El offscreen conserva el
-    // REPORTE PARCIAL en estado "canceled". El carrito solo se vacía con
-    // «Reanudar» o «Terminar», que también reinician la herramienta de cero.
+    // La carga al carrito (status "loading_cart") se cancela DIRECTAMENTE contra
+    // el store vía background: durante un lote largo Chrome puede cerrar el
+    // offscreen y un CANCEL que viaje por él se pierde, dejando la carga andando
+    // sin freno. toSw(CANCEL_CART) persiste la clave tokinCartCancel (el content
+    // script aborta en su próximo chequeo, o al bootear si está navegando) y la
+    // reenvía a la pestaña, aunque el offscreen no exista.
+    const st0 = await toOff({ type: "GET_STATE" });
+    // No fiarse solo del offscreen: si Chrome lo reinició, su estado puede ser
+    // "idle" aunque haya un lote en marcha. Detectar la fase también por el job
+    // persistido y por el estado que el popup ya tenía renderizado.
+    const jobd0 = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+    const inCart =
+      !!jobd0[JOB_KEY] ||
+      (st0 && st0.ok && st0.state && st0.state.status === "loading_cart") ||
+      (ui.sessionState && ui.sessionState.status === "loading_cart");
+    try { console.log("[Tokin] cancelar: status offscreen=" + (st0 && st0.ok ? (st0.state && st0.state.status) : "sin respuesta") + " job=" + !!jobd0[JOB_KEY] + " inCart=" + inCart); } catch (e) {}
+    if (inCart) {
+      setStatus("Cancelando la carga del carrito…", "warn");
+      // Reenviar el CANCEL un par de veces: si la pestaña está navegando entre
+      // líneas, un único mensaje puede perderse en el hueco de navegación (la
+      // clave persistida lo cubre igual al bootear).
+      for (let i = 0; i < 3; i++) {
+        const r = await toSw({ type: "CANCEL_CART" });
+        if (i < 2) await new Promise((r2) => setTimeout(r2, 600));
+      }
+      // Esperar la señal REAL de fin: el offscreen asienta "canceled" con el
+      // reporte parcial, o el job desaparece (la carga se detuvo). Nunca pintar
+      // un "cancelado" falso mientras el store sigue agregando.
+      for (let i = 0; i < 24; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        const st = await toOff({ type: "GET_STATE" });
+        if (st && st.ok && st.state && st.state.status === "canceled") {
+          applyState(st.state);
+          return;
+        }
+        const jobd = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+        const job = jobd[JOB_KEY];
+        if (!job || job.phase === "done") {
+          const st1 = await toOff({ type: "GET_STATE" });
+          if (st1 && st1.ok && st1.state && st1.state.status === "canceled") {
+            applyState(st1.state);
+            return;
+          }
+          setStatus(
+            "Carga detenida — lo cargado quedó en el carrito del store. El reporte parcial no se generó porque el procesador de fondo estaba cerrado.",
+            "warn"
+          );
+          return;
+        }
+      }
+      setStatus("El store sigue procesando la línea actual; se detiene en el próximo corte.", "warn");
+      return;
+    }
+    // Etapas de ingesta (parsing/parsed): el CANCEL frena el proceso en el
+    // offscreen (el content script aborta la carga y deja el reporte parcial).
     await toOff({ type: "CANCEL" });
-    // Esperar a que el offscreen asiente el estado "canceled" (el content
-    // script aborta y deja el reporte parcial) antes de pintarlo.
     for (let i = 0; i < 10; i++) {
       await new Promise((r) => setTimeout(r, 500));
       const st = await toOff({ type: "GET_STATE" });
@@ -658,7 +707,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     }
     const st = await toOff({ type: "GET_STATE" });
     if (st && st.ok) applyState(st.state);
-    setStatus("Carga cancelada — quedó el reporte parcial.", "warn");
+    setStatus("Operación cancelada.", "warn");
   }
 
   // ------------------------------------------------------------- carrito
@@ -829,31 +878,58 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   async function reanudar() {
-    // v2.0.27: si hay una tarea activa o pausada en el store (job vivo), 
-    // «Reanudar» RETOMA esa tarea; NO limpia el formulario. Antes hacía CLEAR
-    // incondicional: con la tarea pausada por señal, el usuario tocaba
-    // «Reanudar», el formulario quedaba vacío y la tarea seguía su curso en la
-    // pestaña sin reflejo en el popup.
+    // v2.0.49: «Reanudar» en pleno proceso DETIENE la ejecución, vacía el
+    // carrito del store y deja el formulario en cero. Solo retoma la tarea
+    // cuando quedó PAUSADA por falta de señal (phase="paused").
     const res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
     const job = res[JOB_KEY];
     if (job && job.phase && job.phase !== "done") {
       const tab = await getStoreTab();
-      if (!tab || !tab.id) {
-        setStatus("Abrí tokintienda.com.ar/store para reanudar la tarea.", "warn");
+      if (job.phase === "paused") {
+        // Tarea pausada por señal: reanudar desde donde quedó.
+        if (!tab || !tab.id) {
+          setStatus("Abrí tokintienda.com.ar/store para reanudar la tarea.", "warn");
+          return;
+        }
+        setStatus("Reanudando la tarea en el store…", "");
+        // Vaciar el carrito del store antes de reanudar para empezar limpio.
+        await sendTab(tab.id, { type: "EMPTY_CART" });
+        const pong = await sendTab(tab.id, { type: "TOKIN_RESUME_NUDGE" });
+        if (!pong || !pong.ok) {
+          // Sin content script (página de error tras el corte de señal):
+          // recargar la pestaña reanuda el lote solo al bootear.
+          try {
+            chrome.tabs.reload(tab.id, {}, () => { void chrome.runtime.lastError; });
+          } catch (e) {}
+        }
+        await syncFromJob();
         return;
       }
-      setStatus("Reanudando la tarea en el store…", "");
-      // Vaciar el carrito del store antes de reanudar para empezar limpio.
-      await sendTab(tab.id, { type: "EMPTY_CART" });
-      const pong = await sendTab(tab.id, { type: "TOKIN_RESUME_NUDGE" });
-      if (!pong || !pong.ok) {
-        // Sin content script (página de error tras el corte de señal):
-        // recargar la pestaña reanuda el lote solo al bootear.
-        try {
-          chrome.tabs.reload(tab.id, {}, () => { void chrome.runtime.lastError; });
-        } catch (e) {}
+      // Lote en pleno proceso (pending/searching): detener la ejecución. El
+      // CANCEL va directo al background (persiste la clave y avisa al content
+      // script; si está navegando, aborta al bootear), se vacía el carrito y se
+      // limpia el formulario.
+      setStatus("Deteniendo la carga en curso…", "");
+      try { await toSw({ type: "CANCEL_CART" }); } catch (e) {}
+      // Esperar a que el lote aborte de verdad (el content script borra el job
+      // en el próximo corte) antes de vaciar el carrito, para no vaciarlo en
+      // pleno agregado. Si en ~8s no confirmó, vaciar igual (best effort).
+      for (let w = 0; w < 16; w++) {
+        await new Promise((r) => setTimeout(r, 500));
+        const jobd = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+        if (!jobd[JOB_KEY]) break;
       }
-      await syncFromJob();
+      const still = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+      if (tab && tab.id && !still[JOB_KEY]) {
+        for (let k = 0; k < 3; k++) {
+          const er = await sendTab(tab.id, { type: "EMPTY_CART" });
+          if (er && er.ok) break;
+          await new Promise((r) => setTimeout(r, 700));
+        }
+      }
+      await toOff({ type: "CLEAR" });
+      resetUi();
+      setStatus("Carga detenida y carrito vaciado. Cargá un archivo para empezar.", "ok");
       return;
     }
     await toOff({ type: "CLEAR" });

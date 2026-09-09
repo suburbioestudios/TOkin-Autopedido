@@ -237,7 +237,6 @@ function applyCartDone(msg) {
     return m ? "c:" + m[1] : "t:" + String(r.producto || "").trim();
   };
   const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
-  const sinStock = results.filter((r) => !isAdded(r) && /sin stock/i.test(r.message || "")).length;
   const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
   const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
   state.cart = {
