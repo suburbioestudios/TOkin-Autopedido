@@ -119,11 +119,25 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const btnCart = $("#btn-cart");
     if (btnCart) btnCart.disabled = false;
     showEl("#btn-cancel", which === "cancel");
-    showEl("#btn-cart", which === "cart");
+    showEl("#btn-cart", which === "cart" || which === "blocks");
     showEl("#btn-cancel-cart", which === "cancelCart");
-    showEl("#btn-open-store", which === "done");
-    showEl("#btn-excel", which === "done");
-    showEl("#btn-clear", which === "done");
+    showEl("#btn-open-store", which === "done" || which === "blocks");
+    showEl("#btn-excel", which === "done" || which === "blocks");
+    showEl("#btn-clear", which === "done" || which === "blocks");
+  }
+
+  // v2.0.55: el botón de carrito se llama con la cantidad de líneas que va a
+  // mandar el próximo bloque (paradas de 19). Llega a 19 o menos en la última
+  // tanda.
+  function updateCartBtn(count) {
+    const btn = $("#btn-cart");
+    if (!btn) return;
+    const rem = typeof count === "number" ? count : (ui.lineItems || []).length;
+    btn.textContent = rem >= 19
+      ? "Enviar 19 a carrito"
+      : rem > 0
+        ? "Enviar " + rem + " a carrito"
+        : "Enviar a carrito";
   }
 
   function resetPanels() {
@@ -137,7 +151,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   function statusKind(st) {
     if (!st) return "";
     if (st.status === "error") return "err";
-    if (st.status === "parsed" || st.status === "done") return "ok";
+    if (st.status === "parsed" || st.status === "done" || st.status === "block_done") return "ok";
     if (st.status === "canceled" || st.status === "paused") return "warn";
     return "";
   }
@@ -173,8 +187,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       renderItems();
       showEl("#items-box", true);
       setAction(ui.lineItems.length ? "cart" : "none");
+      updateCartBtn(ui.lineItems.length);
       setStatus(
-        "Pedido reconocido: " + ui.lineItems.length + " líneas. Revisá las filas y tocá «Enviar a carrito».",
+        "Pedido reconocido: " + ui.lineItems.length + " líneas. Revisá las filas y tocá «Enviar 19 a carrito».",
         "ok"
       );
     } else if (st.status === "loading_cart") {
@@ -183,7 +198,23 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       showEl("#cart-results-final", false);
       showEl("#done-hint", false);
       setAction("cancelCart");
-      renderCartItems(st.cartProgress, st.cart && st.cart.total);
+      renderCartItems(st.cartProgress, st.cart && (st.cart.batchTotal || st.cart.total));
+    } else if (st.status === "block_done") {
+      // Parada del carrito en bloques de 19 (v2.0.55): reporte parcial del
+      // bloque, filas restantes agrupadas y el botón para el próximo bloque.
+      showEl("#items-box", true);
+      showEl("#done-summary", true);
+      showEl("#cart-results-final", true);
+      showEl("#done-hint", false);
+      setAction("blocks");
+      renderItems();
+      updateCartBtn(ui.lineItems.length);
+      renderBlockSummary(st);
+      renderCartResults(st.cart && st.cart.batchResults, $("#cart-results-final"));
+      setStatus(
+        st.progress || "Bloque cargado. Enviá el próximo bloque de 19 líneas.",
+        "ok"
+      );
     } else if (st.status === "done") {
       showEl("#items-box", false);
       showEl("#done-summary", true);
@@ -220,7 +251,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       showEl("#done-hint", false);
       setAction("cancelCart");
       renderCartItems(st.cartProgress, st.cart && st.cart.total);
-      setStatus(st.progress || "Tarea pausada — reanudá cuando tengas señal.", "warn");
+      setStatus(st.progress || "Tarea pausada — se reanuda sola cuando vuelva la señal.", "warn");
     } else if (st.status === "error") {
       resetPanels();
       setStatus(st.error || st.progress || "Ocurrió un error.", "err");
@@ -238,13 +269,29 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
       return;
     }
+    // v2.0.55: el pedido viaja al carrito en bloques de 19 por parada; la vista
+    // agrupa las filas con un separador para mostrar hasta dónde llega cada
+    // bloque ("Enviar 19 a carrito" manda el primero, y así cada parada).
+    const GROUP = 19;
     let html =
       '<table><thead><tr><th>#</th><th>Código</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
     items.forEach((it, i) => {
+      if (i % GROUP === 0) {
+        const end = Math.min(i + GROUP, items.length) - 1;
+        // v2.0.56: el rótulo usa el número de INGESTA original (nro), no la
+        // posición, para que refleje las líneas reales que abarca el bloque.
+        const firstN = items[i].nro || (i + 1);
+        const lastN = items[end].nro || (end + 1);
+        html +=
+          '<tr class="bloque"><td colspan="5">Bloque ' + (Math.floor(i / GROUP) + 1) +
+          " — líneas " + firstN + " a " + lastN + "</td></tr>";
+      }
       const unidad = it.categoria || it.unidad || "";
       html +=
         "<tr>" +
-        '<td class="mono">' + (i + 1) + "</td>" +
+        // v2.0.56: el # es el número de INGESTA original, estable por línea
+        // aunque se vayan quitando filas con cada bloque de 19.
+        '<td class="mono">' + (it.nro || (i + 1)) + "</td>" +
         '<td class="mono editable" data-i="' + i + '" data-field="sku" title="Doble clic para editar">' + esc(it.sku || "") + "</td>" +
         '<td class="editable" data-i="' + i + '" data-field="producto" title="Doble clic para editar">' + esc(it.producto) + "</td>" +
         '<td class="editable" data-i="' + i + '" data-field="cantidad" title="Doble clic para editar">' + esc(it.cantidad) + "</td>" +
@@ -304,7 +351,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   function renderCartResults(results, box) {
-    const res = results || [];
+    const res = (results || []).filter(Boolean);
     if (!res.length) {
       box.innerHTML = '<p class="hint">Cargando…</p>';
       return;
@@ -344,7 +391,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       const unidad = r.it.categoria || r.it.unidad || "";
       html +=
         "<tr>" +
-        '<td class="mono">' + r.n + "</td>" +
+        // v2.0.56: número de INGESTA original (la posición se sigue usando solo
+        // para saber qué quedó por procesar).
+        '<td class="mono">' + (r.it.nro || r.n) + "</td>" +
         "<td>" + esc(r.it.producto) + "</td>" +
         "<td>" + esc(r.it.cantidad) + "</td>" +
         "<td>" + esc(unidad) + "</td>" +
@@ -352,6 +401,23 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     });
     html += "</tbody></table>";
     box.innerHTML = html;
+  }
+
+  // Reporte parcial de la parada entre bloques (v2.0.55): qué pasó con las 19
+  // líneas del bloque recién cargado y cuánto queda del pedido.
+  // v2.0.57: NO existe "sin confirmar" ni acumulados parciales: las líneas que
+  // fallaron ya quedaron reportadas (no vuelven a la lista) y los bloques
+  // avanzan de corrido; el número que queda es lo que falta por intentar.
+  function renderBlockSummary(st) {
+    const b = ((st && st.cart) || {}).batch || {};
+    let html = "Bloque cargado: " + (b.ok || 0) + " de " + (b.total || 0) + " líneas en este bloque.";
+    const parts = [];
+    if (b.sinStock) parts.push("Sin stock: " + b.sinStock);
+    if (b.notFound) parts.push("No encontrados: " + b.notFound);
+    if (parts.length) html += "\n" + parts.join(" · ");
+    const pending = ((st && st.line_items) || []).length;
+    html += "\nQuedan " + pending + " líneas del pedido por cargar" + (pending ? "." : "");
+    $("#done-summary").textContent = html;
   }
 
   function renderDone(st) {
@@ -362,15 +428,20 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       : "El pedido quedó cargado en el carrito del store.";
     if (c.docName) html += "\nDocumento procesado: " + c.docName + ".";
     if (c.total) {
-      html += "\nLíneas agregadas: " + c.ok + " de " + c.total + ".";
+      // v2.0.55: números coherentes con la verificación real de cierre. "Líneas
+      // cargadas" = líneas del pedido que quedaron confirmadas en el carrito;
+      // "en el carrito (verificado)" = productos únicos reales (cards ARC), que
+      // puede diferir de las líneas por la semántica SET del store (dos líneas
+      // que caen en la misma card son UN producto).
+      html += "\nLíneas cargadas y confirmadas en el carrito: " + c.ok + " de " + c.total + ".";
       if (c.prodAdded && c.prodAdded !== c.ok) {
-        html += " En el carrito: " + c.prodAdded + " productos.";
+        html += "\nEn el carrito (verificado al cierre): " + c.prodAdded + " productos.";
       }
     }
     const parts = [];
     if (c.sinStock) parts.push("Sin stock: " + c.sinStock);
     if (c.notFound) parts.push("No encontrados: " + c.notFound);
-    if (c.notConfirmed) parts.push("Sin confirmar: " + c.notConfirmed);
+    // v2.0.57: no existe "sin confirmar" en el informe final.
     if (parts.length) html += "\n" + parts.join(" · ");
     $("#done-summary").textContent = html;
     renderCartResults(c.results, $("#cart-results-final"));
@@ -398,6 +469,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
           ". Se reanuda sola cuando vuelva la señal."
         : "",
       line_items: (job.items || []).map((it) => ({
+        // v2.0.57: preservar el número de INGESTA original. Antes se dropaba acá
+        // (jobToState) y, al restaurar la vista desde el job entre bloques, las
+        // filas del segundo lote volvían a numerarse desde 1 en vez de seguir
+        // desde el 20.
+        nro: it.nro || undefined,
         producto: it.producto || "",
         cantidad: it.cantidad || "",
         unidad: it.unidad || "",
@@ -436,6 +512,28 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     return false;
   }
 
+  // v2.0.56: si hay una tarea ya en curso en el store (bloque cargando al
+  // carrito, o pausada por señal), el popup se restaura tal cual SIN pasar por
+  // las compuertas de acceso ni el cartel de "Refrescá (F5)". Minimizar o
+  // cambiar de ventana no rompe la sesión: el job sigue corriendo solo.
+  async function maybeRestoreRunningTask() {
+    let res;
+    try {
+      res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+    } catch (e) {
+      return false;
+    }
+    const job = res[JOB_KEY];
+    if (!job || !job.phase || job.phase === "done") return false;
+    ui.allowed = { ok: true, emails: (ui.allowed && ui.allowed.emails) || [], cached: true };
+    setBadge("ok", "Tarea en curso", "");
+    $("#access-screen").classList.add("hidden");
+    $("#main-screen").classList.remove("hidden");
+    $("#cfg-session").textContent = "Tarea en curso: " + (job.docName || "pedido en el store");
+    syncFromJob();
+    return true;
+  }
+
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes[JOB_KEY]) return;
     // Solo maneja la vista cuando el popup está mostrando la vista sintetizada
@@ -446,6 +544,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   });
 
   async function init() {
+    // v2.0.56: primero restaura una tarea en curso (si la hay) y recién
+    // entonces verifica acceso/sesión; así el recuadro de F5 no bloquea un job
+    // que ya está corriendo.
+    if (await maybeRestoreRunningTask()) return;
     const tab = await getStoreTab();
     const tabId = tab && tab.id;
 
@@ -750,24 +852,29 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   function estadoDe(r) {
     const msg = String((r && r.message) || "");
     if (r && r.ok && msg.indexOf("agregado") === 0) {
-      return /agregado parcialmente/.test(msg) ? "CARGADO PARCIAL" : "CARGADO";
+      // La línea quedó en el carrito; si quedó con menos cantidad de la pedida
+      // (tope del store / "máximo de unidades permitida") se anota el faltante.
+      return /falta de unidades para completar stock/.test(msg) ? "FALTA UNIDADES" : "CARGADO";
     }
     if (/sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(msg)) {
       return "SIN STOCK";
     }
     if (/no se encontr/.test(msg)) return "NO ENCONTRADO";
     if (/no se pudo convertir|supera el límite/i.test(msg)) return "ERROR UNIDAD";
-    if (msg.indexOf("no se confirmó") === 0) return "NO CONFIRMADO";
+    // v2.0.57: no existe "sin confirmar": al cierre toda línea sin card en el
+    // carrito es un fallo real ("NO CARGADO"), nunca un estado intermedio.
+    if (/no cargado/.test(msg)) return "NO CARGADO";
     return "NO CARGADO";
   }
 
   function estadoCounts(results) {
     const res = results || [];
+    const added = res.filter((r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0);
     return {
-      added: res.filter((r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0).length,
+      added: added.length,
+      faltaUnidades: added.filter((r) => /falta de unidades para completar stock/.test(String(r.message || ""))).length,
       sinStock: res.filter((r) => estadoDe(r) === "SIN STOCK").length,
       notFound: res.filter((r) => estadoDe(r) === "NO ENCONTRADO").length,
-      notConfirmed: res.filter((r) => estadoDe(r) === "NO CONFIRMADO").length,
     };
   }
 
@@ -782,10 +889,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const added = counts.added;
     const sinStock = counts.sinStock;
     const notFound = counts.notFound;
-    const notConfirmed = counts.notConfirmed;
     const isAdded = (r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0;
+    const isPartial = (r) => /falta de unidades para completar stock/.test(String((r && r.message) || ""));
 
-    const summaryStr = `Pedido cargado: ${added} de ${results.length} | Sin stock: ${sinStock} | No encontrados: ${notFound} | Sin confirmar: ${notConfirmed}`;
+    const summaryStr = `Pedido cargado: ${added} de ${results.length} | Sin stock: ${sinStock} | No encontrados: ${notFound}` +
+      (counts.faltaUnidades ? " | Falta unidades: " + counts.faltaUnidades : "");
 
     // 1. Hoja 1: REPORTE GENERAL — 7 columnas simples
     const genHeaders = ["#", "Código SKU", "Producto Solicitado", "Cant. Pedida", "Unidad Pedida", "Estado", "Diagnóstico Detallado"];
@@ -801,7 +909,8 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       const unidad = it.categoria || it.unidad || "";
       const estado = estadoDe(r);
       generalAoa.push([
-        cleanIdx,
+        // v2.0.56: número de INGESTA original (no renumera por líneas cargadas).
+        it.nro || cleanIdx,
         String(it.sku || "N/A"),
         String(it.producto || ""),
         String(it.cantidad || "1"),
@@ -820,7 +929,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     let pendIdx = 0;
     allItems.forEach((it, i) => {
       const r = results[i] || {};
-      if (isAdded(r)) return;
+      // v2.0.57: las líneas cargadas PARCIALMENTE ("falta de unidades para
+      // completar stock") van en la hoja de observados: están en el carrito per
+      //o faltan unidades y el usuario debe revisarlas.
+      if (isAdded(r) && !isPartial(r)) return;
       if (!(it.producto || it.sku || "").trim()) return;
       pendIdx++;
       const unidad = it.categoria || it.unidad || "";
@@ -830,7 +942,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         (r.storeButtons ? " | botones card: " + r.storeButtons : "");
 
       pendingAoa.push([
-        pendIdx,
+        // v2.0.56: número de INGESTA original (mantiene saltos donde hubo
+        // líneas cargadas, alineado con la vista del popup).
+        it.nro || pendIdx,
         String(it.sku || "N/A"),
         String(it.producto || ""),
         String(it.cantidad || "1"),
@@ -1017,6 +1131,14 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       } else {
         setBadge("err", "Lista no disponible", access.error || "");
         setStatus(access.error || "No se pudo actualizar el acceso.", "err");
+      }
+      // v2.0.56: además de refrescar la lista, se recarga la pestaña del store
+      // para que el content script re-aplique la sesión y la lista de acceso.
+      const storeTab = await getStoreTab();
+      if (storeTab && storeTab.id) {
+        try {
+          chrome.tabs.reload(storeTab.id, {}, () => { void chrome.runtime.lastError; });
+        } catch (e) {}
       }
     });
   }

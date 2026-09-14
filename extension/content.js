@@ -385,7 +385,7 @@
   }
 
   function tokUnitLabel(item) {
-    const mapa = { bulto: "Bulto", display: "Display", pack: "Display", packs: "Display", paquete: "Display", pk: "Display", b: "Bulto", bu: "Bulto", d: "Display", di: "Display", u: "Unidad", ud: "Unidad", un: "Unidad", a: "Unidad", unidad: "Unidad", caja: "Caja" };
+    const mapa = { bulto: "Bulto", display: "Display", pack: "Display", packs: "Display", paquete: "Display", pk: "Display", b: "Bulto", bu: "Bulto", d: "Display", di: "Display", u: "Unidad", ud: "Unidad", un: "Unidad", a: "Unidad", unidad: "Unidad", caja: "Caja", combo: "Combo", combos: "Combo", kit: "Combo", kits: "Combo" };
     const k = String((item && (item.categoria || item.unidad)) || "").toLowerCase();
     return mapa[k] || (k ? k.charAt(0).toUpperCase() + k.slice(1) : "Unidad");
   }
@@ -396,6 +396,12 @@
     unidad: ["unidad", "unidades", "uds", "und", "uni", "unid"],
     caja: ["caja", "cajas"],
   };
+
+  // Unidades que pueden tener conversión real (pack). Las demás (p.ej. "Combo")
+  // se cargan SIEMPRE 1:1 en la unidad del pedido: la card de un combo no tiene
+  // botones de unidad ni conversión, solo el botón "agregar" (la cantidad se
+  // vuelca directo, sin multiplicar por el pack del título).
+  const TOK_PACK_TYPES = new Set(["display", "bulto", "caja"]);
 
   function tokNumbers(s) {
     return Array.from(new Set((String(s || "").match(/\d+(?:[.,]\d+)?/g) || []).map((n) => n.replace(",", "."))));
@@ -468,9 +474,27 @@
     return m ? m[1] : null;
   }
 
+  // Código FIJO de COMBO ("C123", "C18"): los combos del pedido no llevan
+  // ARC-XXXX sino "C" + dígitos. Devuelve los dígitos del código si el SKU del
+  // pedido viene como C(código), o null si no es un combo.
+  function tokComboSku(sku) {
+    const m = String(sku || "").trim().match(/^[Cc][\s-]?(\d{2,})$/);
+    return m ? m[1] : null;
+  }
+
   // Empareja el código del pedido con el de la card: el SKU del archivo ("10342", "10352", "13357")
   // matchea con el ARC del store ("ARC-1010342", "ARC-10010342", "ARC-1013357").
+  // Los combos ("C123") matchean con el código fijo "C123" que la card muestra.
   function tokSkuMatch(elOrText, sku) {
+    const combo = tokComboSku(sku);
+    if (combo) {
+      let text = typeof elOrText === "string" ? elOrText : ((elOrText.innerText || "") + " " + (elOrText.outerHTML || ""));
+      for (const c of String(text || "").match(/\b[Cc](\d{2,})\b/g) || []) {
+        const n = c.replace(/\D+/g, "");
+        if (n === combo || (n.length > combo.length && n.slice(-combo.length) === combo)) return true;
+      }
+      return false;
+    }
     const d = String(sku || "").replace(/\D+/g, "");
     if (d.length < 4) return false;
     const arc = tokArcCode(elOrText);
@@ -636,6 +660,9 @@
   function tokPickConversion(units, cardText, itemTitle, wantType, wantQty) {
     const out = { convW: 0, unit: null, q: 0 };
     if (!wantType || !(wantQty > 0)) return out;
+    // Combo (u otra unidad propia del pedido sin pack): nunca convertir con el
+    // pack del título; la card de un combo se carga 1:1 con el botón "agregar".
+    if (wantType !== "unidad" && !TOK_PACK_TYPES.has(wantType)) return out;
     out.convW = wantType === "unidad" ? 1
       : (tokConvFactor(units, cardText, itemTitle, wantType) || tokTitlePack(itemTitle));
     if (!(out.convW > 0)) return out;
@@ -1019,10 +1046,10 @@
         out.push(q);
       }
     };
-    // 0) SKU exacto si es legible (4+ dígitos). Es la búsqueda más precisa y
-    // única que usa el GATE ESTRICTO por código. Código degradado ("ama3") se
-    // saltea y va directo al nombre.
-    if (skuDigits.length >= 4) push(skuRaw);
+    // 0) SKU exacto si es legible: ARC de 4+ dígitos o combo "Cxxx". Es la
+    // búsqueda más precisa y única que usa el GATE ESTRICTO por código. Código
+    // degradado ("ama3") se saltea y va directo al nombre.
+    if (skuDigits.length >= 4 || tokComboSku(item.sku)) push(skuRaw);
     // Nombre: limpia packs/letras sueltas, sin unidad y sin redundancias.
     const clean = tokCleanName(item.producto);
     if (!clean) return out;
@@ -1160,7 +1187,7 @@
           const skuD = String(it.sku || "").replace(/\D+/g, "");
           let msg = "no se encontró el producto en el store";
           if (String(it.sku || "").trim()) {
-            msg = skuD.length >= 4
+            msg = skuD.length >= 4 || !!tokComboSku(it.sku)
               ? "no se encontró card con el código " + String(it.sku).trim() + " ni por nombre en el store"
               // El prefijo "no se encontró" lo cuenta el desglose del informe.
               : "no se encontró: código «" + String(it.sku).trim() + "» ilegible por nombre en el store";
@@ -1305,7 +1332,7 @@
       // byName=true cuando NO estamos en la query de código (qIdx 0 con sku
       // válido). En ese modo la búsqueda es por NOMBRE SIN unidad (solo nombre +
       // gramaje): la unidad se elige después al procesar la card.
-      const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4;
+      const validSku = String(it.sku || "").replace(/\D+/g, "").length >= 4 || !!tokComboSku(it.sku);
       const byName = !(job.qIdx === 0 && validSku);
       const queries = tokBuildQueries(it);
       // Cantidad total del producto en el pedido (suma de líneas duplicadas).
@@ -1323,7 +1350,7 @@
         // real: se reintenta UNA vez la misma query de código antes de caer a
         // las de nombre. qIdx===0 solo identifica la query de código cuando la
         // línea trae un sku válido (tokBuildQueries lo pone primero).
-        if (job.qIdx === 0 && String(it.sku || "").replace(/\D+/g, "").length >= 4 && !job.codeRetried) {
+        if (job.qIdx === 0 && (String(it.sku || "").replace(/\D+/g, "").length >= 4 || tokComboSku(it.sku)) && !job.codeRetried) {
           job.codeRetried = true;
           job.phase = "pending";
           await tokStoreSet(CART_JOB_KEY, job);
@@ -1515,9 +1542,10 @@
         unitBtn.click();
         await toksleep(1500);
       }
-    } else if (wantTypeNorm && wantTypeNorm !== "unidad" && wantQty > 0) {
-      // Sin botones de unidad: la card vende por unidad base (solo input).
-      // Convertir con el factor de la card o el pack del título.
+    } else if (wantTypeNorm && TOK_PACK_TYPES.has(wantTypeNorm) && wantQty > 0) {
+      // Sin botones de unidad pero el pedido quiere un PACK (display/bulto/caja):
+      // la card vende por unidad base (solo input). Convertir con el factor de la
+      // card o el pack del título; si no se declara factor, se vuelca directo.
       const convW = tokConvFactor([], cardText, it.producto, wantTypeNorm) || tokTitlePack(it.producto);
       if (convW > 0) {
         const qFinal = wantQty * convW;
@@ -1535,6 +1563,12 @@
       } else {
         usedUnit = "Unidad";
       }
+    } else if (wantTypeNorm && !TOK_PACK_TYPES.has(wantTypeNorm) && wantTypeNorm !== "unidad" && wantQty > 0) {
+      // Combos / unidades propias del pedido (p.ej. "Combo"): la card NO tiene
+      // botones de unidad ni conversión, solo el botón "agregar" que vuelca la
+      // cantidad. Se carga 1:1 y el informe queda en la unidad del pedido
+      // (jamás se multiplica con el pack del título).
+      usedUnit = wantUnit;
     }
     // Cancelación: corte inmediato también cuando ya se resolvió la unidad de
     // la card, para que un content script vivo frene en el próximo commit (no
@@ -1614,29 +1648,18 @@
       if (convertedQty > 0 && actualQty < wantQty) {
         const conv = convertedQty / qty;
         const actualRequestedUnits = Math.floor(actualQty / conv);
-
-        if (actualRequestedUnits > 0) {
-          const newWantQty = actualRequestedUnits * conv;
-          // Reajustar el DOM a la cantidad mltiplo exacta
-          for (const el of nums) {
-            if (el.offsetParent !== null) tokSetValue(el, String(newWantQty));
-          }
-          await toksleep(600);
-          
-          out.ok = true;
-          out.added = newWantQty;
-          out.usedUnit = usedUnit;
-          out.message = "agregado parcialmente: " + actualRequestedUnits + " " + wantUnit + " (" + newWantQty + " " + usedUnit + "). Faltaba stock para completar el pedido (stock max: " + actualQty + ")";
-          out.unitNote = actualRequestedUnits + " " + wantUnit + " (" + newWantQty + " " + usedUnit + ")";
-        } else {
-          out.ok = false;
-          out.added = actualQty;
-          out.usedUnit = usedUnit;
-          out.message =
-            "no se agregó por falta de stock: el store solo tiene " + actualQty +
-            " " + usedUnit + " y hace falta 1 " + wantUnit + " (" +
-            (Math.round((conv || 0) * 100) / 100) + " " + usedUnit + ")";
-        }
+        // v2.0.55: pedido incompleto = sin stock. Si el store no tiene stock
+        // para completar TODOS los "qty wantUnit" pedidos (ej. faltan 28u para
+        // completar el 3er display/bulto), NO se carga la presentación a medias
+        // ni se intenta completar el paquete: la línea va directo como sin stock
+        // y queda para revisión manual.
+        out.ok = false;
+        out.added = 0;
+        out.usedUnit = usedUnit;
+        out.message =
+          "sin stock: no alcanza para completar " + qty + " " + wantUnit +
+          " (" + wantQty + " " + usedUnit + "), el store solo tiene " + actualQty +
+          " " + usedUnit + (actualRequestedUnits > 0 ? " (alcanza solo para " + actualRequestedUnits + " " + wantUnit + ")" : "");
       } else {
         out.ok = true;
         out.added = actualQty;
@@ -1717,7 +1740,7 @@
     return tokRunJob();
   }
 
-  // Re-confirmación final al terminar el lote. Tiene dos partes:
+  // Re-confirmación final al terminar el lote. Tiene tres partes:
   // 1) RE-FIJAR cantidad: una card que quedó "agregado: N Bulto" durante la
   //    corrida puede quedar corta DESPUÉS, porque el re-render de React / la
   //    sincronización con el servidor la resetea a la unidad mínima (1) cuando
@@ -1728,6 +1751,11 @@
   //    fix GOAT de v2.0.10). Así el informe y el carrito final coinciden.
   // 2) RE-CONFIRMAR las líneas "no se confirmó" que en realidad sí quedaron con
   //    su card y qty pedida (estado del drawer ya estable).
+  // 3) SINCRONIZAR el informe con el CARRITO REAL: toda línea cuya card exista
+  //    en el carrito quedó cargada, aunque la corrida la hubiera anotado como
+  //    "sin stock"/"no se encontró"/"no se confirmó" (render tardío, señal
+  //    cortada, tope de stock con re-render). En el informe final NO existe el
+  //    estado "sin confirmar": o la línea tiene card (está en el carrito) o no.
   async function tokFinalVerify(job) {
     try {
       await toksleep(1500);
@@ -1806,6 +1834,35 @@
           : "agregado: " + wantQty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
         changed++;
       }
+
+      // 3) Sincronizar con el carrito real por el código ARC de la card. Solo
+      // las líneas que NO tienen card quedan como fallo real.
+      for (const r of results) {
+        if (r.ok && String(r.message || "").indexOf("agregado") === 0) continue;
+        const msg = String(r.message || "");
+        const code3 = tokArcCode(r.storeText || "");
+        let card = null;
+        if (code3) {
+          card = (tokCartCards() || []).find(
+            (c) => c.code && (c.code === code3 || c.code.endsWith(code3) || code3.endsWith(c.code)) && c.qty > 0
+          );
+        }
+        if (card) {
+          const want3 = r.added || 0;
+          r.ok = true;
+          r.message =
+            "agregado: " + card.qty + " " + (r.usedUnit || "").trim() +
+            (want3 && card.qty < want3
+              ? " — falta de unidades para completar stock (quedó " + card.qty + " de " + want3 + " en el carrito)"
+              : "") +
+            " (confirmado en el cierre)";
+          changed++;
+        } else if (msg.indexOf("no se confirmó") === 0) {
+          // Sin card, no hay "no se confirmó" que valga: es un fallo real.
+          r.message = "no cargado (no se confirmó la card en el carrito al cierre)";
+          changed++;
+        }
+      }
       if (changed) await tokStoreSet(CART_JOB_KEY, job);
       return changed;
     } catch (e) {
@@ -1843,12 +1900,20 @@
     // código ARC de la card, o su nombre si no trae código.
     let realCartCount = 0;
     try {
-      const realKeys = new Set();
-      for (const c of tokCartCards()) {
-        if (!(c.qty > 0)) continue;
-        realKeys.add(c.code ? "c:" + c.code : "t:" + (c.name || ""));
+      // v2.0.57: el drawer del carrito puede renderizar las cards tarde (React
+      // re-monta al cerrar el lote). Leer el carrito real en pasadas: si la
+      // primera lectura queda por debajo de lo ya confirmado, esperar y releer
+      // para que el informe no diga menos productos de los que hay.
+      for (let t = 0; t < 3; t++) {
+        if (t) await toksleep(700);
+        const realKeys = new Set();
+        for (const c of tokCartCards()) {
+          if (!(c.qty > 0)) continue;
+          realKeys.add(c.code ? "c:" + c.code : "t:" + (c.name || ""));
+        }
+        realCartCount = realKeys.size;
+        if (realCartCount >= prodAdded) break;
       }
-      realCartCount = realKeys.size;
     } catch (e) {}
     const prodAddedReal = realCartCount > prodAdded ? realCartCount : prodAdded;
     const sinStock = results.filter((x) => !isAdded(x) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(x.message || "")).length;
@@ -1951,7 +2016,7 @@
     await tokStoreSet(CART_JOB_KEY, job);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
-    tokToastSet("Sin conexión — tarea pausada en línea " + (job.index + 1) + "/" + job.total + ". Reanudá cuando tengas señal.", "warn");
+    tokToastSet("Sin conexión — tarea pausada en línea " + (job.index + 1) + "/" + job.total + ". Se reanuda sola cuando vuelva la señal.", "warn");
     try {
       chrome.runtime.sendMessage(
         { target: "offscreen", type: "CART_PAUSE" },
@@ -1979,6 +2044,30 @@
       await tokEmptyCart();
     }
     tokToastSet(interrupted ? "Tarea interrumpida — carrito vaciado." : "Carga cancelada — lo cargado quedó en el carrito.", "");
+    // v2.0.57: al cancelar el USUARIO, reconciliar los resultados con el carrito
+    // real (sin mutar el DOM): si una línea quedó "no se confirmó" pero su card
+    // ya está en el carrito, pasa a "agregado" y no aparece un "sin confirmar"
+    // falso (caso real: cancelar por mala señal y la última card igual cargó).
+    if (!interrupted) {
+      try {
+        for (const r of (job && job.results) || []) {
+          if (!r || r.ok) continue;
+          const msg = String(r.message || "");
+          if (msg.indexOf("no se confirmó") !== 0) continue;
+          const code4 = tokArcCode(r.storeText || "");
+          if (!code4) continue;
+          const card = (tokCartCards() || []).find(
+            (c) => c.code && (c.code === code4 || c.code.endsWith(code4) || code4.endsWith(c.code)) && c.qty > 0
+          );
+          if (card) {
+            r.ok = true;
+            r.message = "agregado: " + card.qty + " " + ((r.usedUnit) || "").trim() + " (confirmado al cancelar)";
+          } else {
+            r.message = "no cargado (no se confirmó la card en el carrito)";
+          }
+        }
+      } catch (e) {}
+    }
     try {
       // interrupted: la pestaña/sesión se cerró o el lote quedó huérfano → el
       // offscreen vuelve al paso de líneas capturadas (CART_STOP), no a

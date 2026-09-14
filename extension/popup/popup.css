@@ -113,6 +113,7 @@ header {
   font-size: 11px;
   line-height: 1.45;
 }
+
 #dropzone.has-file { border-color: var(--green); background: rgba(255, 255, 255, 0.95); }
 #dropzone.has-file .dz-icon,
 #dropzone.has-file .dz-prompt { display: none; }
@@ -190,6 +191,16 @@ table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { border: 1px solid var(--border); padding: 5px 6px; text-align: left; }
 th { background: var(--violet-soft); color: var(--violet-dark); font-weight: 700; }
 tr:nth-child(even) td { background: #faf8ff; }
+#items-box tr.bloque td {
+  background: var(--violet-soft);
+  color: var(--violet-dark);
+  font-weight: 700;
+  border: none;
+  padding: 3px 8px;
+  font-size: 11px;
+  text-align: center;
+  letter-spacing: .3px;
+}
 #items-box .mono { font-family: Consolas, monospace; font-size: 11px; white-space: nowrap; }
 #items-box { margin-top: 10px; }
 #items-box td.editable { cursor: text; }

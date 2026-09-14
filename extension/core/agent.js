@@ -407,7 +407,8 @@ async function _pdf_text(data, onProgress, onCancel) {
       let bestEvidence = -1;
       for (const cand of rots) {
         const items = _pdf_table_items(cand.words, cand.w, cand.scale);
-        const evidence = cand.conf + 25 * _legibility(cand.text) + (items.length > 0 ? 50 : 0);
+        const leg = _legibility(cand.text);
+        const evidence = cand.conf + 25 * leg + (items.length > 0 ? 50 : 0);
         if (!chosen || evidence > bestEvidence) {
           chosen = cand;
           firstDone = cand;
@@ -481,8 +482,6 @@ async function _pdf_text(data, onProgress, onCancel) {
             // el mismo código real en el PDF del proveedor (ej. CUENCA: 14800
             // listado en dos productos distintos).
             fixes[String(s.cy)] = fix;
-            if (typeof console !== "undefined")
-              console.log("[tokin] refine cy=%s sku=%s pedida=%s -> %j", s.cy, s.sku, s.pedida, fix);
           }
         }
         full.width = 0;

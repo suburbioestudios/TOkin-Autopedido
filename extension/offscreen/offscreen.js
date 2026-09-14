@@ -19,7 +19,7 @@ if (typeof window !== "undefined") {
 }
 
 const state = {
-  status: "idle", // idle|parsing|parsed|loading_cart|done|canceled|error
+  status: "idle", // idle|parsing|parsed|loading_cart|block_done|done|canceled|error
   step: 1,
   progress: "",
   filename: "",
@@ -31,6 +31,15 @@ const state = {
   cartProgress: null,
   cancelRequested: false,
   cancellingCart: false,
+  // v2.0.55: estado del carrito por BLOQUES de 19 líneas ("parada"). El pedido
+  // completo se guarda acá (origItems, una copia fiel del orden original) con
+  // un resultado por línea original (results, alineado por índice). Cada
+  // «Enviar 19 a carrito» manda el próximo bloque nunca intentado; al terminar
+  // se rearma la vista con lo que falta (no confirmadas + no intentadas).
+  // batchIdx = índices originales de las líneas del bloque en vuelo, para que
+  // CART_DONE matchee resultados contra las líneas correctas aunque el
+  // offscreen se haya recreado a mitad de lote.
+  cartApi: null,
 };
 
 function sessionView() {
@@ -44,6 +53,7 @@ function sessionView() {
     line_items: state.line_items,
     cart: state.cart,
     cartProgress: state.cartProgress,
+    cartApi: state.cartApi,
   };
 }
 
@@ -89,6 +99,7 @@ function resetState() {
   state.cartProgress = null;
   state.cancelRequested = false;
   state.cancellingCart = false;
+  state.cartApi = null;
 }
 
 // Los mensajes de chrome.runtime se serializan como JSON: los binarios deben
@@ -155,7 +166,12 @@ async function runParse(filename, data) {
       () => state.cancelRequested
     );
     state.doc = doc;
-    state.line_items = doc.line_items || [];
+    // v2.0.56: cada línea guarda el número de fila de la INGESTA original
+    // (nro), para que la vista mantenga la numeración aunque las filas se
+    // vayan quitando por bloques de 19 al cargar al carrito.
+    state.line_items = (doc.line_items || []).map((it, i) =>
+      Object.assign({}, it, { nro: i + 1 })
+    );
     state.summary = summarize(doc);
     state.error = doc.error || "";
     setStatus("parsed", summarizeMsg(doc), 2);
@@ -186,22 +202,81 @@ function cartItems() {
     .filter((it) => (it.producto || it.sku || "").trim());
 }
 
+// v2.0.55: el pedido se carga al carrito EN BLOQUES de 19 líneas por parada.
+// Un solo botón «Enviar 19 a carrito» manda el próximo bloque; cuando ese
+// bloque termina se entrega el reporte parcial y se espera al usuario.
+const CART_BLOCK = 19;
+
 async function runCart() {
   state.cancellingCart = false;
-  const items = cartItems();
-  if (!items.length) {
-    setStatus("error", "No hay líneas de pedido para cargar.", 2);
+  const view = (state.line_items || []).filter((it) => (it.producto || it.sku || "").trim());
+  if (!state.cartApi || !state.cartApi.started) {
+    // Primer bloque de la tanda: snapshot del pedido completo (orden original).
+    if (!view.length) {
+      setStatus("error", "No hay líneas de pedido para cargar.", 2);
+      return;
+    }
+    state.cartApi = {
+      started: true,
+      origItems: view.map((it) => Object.assign({}, it)),
+      idxOfView: view.map((_, i) => i),
+      results: [],
+      nextOrig: 0,
+      orderTotal: view.length,
+      batchIdx: [],
+    };
+  } else {
+    // Entre bloques el usuario pudo editar filas pendientes (UPDATE_LINE_ITEMS):
+    // refrescar en origItems las líneas que todavía no se intentaron o fallaron.
+    const idx = state.cartApi.idxOfView || [];
+    for (let k = 0; k < view.length && k < idx.length; k++) {
+      const oi = idx[k];
+      if (oi == null || oi >= state.cartApi.origItems.length) continue;
+      state.cartApi.origItems[oi] = Object.assign({}, state.cartApi.origItems[oi], view[k]);
+    }
+  }
+  if (state.cartApi.nextOrig >= state.cartApi.orderTotal) {
+    // Sin líneas nuevas por intentar: todo el pedido ya se procesó.
+    const api = state.cartApi;
+    const done = api.results.filter(Boolean);
+    const added = done.filter((r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0)).length;
+    setStatus("done", "Todas las líneas del pedido ya fueron procesadas (" + added + " de " + api.orderTotal + " en el carrito).", 4);
+    playBeep(true);
     return;
   }
-  setStatus("loading_cart", "Cargando carrito (" + items.length + " líneas)…", 3);
-  state.cart = { total: items.length, ok: 0, results: [] };
+  const batch = state.cartApi.origItems.slice(state.cartApi.nextOrig, state.cartApi.nextOrig + CART_BLOCK);
+  if (!batch.length) {
+    const api = state.cartApi;
+    const done = api.results.filter(Boolean);
+    const added = done.filter((r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0)).length;
+    setStatus("done", "Todas las líneas del pedido ya fueron procesadas (" + added + " de " + api.orderTotal + " en el carrito).", 4);
+    playBeep(true);
+    return;
+  }
+  const batchIdx = [];
+  for (let i = 0; i < batch.length; i++) batchIdx.push(state.cartApi.nextOrig + i);
+  state.cartApi.nextOrig += batch.length;
+  state.cartApi.batchIdx = batchIdx;
+  state.cartApi.batchItems = batch;
+  state.cart = {
+    total: state.cartApi.orderTotal,
+    ok: 0,
+    results: [],
+    batchTotal: batch.length,
+    batchResults: [],
+    batch: { ok: 0, total: batch.length, sinStock: 0, notFound: 0, notConfirmed: 0 },
+    docName: state.filename || "",
+  };
   state.cartProgress = null;
   state.cartCanceled = false;
-  persist();
+  // Persistir ANTES de mandar el mensaje: si el offscreen se recrea a mitad del
+  // lote, la sesión restaurada conoce el bloque (batchIdx) y al volver el
+  // CART_DONE matchea los resultados a las líneas correctas.
+  setStatus("loading_cart", "Cargando carrito (bloque de " + batch.length + " líneas)…", 3);
   try {
-    // El content script corre un lote resumible (navega por cada búsqueda) y va
-    // reportando CART_PROGRESS; al terminar envía CART_DONE, que aplica el estado.
-    const out = await sendSw({ type: "ADD_TO_CART", items, filename: state.filename || "" });
+    // El content script corre un lote resumible por bloque (navega por cada
+    // búsqueda) y reporta CART_PROGRESS; al terminar envía CART_DONE.
+    const out = await sendSw({ type: "ADD_TO_CART", items: batch, filename: state.filename || "" });
     if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
   } catch (e) {
     if (state.cancellingCart) {
@@ -222,68 +297,115 @@ function applyCartDone(msg) {
   // "agregado"). "sin stock" / "no se encontró" / "no se confirmó" no suman al
   // conteo de cargado (el informe refleja el carrito, no las líneas ok).
   const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
-  const added = results.filter(isAdded).length;
-  // v2.0.44: la falta de stock de una presentación ("el store solo tiene N
-  // unidades / no alcanza para 1 Bulto") cuenta como SIN STOCK, igual que el
-  // "sin stock" de la card; antes ese mensaje caía fuera del desglose.
-  const sinStock = results.filter((r) => !isAdded(r) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(r.message || "")).length;
+  const SIN_STOCK_RE =
+    /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i;
   // "En el carrito: N productos" por la IDENTIDAD del carrito (código ARC de la
   // card donde cayó cada línea), no por el texto: dos líneas en la misma card
   // son UN producto (SET). Caso real CUENCA: código 14800 en "SANDIA x500" y
-  // "FRUTILLA x500" (error del proveedor) -> ambas en ARC-1014800 -> 41 líneas
-  // "agregado" pero 40 cards.
+  // "FRUTILLA x500" (error del proveedor) -> ambas en ARC-1014800.
   const prodKey = (r) => {
     const m = String(r.storeText || "").match(/ARC-?(\d+)/i);
     return m ? "c:" + m[1] : "t:" + String(r.producto || "").trim();
   };
-  const prodAdded = new Set(results.filter(isAdded).map(prodKey)).size;
-  const notFound = results.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
-  const notConfirmed = results.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  const api = state.cartApi;
+  if (api && api.started && Array.isArray(api.batchIdx)) {
+    for (let k = 0; k < results.length; k++) {
+      const oi = api.batchIdx[k];
+      if (oi != null && oi >= 0 && oi < api.origItems.length) api.results[oi] = results[k];
+    }
+  }
+  if (!api || !api.started) return;
+  // Vista de trabajo: quedan SOLO las líneas que todavía no se intentaron (sin
+  // resultado). Las falladas (sin stock / no encontrado / no cargado) ya
+  // quedaron reportadas en results y NO vuelven a la lista: los bloques avanzan
+  // de corrido 1-19, 20-38 ... sin acumular fallidos en el lote.
+  const kept = [];
+  const keptIdx = [];
+  for (let i = 0; i < api.origItems.length; i++) {
+    if (!api.results[i]) {
+      const it = api.origItems[i];
+      // v2.0.57: forzar el número de INGESTA original en cada fila que queda en
+      // la lista, para que el próximo bloque siga numerando desde la línea 20
+      // y no reinicie en 1 aunque la fila haya viajado por copias/mensajes.
+      it.nro = i + 1;
+      kept.push(it);
+      keptIdx.push(i);
+    }
+  }
+  state.line_items = kept;
+  state.cartApi.idxOfView = keptIdx;
+  // Conteos acumulados de TODO el pedido (por línea original).
+  const done = api.results.filter(Boolean);
+  const added = done.filter(isAdded).length;
+  const sinStock = done.filter((r) => !isAdded(r) && SIN_STOCK_RE.test(r.message || "")).length;
+  const notFound = done.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+  const notConfirmed = done.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  const prodAdded = new Set(done.filter(isAdded).map(prodKey)).size;
+  // Resultados del bloque recién terminado (reporte parcial de la parada).
+  const batchResults = [];
+  for (const oi of api.batchIdx || []) {
+    const r = api.results[oi];
+    if (r) batchResults.push(r);
+  }
+  const batchAdded = batchResults.filter(isAdded).length;
+  const batchSin = batchResults.filter((r) => !isAdded(r) && SIN_STOCK_RE.test(r.message || "")).length;
+  const batchNotF = batchResults.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+  const batchNotC = batchResults.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  const allAttempted = api.nextOrig >= api.orderTotal;
   state.cart = {
-    total: (msg && msg.total) || results.length,
+    total: api.orderTotal,
     ok: added,
     prodAdded: (msg && msg.prodAdded != null) ? msg.prodAdded : prodAdded,
     sinStock,
     notFound,
     notConfirmed,
-    results,
+    results: api.results.slice(),
+    batchTotal: batchResults.length,
+    batchResults,
+    batch: {
+      ok: batchAdded,
+      total: batchResults.length,
+      sinStock: batchSin,
+      notFound: batchNotF,
+      notConfirmed: batchNotC,
+    },
     docName: (msg && msg.docName) || state.filename || "",
+    allLineItems: api.origItems.slice(),
   };
   if (!msg || !msg.canceled) {
-    // Las líneas que NO se agregaron al carrito quedan en las filas para
-    // corregir y reintentar; solo se quitan las confirmadas (message empieza
-    // con "agregado"), porque reenviarlas las duplicaría. Quedan las falladas,
-    // las "sin stock" y las "no se confirmó". Los resultados llegan en el mismo
-    // orden que cartItems() (líneas no vacías).
-    const all = state.line_items || [];
-    state.cart.allLineItems = all;
-    const pending = [];
-    let idx = 0;
-    for (const it of all) {
-      if (!(it.producto || it.sku || "").trim()) {
-        pending.push(it);
-        continue;
-      }
-      const r = results[idx];
-      idx++;
-      if (!isAdded(r)) pending.push(it);
+    if (allAttempted) {
+      // Reporte final del pedido ENTERO (revisado contra el carrito real).
+      const parts = [];
+      if (sinStock) parts.push(sinStock + " sin stock");
+      if (notFound) parts.push(notFound + " no encontrados");
+      if (notConfirmed) parts.push(notConfirmed + " pendientes de confirmación");
+      const other = Math.max(0, api.orderTotal - added - sinStock - notFound - notConfirmed);
+      if (other) parts.push(other + " con error");
+      const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
+      setStatus(
+        "done",
+        "Pedido cargado en el carrito: " + added + " de " + api.orderTotal + "." +
+          docNote +
+          (parts.length ? " (" + parts.join(", ") + ")" : "") +
+          (state.line_items.length ? " Quedaron " + state.line_items.length + " líneas para revisar." : ""),
+        4
+      );
+    } else {
+      // Parada entre bloques: reporte parcial preciso y espera al usuario.
+      const parts = [];
+      if (batchSin) parts.push(batchSin + " sin stock");
+      if (batchNotF) parts.push(batchNotF + " no encontrados");
+      if (batchNotC) parts.push(batchNotC + " pendientes de confirmación");
+      const otros = Math.max(0, batchResults.length - batchAdded - batchSin - batchNotF - batchNotC);
+      if (otros) parts.push(otros + " con error");
+      setStatus(
+        "block_done",
+        "Bloque listo: " + batchAdded + " de " + batchResults.length +
+          " líneas en este bloque" + (parts.length ? " (" + parts.join(", ") + ")" : "") +
+          ". Restan " + state.line_items.length + " líneas del pedido. Presioná «Enviar 19 a carrito» para el próximo bloque.",
+        3
+      );
     }
-    state.line_items = pending;
-    const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
-    const parts = [];
-    if (sinStock) parts.push(sinStock + " sin stock");
-    if (notFound) parts.push(notFound + " no encontrados");
-    if (notConfirmed) parts.push(notConfirmed + " sin confirmar");
-    const other = Math.max(0, state.cart.total - added - sinStock - notFound - notConfirmed);
-    if (other) parts.push(other + " con error");
-    setStatus(
-      "done",
-      "Pedido cargado en el carrito: " + added + " de " + state.cart.total + "." +
-        docNote +
-        (parts.length ? " (" + parts.join(", ") + ")" : "") +
-        (pending.length ? " Quedaron " + pending.length + " líneas para revisar." : ""),
-      4
-    );
     playBeep(true);
   } else {
     setStatus("canceled", "Carga del carrito cancelada.", 3);
@@ -354,7 +476,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "UPDATE_LINE_ITEMS":
       // El popup permitió editar las filas (doble clic): se persisten los
       // cambios en la sesión para que la carga al carrito use los valores
-      // corregidos por el usuario.
+      // corregidos por el usuario. Entre bloques, los cambios también se
+      // aplican a las líneas pendientes del pedido original (lo hace runCart
+      // al refrescar origItems antes del próximo bloque).
       if (Array.isArray(msg.items) && state.status !== "loading_cart") {
         state.line_items = msg.items;
         persist();
@@ -379,11 +503,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "CART_STOP":
       // El lote quedó huérfano (pestaña o sesión cerrada): vuelve al paso de
       // líneas capturadas. La tarea no terminó con confirmación del usuario,
-      // así que NO se marca "canceled" y NO se limpia la sesión.
+      // así que NO se marca "canceled" y NO se limpia la sesión. La tanda de
+      // bloques se reinicia desde cero para no arrastrar resultados viejos.
       if (state.status === "loading_cart") {
         state.cart = null;
         state.cartProgress = null;
         state.cartCanceled = false;
+        state.cartApi = null;
         setStatus("idle", "", 1);
         persist();
         emitState();
@@ -395,7 +521,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // conserva line_items, cart y cartResults para que el usuario
       // pueda reanudar desde donde se quedó.
       if (state.status === "loading_cart") {
-        setStatus("paused", "Tarea pausada — reanudá cuando tengas señal.", 3);
+        setStatus("paused", "Tarea pausada — se reanuda sola cuando vuelva la señal.", 3);
         persist();
         emitState();
       }
@@ -449,12 +575,14 @@ function restoreSession() {
             state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
             state.cart = s.cart || null;
             state.cartProgress = s.cartProgress || null;
+            state.cartApi = s.cartApi || null;
           } else {
             state.status = "idle";
             state.step = 1;
             state.progress = "";
             state.cart = null;
             state.cartProgress = null;
+            state.cartApi = null;
           }
           persist();
           emitState();
@@ -470,6 +598,7 @@ function restoreSession() {
       state.line_items = Array.isArray(s.line_items) ? s.line_items : [];
       state.cart = s.cart || null;
       state.cartProgress = s.cartProgress || null;
+      state.cartApi = s.cartApi || null;
       persist();
       emitState();
     } catch (e) {}
