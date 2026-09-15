@@ -386,7 +386,20 @@
 
   function tokUnitLabel(item) {
     const mapa = { bulto: "Bulto", display: "Display", pack: "Display", packs: "Display", paquete: "Display", pk: "Display", b: "Bulto", bu: "Bulto", d: "Display", di: "Display", u: "Unidad", ud: "Unidad", un: "Unidad", a: "Unidad", unidad: "Unidad", caja: "Caja", combo: "Combo", combos: "Combo", kit: "Combo", kits: "Combo" };
-    const k = String((item && (item.categoria || item.unidad)) || "").toLowerCase();
+    let k = String((item && (item.categoria || item.unidad)) || "").toLowerCase().trim();
+    if (!mapa[k]) {
+      // v2.0.58: la unidad puede llegar pegada a la cantidad o con ruido de OCR
+      // ("4d", "4 d", "6DI", "2b", "24 bultos", "12uds"). Quedarse con el token
+      // de unidad que reconozca el mapa, ignorando números, espacios y símbolos.
+      k = (k.replace(/^[\d.,\s/\\-]+/, "").split(/[^a-z]+/)[0] || k).trim();
+      if (!mapa[k] && k.length > 1 && k.endsWith("s") && mapa[k.slice(0, -1)]) k = k.slice(0, -1);
+    }
+    if (!mapa[k] && !k) {
+      // Sin columna de unidad: puede venir pegada a la cantidad ("4d", "2B", "12uds").
+      const cm = String((item && item.cantidad) || "").toLowerCase().match(/^[\d.,\s]*([a-z]+)\s*$/);
+      if (cm && !/^[0-9]+$/.test(String((item && item.cantidad) || "").trim())) k = cm[1];
+      if (k && k.length > 1 && k.endsWith("s") && mapa[k.slice(0, -1)]) k = k.slice(0, -1);
+    }
     return mapa[k] || (k ? k.charAt(0).toUpperCase() + k.slice(1) : "Unidad");
   }
 
@@ -736,7 +749,16 @@
     const byCode = parsed.filter((p) => p.codeMatch);
     // Prioridad 1: cards con match de código SKU.
     // Prioridad 2 (fallback): cards que comparten nombre/términos/gramos o que indican sin stock.
-    const pool = byCode.length ? byCode : parsed.filter((p) => p.shared > 0 || p.score > 0.1 || p.isNoStock);
+    // v2.0.58: cuando el pedido tiene nombre (tokens reales), la card elegida
+    // tiene que compartir AL MENOS un término con ese nombre. Las cards que solo
+    // entran por score>0.1 sin compartir NINGÚN término son sugerencias /
+    // "términos relacionados" de la búsqueda y NO se eligen (el título de la
+    // card se empata contra el producto del pedido antes de admitirla).
+    const pool = byCode.length
+      ? byCode
+      : targetCore.length
+        ? parsed.filter((p) => p.shared > 0 || (p.isNoStock && p.score > 0.1))
+        : parsed.filter((p) => p.shared > 0 || p.score > 0.1 || p.isNoStock);
     if (!pool.length) return null;
 
     let best = null;
