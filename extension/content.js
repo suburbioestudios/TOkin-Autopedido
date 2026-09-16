@@ -1858,18 +1858,21 @@
       }
 
       // 3) Sincronizar con el carrito real por el código ARC de la card. Solo
-      // las líneas que NO tienen card quedan como fallo real.
-      for (const r of results) {
-        if (r.ok && String(r.message || "").indexOf("agregado") === 0) continue;
-        const msg = String(r.message || "");
-        const code3 = tokArcCode(r.storeText || "");
-        let card = null;
-        if (code3) {
-          card = (tokCartCards() || []).find(
+      // las líneas que NO tienen card quedan como fallo real. Se relee el
+      // carrito en varias pasadas: el drawer puede renderizar (o corregir la
+      // qty de) una card DESPUÉS de la pasada anterior; se sigue hasta que una
+      // pasada no convierta ninguna línea nueva (v2.0.58).
+      for (let pass = 0; pass < 6; pass++) {
+        let convertedHere = 0;
+        const cardsNow = tokCartCards();
+        for (const r of results) {
+          if (r.ok && String(r.message || "").indexOf("agregado") === 0) continue;
+          const code3 = tokArcCode(r.storeText || "");
+          if (!code3) continue;
+          const card = cardsNow.find(
             (c) => c.code && (c.code === code3 || c.code.endsWith(code3) || code3.endsWith(c.code)) && c.qty > 0
           );
-        }
-        if (card) {
+          if (!card) continue;
           const want3 = r.added || 0;
           r.ok = true;
           r.message =
@@ -1879,8 +1882,14 @@
               : "") +
             " (confirmado en el cierre)";
           changed++;
-        } else if (msg.indexOf("no se confirmó") === 0) {
-          // Sin card, no hay "no se confirmó" que valga: es un fallo real.
+          convertedHere++;
+        }
+        if (!convertedHere) break;
+        await toksleep(600);
+      }
+      // Relabel: los que siguen "no se confirmó" sin card son fallo real.
+      for (const r of results) {
+        if (!r.ok && String(r.message || "").indexOf("no se confirmó") === 0) {
           r.message = "no cargado (no se confirmó la card en el carrito al cierre)";
           changed++;
         }
@@ -1922,27 +1931,42 @@
     // código ARC de la card, o su nombre si no trae código.
     let realCartCount = 0;
     try {
-      // v2.0.57: el drawer del carrito puede renderizar las cards tarde (React
-      // re-monta al cerrar el lote). Leer el carrito real en pasadas: si la
-      // primera lectura queda por debajo de lo ya confirmado, esperar y releer
-      // para que el informe no diga menos productos de los que hay.
-      for (let t = 0; t < 3; t++) {
-        if (t) await toksleep(700);
+      // v2.0.57/58: el número principal del informe sale del CARRITO REAL
+      // (cards únicas del drawer con qty>0), no de la heurística de líneas
+      // "agregado". Se relee hasta que el conteo se estabilice (dos pasadas
+      // seguidas iguales): el drawer renderiza cards tarde y la primera lectura
+      // infra-cuenta (ej. decía 16 cuando el carrito ya tenía 17).
+      let last = -1, stable = 0;
+      for (let t = 0; t < 10; t++) {
+        if (t) await toksleep(600);
         const realKeys = new Set();
         for (const c of tokCartCards()) {
           if (!(c.qty > 0)) continue;
           realKeys.add(c.code ? "c:" + c.code : "t:" + (c.name || ""));
         }
         realCartCount = realKeys.size;
-        if (realCartCount >= prodAdded) break;
+        if (realCartCount === last) {
+          if (++stable >= 2) break;
+        } else {
+          stable = 0;
+        }
+        last = realCartCount;
       }
     } catch (e) {}
     const prodAddedReal = realCartCount > prodAdded ? realCartCount : prodAdded;
+    // Productos únicos del PEDIDO, para comparar igual contra el carrito: por
+    // SKU, y si la línea no trae código, por un prefijo del nombre.
+    const orderedProducts = new Set();
+    for (const it of job.items || []) {
+      const sd = String(it.sku || "").replace(/\D+/g, "");
+      orderedProducts.add(sd.length >= 4 ? sd : tokNorm(String(it.producto || "").slice(0, 24)));
+    }
+    const totalProducts = orderedProducts.size || job.total || 0;
     const sinStock = results.filter((x) => !isAdded(x) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(x.message || "")).length;
     const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
     const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;
     const docName = job.docName || "";
-    const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded: prodAddedReal };
+    const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded: prodAddedReal, totalProducts };
     try {
       window.__TOKIN_RES__ = summary;
     } catch (e) {}
@@ -1950,15 +1974,15 @@
       window.postMessage({ __tok: "cart-res", payload: summary }, "*");
     } catch (e) {}
     tokToastSet(
-      "Pedido listo: " + added + " de " + job.total + " en el carrito",
-      added === job.total ? "ok" : "err"
+      "Pedido listo: " + prodAddedReal + " de " + (totalProducts || job.total) + " productos en el carrito",
+      prodAddedReal >= (totalProducts || job.total) ? "ok" : "err"
     );
     tokToastHide();
     try {
       chrome.runtime.sendMessage(
         {
           target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName,
-          sinStock, notFound, notConfirmed, prodAdded: prodAddedReal,
+          sinStock, notFound, notConfirmed, prodAdded: prodAddedReal, totalProducts,
         },
         () => { void chrome.runtime.lastError; }
       );

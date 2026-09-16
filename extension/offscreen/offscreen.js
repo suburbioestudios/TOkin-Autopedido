@@ -356,6 +356,9 @@ function applyCartDone(msg) {
     total: api.orderTotal,
     ok: added,
     prodAdded: (msg && msg.prodAdded != null) ? msg.prodAdded : prodAdded,
+    // v2.0.58: productos únicos del PEDIDO (para comparar igual contra el
+    // carrito real en el informe final: "N de M productos").
+    totalProducts: (msg && msg.totalProducts) || api.orderTotal,
     sinStock,
     notFound,
     notConfirmed,
@@ -374,7 +377,11 @@ function applyCartDone(msg) {
   };
   if (!msg || !msg.canceled) {
     if (allAttempted) {
-      // Reporte final del pedido ENTERO (revisado contra el carrito real).
+      // Reporte final del pedido ENTERO: la cifra principal sale del carrito
+      // real (prodAdded, cards únicas verificadas), comparable con lo que el
+      // usuario ve en el carrito del store (v2.0.58).
+      const headN = (msg && msg.prodAdded != null) ? msg.prodAdded : added;
+      const headM = state.cart.totalProducts;
       const parts = [];
       if (sinStock) parts.push(sinStock + " sin stock");
       if (notFound) parts.push(notFound + " no encontrados");
@@ -384,7 +391,7 @@ function applyCartDone(msg) {
       const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
       setStatus(
         "done",
-        "Pedido cargado en el carrito: " + added + " de " + api.orderTotal + "." +
+        "Pedido cargado en el carrito: " + headN + " de " + headM + " productos." +
           docNote +
           (parts.length ? " (" + parts.join(", ") + ")" : "") +
           (state.line_items.length ? " Quedaron " + state.line_items.length + " líneas para revisar." : ""),

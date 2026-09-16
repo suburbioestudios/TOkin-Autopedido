@@ -282,8 +282,13 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         // posición, para que refleje las líneas reales que abarca el bloque.
         const firstN = items[i].nro || (i + 1);
         const lastN = items[end].nro || (end + 1);
+        // v2.0.58: el número de BLOQUE también sale del nro original. Antes se
+        // calculaba por posición (i/19+1) y, al quitar el bloque 1 cargado, el
+        // siguiente volvía a etiquetarse "Bloque 1 — líneas 20 a 38" en vez de
+        // "Bloque 2". Los bloques del pedido no se re-numeran nunca.
+        const blockN = items[i].nro ? Math.floor((items[i].nro - 1) / GROUP) + 1 : Math.floor(i / GROUP) + 1;
         html +=
-          '<tr class="bloque"><td colspan="5">Bloque ' + (Math.floor(i / GROUP) + 1) +
+          '<tr class="bloque"><td colspan="5">Bloque ' + blockN +
           " — líneas " + firstN + " a " + lastN + "</td></tr>";
       }
       const unidad = it.categoria || it.unidad || "";
@@ -428,14 +433,16 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       : "El pedido quedó cargado en el carrito del store.";
     if (c.docName) html += "\nDocumento procesado: " + c.docName + ".";
     if (c.total) {
-      // v2.0.55: números coherentes con la verificación real de cierre. "Líneas
-      // cargadas" = líneas del pedido que quedaron confirmadas en el carrito;
-      // "en el carrito (verificado)" = productos únicos reales (cards ARC), que
-      // puede diferir de las líneas por la semántica SET del store (dos líneas
-      // que caen en la misma card son UN producto).
-      html += "\nLíneas cargadas y confirmadas en el carrito: " + c.ok + " de " + c.total + ".";
-      if (c.prodAdded && c.prodAdded !== c.ok) {
-        html += "\nEn el carrito (verificado al cierre): " + c.prodAdded + " productos.";
+      // v2.0.55/58: la cifra principal del informe sale del CARRITO REAL
+      // (cards únicas verificadas al cierre), no de las líneas: el usuario
+      // compara contra lo que ve en el carrito del store ("cargaron 16 y hay
+      // 17"). Las "líneas del pedido" quedan como dato secundario (una misma
+      // card puede recibir varias líneas por la semántica SET del store).
+      const headN = c.prodAdded != null ? c.prodAdded : c.ok;
+      const headM = c.totalProducts || c.total;
+      html += "\nEn el carrito (verificado al cierre): " + headN + " de " + headM + " productos del pedido.";
+      if (c.ok !== headN || c.total !== headM) {
+        html += "\nLíneas del pedido confirmadas: " + c.ok + " de " + c.total + ".";
       }
     }
     const parts = [];
@@ -891,8 +898,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const notFound = counts.notFound;
     const isAdded = (r) => !!r && r.ok && String(r.message || "").indexOf("agregado") === 0;
     const isPartial = (r) => /falta de unidades para completar stock/.test(String((r && r.message) || ""));
-
-    const summaryStr = `Pedido cargado: ${added} de ${results.length} | Sin stock: ${sinStock} | No encontrados: ${notFound}` +
+    // v2.0.58: igual que el informe, la cifra principal es lo verificado en el
+    // carrito real (productos únicos), no las líneas del pedido.
+    const headN = (ui.cart && ui.cart.prodAdded != null) ? ui.cart.prodAdded : added;
+    const headM = (ui.cart && ui.cart.totalProducts) || results.length;
+    const summaryStr = `Pedido cargado: ${headN} de ${headM} productos del pedido | Sin stock: ${sinStock} | No encontrados: ${notFound}` +
       (counts.faltaUnidades ? " | Falta unidades: " + counts.faltaUnidades : "");
 
     // 1. Hoja 1: REPORTE GENERAL — 7 columnas simples
