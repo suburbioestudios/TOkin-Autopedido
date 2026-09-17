@@ -1184,50 +1184,6 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     $("#btn-close-settings").addEventListener("click", () => {
       $("#settings-overlay").classList.add("hidden");
     });
-    // v2.0.60: diagnóstico — baja la trazabilidad de la corrida del content
-    // script (cada ítem, card elegida, botones/factores, conversión, set y
-    // resultado) y la copia al portapapeles para pegarla en el chat.
-    $("#btn-copy-diag").addEventListener("click", async () => {
-      try {
-        const tab = await getStoreTab();
-        if (!tab || !tab.id) {
-          setStatus("Para leer el diagnóstico abrí la pestaña del store.", "err");
-          return;
-        }
-        const res = await sendTab(tab.id, { type: "TOKIN_DIAG" });
-        if (!res || !res.ok || !res.diag) {
-          setStatus("Sin trazabilidad (recargá el store con F5 y volvé a cargar el pedido).", "err");
-          return;
-        }
-        const text =
-          "=== Tokin AutoPedido DIAGNÓSTICO ===\n" +
-          "entradas: " + res.entries + " · " + JSON.stringify(res.tally || {}) + "\n\n" +
-          res.diag;
-        let ok = false;
-        try {
-          await navigator.clipboard.writeText(text);
-          ok = true;
-        } catch (e) {}
-        if (!ok) {
-          const ta = document.createElement("textarea");
-          ta.value = text;
-          document.body.appendChild(ta);
-          ta.select();
-          try {
-            ok = document.execCommand("copy");
-          } catch (e2) {}
-          ta.remove();
-        }
-        setStatus(
-          ok
-            ? "Diagnóstico copiado (" + res.entries + " entradas). Pegalo en el chat para analizarlo."
-            : "No se pudo copiar; seleccioná y copiá el texto con Ctrl+C.",
-          ok ? "ok" : "err"
-        );
-      } catch (e) {
-        setStatus("Error copiando diagnóstico: " + String((e && e.message) || e), "err");
-      }
-    });
     $("#btn-refresh-list").addEventListener("click", async () => {
       setStatus("Refrescando pestaña del store y reactivando la herramienta…", "");
       let access;
