@@ -262,6 +262,23 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     }
   }
 
+  // Separador de "Bloque N — líneas X a Y" (v2.0.55/58). El número de bloque y
+  // las líneas salen del nro de INGESTA original, no de la posición, para que
+  // los lotes no se re-numeren mientras se van cargando. Acepta también filas
+  // envueltas ({it}) como las que usa renderCartItems.
+  const GROUP = 19;
+  function blockRow(items, i, cols) {
+    const get = (el) => el && (el.nro != null ? el.nro : (el.it && el.it.nro));
+    const firstIt = items[i];
+    const end = Math.min(i + GROUP, items.length) - 1;
+    const lastIt = items[end];
+    const firstN = get(firstIt) || (i + 1);
+    const lastN = get(lastIt) || (end + 1);
+    const blockN = get(firstIt) ? Math.floor((get(firstIt) - 1) / GROUP) + 1 : Math.floor(i / GROUP) + 1;
+    return '<tr class="bloque"><td colspan="' + cols + '">Bloque ' + blockN +
+      " — líneas " + firstN + " a " + lastN + "</td></tr>";
+  }
+
   function renderItems() {
     const items = ui.lineItems || [];
     const box = $("#items-box");
@@ -269,28 +286,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       box.innerHTML = '<p class="hint">No se detectaron líneas de pedido.</p>';
       return;
     }
-    // v2.0.55: el pedido viaja al carrito en bloques de 19 por parada; la vista
-    // agrupa las filas con un separador para mostrar hasta dónde llega cada
-    // bloque ("Enviar 19 a carrito" manda el primero, y así cada parada).
-    const GROUP = 19;
     let html =
       '<table><thead><tr><th>#</th><th>Código</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
     items.forEach((it, i) => {
-      if (i % GROUP === 0) {
-        const end = Math.min(i + GROUP, items.length) - 1;
-        // v2.0.56: el rótulo usa el número de INGESTA original (nro), no la
-        // posición, para que refleje las líneas reales que abarca el bloque.
-        const firstN = items[i].nro || (i + 1);
-        const lastN = items[end].nro || (end + 1);
-        // v2.0.58: el número de BLOQUE también sale del nro original. Antes se
-        // calculaba por posición (i/19+1) y, al quitar el bloque 1 cargado, el
-        // siguiente volvía a etiquetarse "Bloque 1 — líneas 20 a 38" en vez de
-        // "Bloque 2". Los bloques del pedido no se re-numeran nunca.
-        const blockN = items[i].nro ? Math.floor((items[i].nro - 1) / GROUP) + 1 : Math.floor(i / GROUP) + 1;
-        html +=
-          '<tr class="bloque"><td colspan="5">Bloque ' + blockN +
-          " — líneas " + firstN + " a " + lastN + "</td></tr>";
-      }
+      if (i % GROUP === 0) html += blockRow(items, i, 5);
       const unidad = it.categoria || it.unidad || "";
       html +=
         "<tr>" +
@@ -384,21 +383,33 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     if (total || list.length) {
       setStatus("Cargando carrito (" + count + " de " + (total || list.length) + ")…", "");
     }
-    const remaining = list
-      .map((it, i) => ({ it, n: i + 1 }))
-      .filter((r) => r.n - 1 > done);
-    if (!remaining.length) {
+    // v2.0.60: los separadores se calculan sobre las posiciones ORIGINALES del
+    // pedido (list), no sobre el slice "remaining" que se re-filtra con cada
+    // avance, para que el rango de cada lote quede FIJO mientras se carga
+    // ("Bloque 2 — líneas 20 a 38") y no se recalcule como X+19 por lote. La
+    // primera fila que queda emite el separador del lote al que pertenece
+    // (aunque ese lote esté a medias) con su rango completo original.
+    const rest = list
+      .map((it, i) => ({ it, orig: i }))
+      .filter((r) => r.orig > done);
+    if (!rest.length) {
       box.innerHTML = "";
       return;
     }
     let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
-    remaining.forEach((r) => {
+    let lastSep = -1;
+    rest.forEach((r) => {
+      const blockStart = Math.floor(r.orig / GROUP) * GROUP;
+      if (blockStart !== lastSep) {
+        html += blockRow(list, blockStart, 4);
+        lastSep = blockStart;
+      }
       const unidad = r.it.categoria || r.it.unidad || "";
       html +=
         "<tr>" +
         // v2.0.56: número de INGESTA original (la posición se sigue usando solo
         // para saber qué quedó por procesar).
-        '<td class="mono">' + (r.it.nro || r.n) + "</td>" +
+        '<td class="mono">' + (r.it.nro || r.orig + 1) + "</td>" +
         "<td>" + esc(r.it.producto) + "</td>" +
         "<td>" + esc(r.it.cantidad) + "</td>" +
         "<td>" + esc(unidad) + "</td>" +
@@ -496,7 +507,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   async function syncFromJob() {
     let res;
     try {
-      res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
+      res = await new Promise((r) => chrome.storage.local.get([JOB_KEY, "tokinCartReport"], (x) => r(x || {})));
     } catch (e) {
       return false;
     }
@@ -504,6 +515,21 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     if (job && job.phase && job.phase !== "done") {
       ui.synthFromJob = true;
       applyState(jobToState(job));
+      return true;
+    }
+    // v2.0.60: sin job vivo pero con reporte del último bloque persistido por
+    // el content script (el offscreen estaba cerrado cuando terminó). Se
+    // reconstruye la vista parcial/final desde el reporte para que el usuario
+    // igual vea el resultado del lote y pueda exportar el Excel. Solo cuando NO
+    // hay una sesión real del offscreen contando el estado (si el offscreen
+    // vive, su STATE block_done/done es más rico y manda).
+    const report = res["tokinCartReport"];
+    const st = ui.sessionState;
+    const realSessionLive = !ui.synthFromJob && st &&
+      (st.status === "block_done" || st.status === "done" || st.status === "loading_cart" || st.status === "paused");
+    if (!realSessionLive && report && Array.isArray(report.results) && (report.results.length || report.batch)) {
+      ui.synthFromJob = true;
+      applyState(reportToState(report));
       return true;
     }
     if (ui.synthFromJob) {
@@ -517,6 +543,42 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       setStatus("La tarea del store terminó. Revisá el carrito o cargá otro pedido.", "ok");
     }
     return false;
+  }
+
+  // Estado sintético construido desde el reporte persistido del bloque
+  // (tokinCartReport). Usado cuando el offscreen se cerró y no pudo asentar el
+  // CART_DONE: el reporte del content script basta para mostrar el lote.
+  function reportToState(report) {
+    const lastBatch = !!report.lastBatch;
+    const status = lastBatch ? "done" : "block_done";
+    const c = {
+      total: report.orderTotal || report.total || 0,
+      ok: report.added || 0,
+      prodAdded: report.prodAdded != null ? report.prodAdded : (report.added || 0),
+      totalProducts: report.totalProducts || report.orderTotal || report.total || 0,
+      sinStock: report.sinStock || 0,
+      notFound: report.notFound || 0,
+      notConfirmed: report.notConfirmed || 0,
+      results: report.results || [],
+      batchResults: report.results || [],
+      batch: report.batch || { ok: 0, total: 0 },
+      docName: report.docName || "",
+      allLineItems: [],
+      fromReport: true,
+    };
+    return {
+      status,
+      step: lastBatch ? 4 : 3,
+      filename: report.docName || "",
+      progress: lastBatch
+        ? "Pedido cargado en el carrito: " + c.prodAdded + " de " + c.totalProducts +
+          " productos del pedido (reporte recuperado)."
+        : "Bloque listo: " + (c.batch && c.batch.ok || 0) + " de " +
+          ((c.batch && c.batch.total) || c.batchResults.length) +
+          " líneas en este bloque (reporte recuperado).",
+      line_items: [],
+      cart: c,
+    };
   }
 
   // v2.0.56: si hay una tarea ya en curso en el store (bloque cargando al
@@ -542,7 +604,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local" || !changes[JOB_KEY]) return;
+    if (area !== "local") return;
+    // v2.0.60: también el reporte persistido por el content script (tokinCartReport)
+    // dispara la sincronización: cubre el caso en que el offscreen no existe y el
+    // job ya se borró — el reporte llega un instante después del removido del job.
+    if (!changes[JOB_KEY] && !changes["tokinCartReport"]) return;
     // Solo maneja la vista cuando el popup está mostrando la vista sintetizada
     // o no tiene sesión activa; si hay sesión real del offscreen, ella manda.
     if (ui.synthFromJob || !ui.sessionState || ui.sessionState.status === "idle") {
@@ -912,19 +978,38 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     generalAoa.push(genHeaders);
 
     let cleanIdx = 0;
-    allItems.forEach((it, i) => {
+    // v2.0.60: en el reporte RECUPERADO (offscreen cerrado, sintetizado desde
+    // tokinCartReport) no hay allLineItems: las filas se arman desde los
+    // resultados del bloque, que traen producto/mensaje/unidad.
+    const recovered = !allItems.length && Array.isArray(results) && results.some(Boolean);
+    const src = recovered ? results.filter(Boolean) : allItems;
+    const recRow = (r, i) => ({
+      nro: r.nro || r.itemNro || (i + 1),
+      sku: r.sku || r.code || "",
+      producto: r.producto || "",
+      cantidad: r.qty != null ? r.qty : (r.quantity != null ? r.quantity : ""),
+      unidad: r.usedUnit || "",
+      r,
+    });
+    src.forEach((it, i) => {
+      const r = recovered ? it : (results[i] || {});
       if (!(it.producto || it.sku || "").trim()) return;
       cleanIdx++;
-      const r = results[i] || {};
-      const unidad = it.categoria || it.unidad || "";
+      const row = recovered ? recRow(it, i) : {
+        nro: it.nro || (i + 1),
+        sku: it.sku || "",
+        producto: it.producto || "",
+        cantidad: it.cantidad || "1",
+        unidad: it.categoria || it.unidad || "",
+        r,
+      };
       const estado = estadoDe(r);
       generalAoa.push([
-        // v2.0.56: número de INGESTA original (no renumera por líneas cargadas).
-        it.nro || cleanIdx,
-        String(it.sku || "N/A"),
-        String(it.producto || ""),
-        String(it.cantidad || "1"),
-        String(unidad || ""),
+        row.nro,
+        String(row.sku || "N/A"),
+        String(row.producto || ""),
+        String(row.cantidad || "1"),
+        String(row.unidad || ""),
         estado,
         String(r.message || (isAdded(r) ? "Cargado correctamente al carrito" : "Sin mensaje de respuesta"))
       ]);
@@ -937,27 +1022,25 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     pendingAoa.push(pendHeaders);
 
     let pendIdx = 0;
-    allItems.forEach((it, i) => {
-      const r = results[i] || {};
+    (recovered ? results.filter(Boolean) : allItems).forEach((it, i) => {
+      const r = recovered ? it : (results[i] || {});
       // v2.0.57: las líneas cargadas PARCIALMENTE ("falta de unidades para
       // completar stock") van en la hoja de observados: están en el carrito per
       //o faltan unidades y el usuario debe revisarlas.
       if (isAdded(r) && !isPartial(r)) return;
       if (!(it.producto || it.sku || "").trim()) return;
       pendIdx++;
-      const unidad = it.categoria || it.unidad || "";
+      const unidad = recovered ? (r.usedUnit || "") : (it.categoria || it.unidad || "");
       const estado = estadoDe(r);
       const diagExtra =
         (r.convFactor > 0 ? " | factor conv: " + r.convFactor + " (pedido " + r.usedUnit + ")" : "") +
         (r.storeButtons ? " | botones card: " + r.storeButtons : "");
 
       pendingAoa.push([
-        // v2.0.56: número de INGESTA original (mantiene saltos donde hubo
-        // líneas cargadas, alineado con la vista del popup).
-        it.nro || pendIdx,
-        String(it.sku || "N/A"),
+        recovered ? (r.nro || pendIdx) : (it.nro || pendIdx),
+        String(recovered ? (r.sku || "") : (it.sku || "N/A")),
         String(it.producto || ""),
-        String(it.cantidad || "1"),
+        String(recovered ? (r.qty || "") : (it.cantidad || "1")),
         String(unidad || ""),
         estado,
         String(r.storeName || r.storeText || "N/A"),
@@ -1101,7 +1184,52 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     $("#btn-close-settings").addEventListener("click", () => {
       $("#settings-overlay").classList.add("hidden");
     });
+    // v2.0.60: diagnóstico — baja la trazabilidad de la corrida del content
+    // script (cada ítem, card elegida, botones/factores, conversión, set y
+    // resultado) y la copia al portapapeles para pegarla en el chat.
+    $("#btn-copy-diag").addEventListener("click", async () => {
+      try {
+        const tab = await getStoreTab();
+        if (!tab || !tab.id) {
+          setStatus("Para leer el diagnóstico abrí la pestaña del store.", "err");
+          return;
+        }
+        const res = await sendTab(tab.id, { type: "TOKIN_DIAG" });
+        if (!res || !res.ok || !res.diag) {
+          setStatus("Sin trazabilidad (recargá el store con F5 y volvé a cargar el pedido).", "err");
+          return;
+        }
+        const text =
+          "=== Tokin AutoPedido DIAGNÓSTICO ===\n" +
+          "entradas: " + res.entries + " · " + JSON.stringify(res.tally || {}) + "\n\n" +
+          res.diag;
+        let ok = false;
+        try {
+          await navigator.clipboard.writeText(text);
+          ok = true;
+        } catch (e) {}
+        if (!ok) {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            ok = document.execCommand("copy");
+          } catch (e2) {}
+          ta.remove();
+        }
+        setStatus(
+          ok
+            ? "Diagnóstico copiado (" + res.entries + " entradas). Pegalo en el chat para analizarlo."
+            : "No se pudo copiar; seleccioná y copiá el texto con Ctrl+C.",
+          ok ? "ok" : "err"
+        );
+      } catch (e) {
+        setStatus("Error copiando diagnóstico: " + String((e && e.message) || e), "err");
+      }
+    });
     $("#btn-refresh-list").addEventListener("click", async () => {
+      setStatus("Refrescando pestaña del store y reactivando la herramienta…", "");
       let access;
       try {
         access = await getAllowedUsers(true);
@@ -1111,44 +1239,67 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       ui.allowed = access;
       if (access && access.ok) {
         setBadge("ok", "Lista OK", access.warning || "");
-        setStatus("Acceso actualizado.", "ok");
-        let email = ui.session && ui.session.email;
-        if (!email) {
-          const tab = await getStoreTab();
-          if (tab && tab.id) {
-            const pong = await pingWithRetry(tab.id, 3);
-            if (pong && pong.ok) {
-              ui.session = pong.session;
-              email = pong.session.email || "";
-            }
-          }
-        }
-        if (email) {
-          if (isAllowed(email, ui.allowed.emails)) {
-            await grantAccess(email);
-            $("#access-screen").classList.add("hidden");
-            $("#main-screen").classList.remove("hidden");
-            setBadge("ok", "Autorizado");
-            setStatus("Acceso habilitado. Podés usar la herramienta.", "ok");
-          } else {
-            await revokeAccess();
-            setBadge("err", "No autorizado");
-            setStatus("Tu usuario aún no está en la lista.", "err");
-          }
-        } else {
-          setStatus("No se detectó tu sesión del store. Refrescá la pestaña del store (F5) e intentá de nuevo.", "warn");
-        }
       } else {
-        setBadge("err", "Lista no disponible", access.error || "");
-        setStatus(access.error || "No se pudo actualizar el acceso.", "err");
+        setBadge("err", "Lista no disponible", (access && access.error) || "");
       }
       // v2.0.56: además de refrescar la lista, se recarga la pestaña del store
       // para que el content script re-aplique la sesión y la lista de acceso.
       const storeTab = await getStoreTab();
-      if (storeTab && storeTab.id) {
-        try {
-          chrome.tabs.reload(storeTab.id, {}, () => { void chrome.runtime.lastError; });
-        } catch (e) {}
+      if (!storeTab || !storeTab.id) {
+        setStatus(access && access.ok ? "Lista actualizada. No se encontró la pestaña del store." : "No se pudo actualizar ni encontrar la pestaña del store.", "warn");
+        return;
+      }
+      try {
+        chrome.tabs.reload(storeTab.id, {}, () => { void chrome.runtime.lastError; });
+      } catch (e) {}
+      // v2.0.60: esperar a que el content script vuelva a estar listo tras el
+      // reload (hasta ~15s: el reload repinta la pestaña) en lugar de dejar la
+      // herramienta muerta hasta un segundo clic / reapertura del popup.
+      let pong = null;
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        pong = await pingTab(storeTab.id);
+        if (pong && pong.ok) break;
+      }
+      if (!(pong && pong.ok)) {
+        setStatus(access && access.ok
+          ? "Lista actualizada. La pestaña del store se recargó; volvé a abrir el popup."
+          : "No se pudo conectar con la pestaña del store tras el refresco.", "warn");
+        return;
+      }
+      ui.session = pong.session;
+      const email = (pong.session && pong.session.email) || "";
+      $("#user-info").textContent = email || "No logueado";
+      if (!email) {
+        setStatus("Sesión del store no detectada tras el refresco. Iniciá sesión en Tokin.", "warn");
+        return;
+      }
+      if (!(access && access.ok)) {
+        setStatus("Sesión OK pero sin lista de acceso. Intentá de nuevo en unos segundos.", "warn");
+        return;
+      }
+      if (isAllowed(email, access.emails)) {
+        await grantAccess(email);
+        // Reactivar en el MISMO clic: asegurar el offscreen y restaurar la
+        // sesión (o la tarea del store si hay un lote vivo), sin pedir pasos
+        // extras.
+        const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+        if (ens && ens.ok) {
+          const st = await toOff({ type: "GET_STATE" });
+          if (st && st.ok && st.state && st.state.status !== "idle") {
+            applyState(st.state);
+          } else {
+            await syncFromJob();
+          }
+        }
+        $("#access-screen").classList.add("hidden");
+        $("#main-screen").classList.remove("hidden");
+        setBadge("ok", "Autorizado");
+        setStatus("Información refrescada. La herramienta quedó activa.", "ok");
+      } else {
+        await revokeAccess();
+        setBadge("err", "No autorizado");
+        setStatus("Tu usuario aún no está en la lista.", "err");
       }
     });
   }

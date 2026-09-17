@@ -384,6 +384,67 @@
     } catch (e) {}
   }
 
+  // v2.0.60: DIAGNÓSTICO. Registro en memoria de todas las decisiones de la
+  // corrida (cada ítem, la card elegida, sus botones/factores, la conversión,
+  // los valores seteados y el resultado). El popup lo baja con "TOKIN_DIAG" y
+  // lo copia al portapapeles para diagnosticar líneas que no se pidieron o que
+  // se convirtieron mal. Se corta en ~3000 entradas para no comerse memoria.
+  const TOK_DIAG_MAX = 3000;
+  const TOK_DIAG_KEY = "tokinDiagLog";
+  let tokDiagLog = [];
+  let tokDiagBatchShown = false;
+  // v2.0.60 (rev2): el diag sobrevive a las NAVEGACIONES de la SPA del store
+  // (cada ítem es una búsqueda/página nueva) persistiéndolo en sessionStorage
+  // del tab. El "Copiar diagnóstico" de la página final muestra TODA la corrida
+  // del pedido (o del bloque), no solo el último segmento (resume).
+  function tokDiagLoad() {
+    try {
+      const raw = sessionStorage.getItem(TOK_DIAG_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) tokDiagLog = arr.slice(-TOK_DIAG_MAX);
+      }
+    } catch (e) {}
+  }
+  function tokDiagPersist() {
+    try {
+      sessionStorage.setItem(TOK_DIAG_KEY, JSON.stringify(tokDiagLog.slice(-TOK_DIAG_MAX)));
+    } catch (e) {}
+  }
+  function tokDiagClear() {
+    tokDiagLog = [];
+    try { sessionStorage.removeItem(TOK_DIAG_KEY); } catch (e) {}
+  }
+  function tokDiagPush(phase, d) {
+    try {
+      tokDiagLog.push(Object.assign({ t: Date.now(), phase }, d || {}));
+      if (tokDiagLog.length > TOK_DIAG_MAX) tokDiagLog = tokDiagLog.slice(-TOK_DIAG_MAX);
+      tokDiagPersist();
+      try { window.__TOKIN_DIAG__ = tokDiagLog; } catch (e) {}
+    } catch (e) {}
+  }
+  tokDiagLoad();
+  function tokDiagText() {
+    const lines = ["Tokin AutoPedido — diagnóstico (v" + (chrome.runtime && chrome.runtime.getManifest ? (chrome.runtime.getManifest().version || "") : "") + ")", "url: " + location.href, ""];
+    for (const e of tokDiagLog) {
+      const tag = e.idx != null ? ("[" + e.idx + "]") : e.nro != null ? ("[n" + e.nro + "]") : "[-]";
+      lines.push(tag + " " + (e.phase || "") + " · " + e.msg);
+    }
+    return lines.join("\n");
+  }
+  function tokDiagCard(card) {
+    try {
+      const els = Array.from(card.querySelectorAll("article, [data-id=sku-selector-button], [data-id=product-card], [class*=product-card], [data-id^=ARC]"));
+      const btns = Array.from(card.querySelectorAll("[data-id=sku-selector-button]")).map((el) =>
+        (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim()
+      );
+      const txt = (card.innerText || "").replace(/\s+/g, " ").trim();
+      return { btns, txt: txt.slice(0, 420) };
+    } catch (e) {
+      return { btns: [], txt: "" };
+    }
+  }
+
   function tokUnitLabel(item) {
     const mapa = { bulto: "Bulto", display: "Display", pack: "Display", packs: "Display", paquete: "Display", pk: "Display", b: "Bulto", bu: "Bulto", d: "Display", di: "Display", u: "Unidad", ud: "Unidad", un: "Unidad", a: "Unidad", unidad: "Unidad", caja: "Caja", combo: "Combo", combos: "Combo", kit: "Combo", kits: "Combo" };
     let k = String((item && (item.categoria || item.unidad)) || "").toLowerCase().trim();
@@ -541,21 +602,40 @@
     return n > 0 && n <= 999 ? n : 0;
   }
 
-  // Factor de unidades que declara el TEXTO de un botón ("Display =12 u",
-  // "12 Uds", "Display 12", "Bulto 24"). Devuelve 0 si no hay un número que
-  // sea un conteo de unidades (un "% OFF" NO cuenta: el número viene solo).
+// Factor de unidades que declara el TEXTO de un botón ("Display =12 u",
+// "DISP 15", "12 Uds", "Bulto x24", "Caja (12u)"). Devuelve 0 si no hay un
+// número que sea un conteo de unidades (un "% OFF" NO cuenta).
   function tokFactorFromText(s) {
     const t = String(s || "").replace(/\s+/g, " ").trim();
     if (!t) return 0;
-    // 1) número + marcador de unidad: "=12 u", "12 uds", "12u", "24 unidades".
-    let m = t.match(/(?:=\s*|:\s*|x\s*)?(\d{1,3})\s*(?:ud|uds|u\.?d\.?s?|u(?:nidades?)?|unid|und)\b/i);
+    // 1) número + marcador de unidad: "=12 u", "12 uds", "12u", "24 unidades",
+    //    "1 u" (Display de 1 unidad -> factor 1, no 0).
+    let m = t.match(/(?:=\s*|:\s*|x\s*)?(\d{1,3})\s*(?:ud|uds|u\.?d\.?s?|u(?:nidades?)?|unid|und|uni|un)\b/i);
     if (m) {
       const n = parseInt(m[1], 10);
       if (n > 0 && n <= 999) return n;
     }
-    // 2) alias de unidad + número: "Display 12", "Bulto 24", "Display 12 u".
-    m = t.match(/(?:display|bulto|caja|paquete|pack|unidad|displays?|bultos?|cajas?|paquetes?)\s*[:\s=×x\-]*(\d{1,3})\b/i);
+    // 2) alias de unidad + número, con separadores amplios: "Display 12",
+    //    "Bulto x24", "Caja (12)", "DISP 15", "Pack=4" (la "unidad" NUNCA se
+    //    factoriza: es la base 1, un "Unidad=15" sería un error de lectura).
+    m = t.match(/(?:displays?|dsp|disp|bultos?|cajas?|paquetes?|packs?|paq|envases?)\s*[:=\s×x\-()]*(\d{1,3})\b/i);
     if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n <= 999) return n;
+    }
+
+    // 3) v2.0.60: "x12 (Unid)", "12u (Disp)": número+marker en cualquier lugar
+    //    del texto del botón, pero NO cuando es un precio suelto que flota solo
+    //    ni cuando el número es claramente otro dato (ej. "12%"). Solo cuenta si
+    //    viene acompañado de un marcador de unidades o de "x".
+    m = t.match(/(?:x\s*)?(\d{1,3})\s*(?:ud|uds|u\.?d\.?s?|u(?:nidades?)?|uni|unid|und|un)\b/i);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n <= 999) return n;
+    }
+    // 4) número precedido de "x" con el alias en el resto del texto ("x15 Display").
+    m = t.match(/\bx\s*(\d{1,3})\b/i);
+    if (m && /(?:display|disp|dsp|bulto|caja|paquete|pack|paq|envase|unidad|unidades)/i.test(t)) {
       const n = parseInt(m[1], 10);
       if (n > 0 && n <= 999) return n;
     }
@@ -650,6 +730,47 @@
     return out;
   }
 
+  // v2.0.60: detecta el mensaje de MÁXIMO DE PEDIDO / cuota del producto en el
+  // texto de la card ("Máximo de pedido alcanzado", "Límite de pedido: 5",
+  // "Pedido máximo 3", "cuota") y extrae el número tope si está declarado.
+  // Los test se hacen sobre el texto SIN acentos para no fallar con á/ó.
+  function tokLimitInfo(txt) {
+    const t = String(txt || "").replace(/\s+/g, " ").trim();
+    const t2 = t.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (!t) return null;
+    const patterns = [
+      /max(?:imo|ima)?\s*de\s*pedido/i,
+      /pedido\s*max(?:imo|ima)?/i,
+      /limite\s*de\s*pedido/i,
+      /supera(?:s)?\s+(?:el\s+)?(?:limite|maximo)/i,
+      /cantidad\s*maxima/i,
+      /max(?:imo|ima)?\.?\s*[:=]?\s*\d/i,
+      /max(?:imo|ima)?\s*(?:alcanzado|superado)/i,
+      /\bcuota\b/i,
+      /alcanz(?:ado|o)?\s+(?:el\s+)?(?:maximo|limite)/i,
+    ];
+    if (!patterns.some((r) => r.test(t2))) return null;
+    const m =
+      t2.match(/(?:maximo|max|pedido|limite|cantidad|cuota)[^\d]{0,40}(\d{1,4})/i) ||
+      t2.match(/(\d{1,4})[^\d]{0,12}(?:maximo|pedido|limite|cuota)/i);
+    return { max: m ? parseInt(m[1], 10) : 0, text: t.slice(0, 180) };
+  }
+
+  // v2.0.60: el cartel de "máximo de pedido" del store no siempre está en la
+  // card: puede aparecer en un toast/alert o en el drawer del carrito. Se unen
+  // los textos visibles de esos contenedores para que tokLimitInfo los detecte.
+  function tokCapScan(cardText, storeName) {
+    let s = String(cardText || "") + " " + String(storeName || "");
+    try {
+      const sels = "[role=alert], [class*=toast], [class*=alert], [class*=notif], [class*=snack], [data-id*=alert], [class*=cart-mini], [class*=minicart], [class*=drawer]";
+      for (const el of document.querySelectorAll(sels)) {
+        const tx = String((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim());
+        if (tx && tx.length < 400) s += " | " + tx;
+      }
+    } catch (e) {}
+    return s;
+  }
+
   // Factor de conversión para un tipo de unidad ("bulto"/"display"/"unidad"):
   // (1) botón de esa unidad en la card, (2) texto de la card debajo de los
   // botones (tokCaptFactors), (3) base: el Display es la unidad de venta
@@ -671,7 +792,7 @@
   // cantidad convertida. La card dicta la conversión; el pack del título es la
   // opción B cuando la card no declara nada.
   function tokPickConversion(units, cardText, itemTitle, wantType, wantQty) {
-    const out = { convW: 0, unit: null, q: 0 };
+    const out = { convW: 0, unit: null, q: 0, reason: "" };
     if (!wantType || !(wantQty > 0)) return out;
     // Combo (u otra unidad propia del pedido sin pack): nunca convertir con el
     // pack del título; la card de un combo se carga 1:1 con el botón "agregar".
@@ -686,14 +807,38 @@
     let target = null;
     let targetQ = 0;
     let targetScore = -1;
+    let bestUfForReason = 0;
     for (const u of units || []) {
       const uf = u.factor > 0 ? u.factor : (u.unit === "unidad" ? 1 : tokConvFactor(units, cardText, itemTitle, u.unit));
       if (!(uf > 0)) continue;
       const q = (wantQty * out.convW) / uf;
-      if (!(q >= 1) || q > 999) continue;
+      if (!bestUfForReason || uf < bestUfForReason) bestUfForReason = uf;
+      // v2.0.60: SOLO paquetes ENTEROS. Un pedido en unidades debe completar el
+      // paquete exacto de la card (1 Display de 12 = 12 Unidad; pero 10 Unidad
+      // NO se pueden pedir si el store solo vende por Display de 12). Nunca se
+      // manda una fracción ni un redondeo que cambie la cantidad pedida.
+      if (!(q >= 1) || q > 999 || !Number.isInteger(q)) continue;
       const tier = tierPrefs.indexOf(u.unit);
-      const score = (q === Math.round(q) ? 10 : 0) + (tier >= 0 ? 5 - tier : 0);
+      // La unidad 1:1 (factor 1, ej. "Display = 1 u") es la preferida cuando el
+      // pedido viene en unidades: la cantidad del carrito queda idéntica a la
+      // del pedido, pase lo que pase.
+      const score = (uf === 1 ? 3 : 0) + (tier >= 0 ? 5 - tier : 0);
       if (score > targetScore) { targetScore = score; targetQ = q; target = u; }
+    }
+    if (!target && !bestUfForReason) {
+      out.reason = "la card vende por [" + units.map((u) => u.label).join(", ") + "] sin factores de conversión declarados";
+    } else if (!target && bestUfForReason) {
+      // Por qué no completa: los paquetes de la card no se llenan con lo pedido.
+      const need = wantQty * out.convW;
+      const pkg = bestUfForReason;
+      const falta = need % pkg;
+      if (need < pkg) {
+        out.reason = "pedís " + need + " " + wantType + " y la card arma paquetes de " + pkg + " (el más chico no se llena completo)";
+      } else if (falta > 0) {
+        out.reason = need + " " + wantType + " no completan el paquete de " + pkg + " (faltan " + (pkg - falta) + " " + wantType + " para el siguiente)";
+      } else {
+        out.reason = "no se puede armar con los factores de la card [" + units.map((u) => u.label + ":" + (u.factor || 1)).join(", ") + "] para " + need + " " + wantType;
+      }
     }
     out.unit = target;
     out.q = target && targetQ > 0 ? Math.round(targetQ * 100) / 100 : 0;
@@ -1091,8 +1236,9 @@
     } catch (e) {}
   }
 
-  async function tokCartStart(items, tabId, filename) {
+  async function tokCartStart(items, tabId, filename, opts) {
     cartCancel = false;
+    opts = opts || {};
     const existing = await tokStoreGet(CART_JOB_KEY);
     // v2.0.23: si hay un job pausado (interrupción de internet), reanudarlo
     // en vez de bloquear. El usuario ya tiene los items en el carrito.
@@ -1143,8 +1289,21 @@
       started: Date.now(),
       // Nombre del documento ingestado, para el informe de cierre de la tarea.
       docName: String(filename || ""),
+      // Identidad del bloque dentro del pedido (v2.0.60): batchIdx = índices de
+      // las líneas en el pedido ORIGINAL (para que el reporte por bloque se
+      // pueda alinear aunque el offscreen esté cerrado/recreado), orderTotal =
+      // líneas totales del pedido, lastBatch = es el último bloque.
+      batchIdx: Array.isArray(opts.batchIdx) ? opts.batchIdx.map(Number) : [],
+      orderTotal: opts.orderTotal >= clean.length ? opts.orderTotal : clean.length,
+      lastBatch: !!opts.lastBatch,
     };
     await tokStoreRemove(CART_CANCEL_KEY);
+    // v2.0.60 (rev2): el diagnóstico cubre UN pedido. Al arrancar su PRIMER
+    // bloque (batchIdx arranca en 0) se limpia el log persistido de corridas
+    // anteriores; en el resto de los bloques se va acumulando.
+    if (Array.isArray(opts.batchIdx) && opts.batchIdx.length && opts.batchIdx[0] === 0) {
+      tokDiagClear();
+    }
     await tokStoreSet(CART_JOB_KEY, job);
     tokStartChain();
     tokToastSet("Preparando carrito (0/" + job.total + ")", "");
@@ -1214,11 +1373,11 @@
               // El prefijo "no se encontró" lo cuenta el desglose del informe.
               : "no se encontró: código «" + String(it.sku).trim() + "» ilegible por nombre en el store";
           }
-          job.results.push({
+          job.results[job.index] = {
             producto: it.producto || it.sku || "",
             ok: false,
             message: msg,
-          });
+          };
           return tokAdvance(job, false);
         }
         const query = queries[job.qIdx];
@@ -1345,7 +1504,7 @@
       const target = String(it.producto || it.sku || "").trim();
       if (!target) {
         r.message = "sin nombre de producto";
-        job.results.push(r);
+        job.results[job.index] = r;
         return tokAdvance(job, false);
       }
       const wantUnit = tokUnitLabel(it);
@@ -1361,12 +1520,48 @@
       const wantKey = String(it.sku || "").replace(/\D+/g, "") + "|" + tokNorm(wantUnit);
       const wantQty = (job.productTotals || {})[wantKey] || 0;
 
+      // v2.0.60: diagnóstico — registrar cada ítem tal como lo entiende el job
+      // (para saber si "no lee ítems" es un problema de parseo o de match).
+      if (!tokDiagBatchShown) {
+        tokDiagBatchShown = true;
+        tokDiagPush("batch", { msg: "lote recibido con " + job.items.length + " líneas (productTotals=" + Object.keys(job.productTotals || {}).length + ") · job.index=" + job.index + " (resume=" + (job.index > 0) + ")" });
+      }
+      tokDiagPush("item", {
+        idx: job.index,
+        nro: it.nro,
+        msg: "item=" + (it.producto || "") + " · cant=" + String(it.cantidad || "") + " · colUnidad=" + String(it.categoria || it.unidad || "") + " · sku=" + String(it.sku || "") + " · wantType=" + wantType + "/" + wantUnit + " · wantQty=" + wantQty + " · byName=" + byName
+      });
+
+      // v2.0.61: guarda anti-pisado. Cada línea reclama su card (ARC) en
+      // job.claimed (persiste con el job entre páginas del bloque). Si OTRA
+      // línea con un código de sku DISTINTO (sea por nombre o código) llega a
+      // una card ya reclamada, NO se acepta: es un falso positivo que pisaría
+      // la qty de la línea original (ej. "AGUILA MEDALLON MENTA" cayendo en la
+      // card ARC-1011601 de "AGUILA BARRITA AMARGA 14G" y re-setearla a 1 Bulto
+      // después de haberse cargado 4 Display). Los SKU duplicados legítimos
+      // (misma cifra / error del proveedor) comparten card y siguen permitidos
+      // (claimedBy === skuD).
+      function tokCardClaimed(job, cand, it) {
+        try {
+          const arc = tokArcCode((cand.el && cand.el.innerText) || "");
+          if (!arc) return "";
+          const skuD = String(it.sku || "").replace(/\D+/g, "");
+          if (skuD.length < 4) return "";
+          const claimedBy = (job.claimed || {})[arc];
+          if (!claimedBy || claimedBy === skuD) return "";
+          return claimedBy;
+        } catch (e) {
+          return "";
+        }
+      }
+
       const cand = await waitForTokin(
         () => tokBestArticle(target, wantType, wantedGrams, it.sku, byName),
         20000,
         350
       );
       if (!cand || !tokAccept(cand)) {
+        tokDiagPush("match", { idx: job.index, nro: it.nro, msg: "SIN CARD para query qIdx=" + job.qIdx + " («" + String((queries && queries[job.qIdx]) || "").slice(0, 60) + "»)" });
         // v2.0.29: la PRIMERA query es la del código. Si la SPA tardó en
         // renderizar las cards (carrito grande) esa query pudo fallar sin ser
         // real: se reintenta UNA vez la misma query de código antes de caer a
@@ -1384,8 +1579,33 @@
         await tokStoreSet(CART_JOB_KEY, job);
         return tokRunJob();
       }
+      // v2.0.61: si la card (aceptada) ya fue reclamada por otra línea
+      // con otro sku, rechazar el match: no pisar la qty ya cargada.
+      const claimedBy = tokCardClaimed(job, cand, it);
+      if (claimedBy) {
+        tokDiagPush("match", {
+          idx: job.index,
+          nro: it.nro,
+          msg: "card " + (tokArcCode(cand.el.innerText || "") || "?") + " YA reclamada por sku " + claimedBy + " (línea " + String(it.sku || "") + ") — no se pisa: se descarta para esta línea"
+        });
+        job.qIdx++;
+        job.phase = "pending";
+        await tokStoreSet(CART_JOB_KEY, job);
+        return tokRunJob();
+      }
+      const snap = tokDiagCard(cand.el);
+      tokDiagPush("match", {
+        idx: job.index,
+        nro: it.nro,
+        msg: "card elegida · ARC=" + (tokArcCode(cand.el.innerText || "") || "?") + " · shared=" + cand.shared + " · score=" + Math.round((cand.score || 0) * 100) + " · noStock=" + cand.isNoStock + " · botones=[" + snap.btns.join(" | ") + "]"
+      });
       const out = await tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName);
       Object.assign(r, out);
+      tokDiagPush("out", {
+        idx: job.index,
+        nro: it.nro,
+        msg: "→ " + String(r.message || "") + " · ok=" + r.ok + " · added=" + r.added + " · usedUnit=" + r.usedUnit + " · convFactor=" + r.convFactor
+      });
       const storeText = cand.el.innerText || "";
       r.storeText = storeText;
       // Código ARC-XXXX de la card del store elegida (v2.0.10): la verificación
@@ -1395,6 +1615,29 @@
       // remonta las cards), se RE-aplica la qty DIRECTAMENTE en la card del
       // carrito (por su código) y en la card del store, y se vuelve a verificar.
       const code = tokArcCode(storeText);
+      // v2.0.62: reclamar la card en CUANTO la qty quedó asentada (out.added>0),
+      // sin esperar al loop de confirmación. Antes el claim dependía de r.ok, y
+      // si el drawer tardaba en reflejar la qty (confirm -> "no se confirmó"),
+      // nunca se registraba: otra línea con otro sku pasaba la guarda y pisaba
+      // la card (ej. 10798 MEDALLON sobre ARC-1011601 de la BARRITA 11601).
+      // La card queda ocupada por esta línea aún si el confirm es dudoso.
+      try {
+        if ((out.added || 0) > 0) {
+          const arcC = tokArcCode(storeText);
+          if (arcC) {
+            const skuD = String(it.sku || "").replace(/\D+/g, "");
+            if (skuD.length >= 4) {
+              job.claimed = job.claimed || {};
+              job.claimed[arcC] = skuD;
+              tokDiagPush("claim", {
+                idx: job.index,
+                nro: it.nro,
+                msg: "card " + arcC + " reclamada por sku " + skuD + " (added=" + out.added + " · ok=" + out.ok + ")"
+              });
+            }
+          }
+        }
+      } catch (e) {}
       if (r.ok && out.added > 0) {
         // Confirmar por PRODUCTO que la línea realmente se cargó (semántica
         // SET: la card del carrito debe quedar con la qty pedida).
@@ -1451,8 +1694,12 @@
     } catch (e) {
       r.message = "error: " + String((e && e.message) || e).slice(0, 140);
     }
-    job.results.push(r);
-    return tokAdvance(job, r.ok);
+      // v2.0.61: UN resultado por línea (results keyed by index). Las
+      // re-ejecuciones/retries de la misma línea SOBREESCRIBEN su resultado en
+      // vez de duplicarlo (antes, un ítem re-procesado sumaba otra entrada
+      // "agregado" y el informe inflaba añadidas por encima del total de líneas).
+      job.results[job.index] = r;
+      return tokAdvance(job, r.ok);
   }
 
   async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName) {
@@ -1513,6 +1760,10 @@
     // distinta sin convertir.
     const units = tokCardUnits(card);
     out.storeButtons = units.map((u) => u.text).join(" | ");
+    tokDiagPush("units", {
+      nro: it.nro,
+      msg: "botones=[" + units.map((u) => u.label + "=" + u.factor).join(", ") + "] · captFactors=" + JSON.stringify(tokCaptFactors(cardText)) + " · txtCard=" + cardText.slice(0, 330)
+    });
     const wantTypeNorm = wantType || "";
     if (units.length) {
       const want = wantTypeNorm ? units.find((u) => u.unit === wantTypeNorm) : null;
@@ -1527,6 +1778,10 @@
         // ofrece con el factor que la card declara (o el pack del título,
         // opción B, si la card no declara nada).
         const pick = tokPickConversion(units, cardText, it.producto, wantTypeNorm, wantQty);
+        tokDiagPush("conv", {
+          nro: it.nro,
+          msg: "pick wantType=" + wantTypeNorm + "/q=" + wantQty + " convW=" + pick.convW + " → " + (pick.unit ? pick.unit.label + " q=" + pick.q : "NONE") + (pick.reason ? " · " + pick.reason : "")
+        });
         if (pick.unit && pick.q > 0) {
           const qFinal = pick.q;
           if (qFinal > 999) {
@@ -1547,8 +1802,8 @@
           out.ok = false;
           out.message =
             "no se pudo convertir " + wantQty + " " + wantUnit +
-            ": la card ofrece [" + units.map((u) => u.label).join(", ") +
-            "] sin factores compatibles. Corregí la unidad en la tabla.";
+            (pick.reason ? ": " + pick.reason : ": la card ofrece [" + units.map((u) => u.label).join(", ") + "] sin factores compatibles") +
+            ". Corregí la unidad o la cantidad en la tabla.";
           return out;
         } else {
           // opción B: sin factor de conversión, cargar la cantidad que ya viene
@@ -1654,27 +1909,60 @@
 
     if (wantQty > 0) {
       for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, String(wantQty));
-      await toksleep(600);
-      // v2.0.21: si hubo conversión (Display/Bulto → Unidades), verificar que
-      // el store aceptó la cantidad completa. Si el store capó la qty (stock
-      // insuficiente),.reportar el límite en vez de reportar "agregado".
+      await toksleep(650);
+      // v2.0.60: leer SIEMPRE el valor que quedó en la card del store (antes
+      // solo cuando había conversión). El store capa la cantidad cuando el
+      // pedido supera el MÁXIMO de pedido del producto ("máximo de pedido
+      // alcanzado") o el stock. Si el input quedó en menos, se reporta con
+      // honestidad (cargado parcial/tope) y NUNCA se inventa que pasó completo.
       let actualQty = wantQty;
-      if (convertedQty > 0) {
-        for (const el of nums) {
-          if (el.offsetParent !== null) {
-            const v = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
-            if (v > 0 && v < actualQty) actualQty = v;
-          }
+      const origWantQty = wantQty;
+      for (const el of nums) {
+        if (el.offsetParent !== null) {
+          const v = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+          if (v >= 0) actualQty = v;
         }
       }
-      if (convertedQty > 0 && actualQty < wantQty) {
+      if (actualQty === 0) {
+        out.ok = false;
+        out.added = 0;
+        out.usedUnit = usedUnit;
+        const capReject = tokLimitInfo(tokCapScan(cardText, out.storeName));
+        out.message =
+          "no cargado: el store rechazó la cantidad " + origWantQty + " " + usedUnit +
+          (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+          (capReject ? " (" + capReject.text.slice(0, 60) + ")" : "") +
+          " (máximo de pedido alcanzado / sin disponibilidad)";
+        tokDiagPush("cap", { nro: it.nro, msg: "rechazo total: pedido=" + origWantQty + " quedó=0" + (capReject ? " · " + capReject.text.slice(0, 120) : "") + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
+        return out;
+      }
+      const capped = actualQty > 0 && actualQty < wantQty;
+      const limitInfo = capped ? tokLimitInfo(tokCapScan(cardText, out.storeName)) : null;
+      if (capped && limitInfo) {
+        // v2.0.60: la card tiene tope de pedido (cuota). El store no admite más:
+        // se carga el máximo que permite (la cantidad que quedó real) y se anota
+        // el parcial con el motivo exacto, sin simular éxito completo.
+        await toksleep(500);
+        for (const el of nums) if (el.offsetParent !== null) {
+          const v2 = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+          if (v2 >= 0 && v2 < wantQty && v2 > 0) actualQty = v2;
+        }
+        wantQty = actualQty;
+        out.ok = true;
+        out.added = actualQty;
+        out.usedUnit = usedUnit;
+        out.message =
+          "agregado parcial: máximo de pedido alcanzado" +
+          (limitInfo.max ? " (" + limitInfo.max + " de " + origWantQty + ")" : "") +
+          ": el store admite " + actualQty + " " + usedUnit;
+        out.unitNote = qty + " " + wantUnit + " (tope " + actualQty + " " + usedUnit + ")";
+      } else if (capped && convertedQty > 0) {
         const conv = convertedQty / qty;
         const actualRequestedUnits = Math.floor(actualQty / conv);
         // v2.0.55: pedido incompleto = sin stock. Si el store no tiene stock
-        // para completar TODOS los "qty wantUnit" pedidos (ej. faltan 28u para
-        // completar el 3er display/bulto), NO se carga la presentación a medias
-        // ni se intenta completar el paquete: la línea va directo como sin stock
-        // y queda para revisión manual.
+        // para completar TODOS los "qty wantUnit" pedidos, NO se carga la
+        // presentación a medias ni se intenta completar el paquete: la línea va
+        // directo como sin stock y queda para revisión manual.
         out.ok = false;
         out.added = 0;
         out.usedUnit = usedUnit;
@@ -1682,6 +1970,35 @@
           "sin stock: no alcanza para completar " + qty + " " + wantUnit +
           " (" + wantQty + " " + usedUnit + "), el store solo tiene " + actualQty +
           " " + usedUnit + (actualRequestedUnits > 0 ? " (alcanza solo para " + actualRequestedUnits + " " + wantUnit + ")" : "");
+      } else if (capped) {
+        // Sin mensaje de tope explícito y sin conversión: releer una vez más
+        // (el input puede estar tomando el valor) y reportar parcial.
+        await toksleep(500);
+        let second = wantQty;
+        for (const el of nums) if (el.offsetParent !== null) {
+          const v2 = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+          if (v2 >= 0) second = v2;
+        }
+        if (second > 0 && second < wantQty) {
+          actualQty = second;
+          wantQty = second;
+          out.ok = true;
+          out.added = actualQty;
+          out.usedUnit = usedUnit;
+          out.message = "agregado parcial: el store aceptó " + actualQty + " " + usedUnit + " de " + origWantQty + " " + wantUnit + " (posible máximo de pedido o stock)";
+          out.unitNote = qty + " " + wantUnit + " (parcial " + actualQty + " " + usedUnit + ")";
+        } else if (second === 0) {
+          out.ok = false;
+          out.added = 0;
+          out.usedUnit = usedUnit;
+          out.message = "no cargado: el store no aceptó la cantidad " + origWantQty + " " + usedUnit + " (máximo de pedido alcanzado)";
+        } else {
+          actualQty = second === wantQty ? wantQty : actualQty;
+          out.ok = true;
+          out.added = actualQty;
+          out.usedUnit = usedUnit;
+          out.message = "agregado: " + qty + " " + usedUnit;
+        }
       } else {
         out.ok = true;
         out.added = actualQty;
@@ -1694,6 +2011,9 @@
         } else {
           out.message = "agregado: " + qty + " " + usedUnit;
         }
+      }
+      if (capped) {
+        tokDiagPush("cap", { nro: it.nro, msg: "store capó la qty: pedido=" + origWantQty + " quedó=" + actualQty + " · limit=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "sin mensaje de tope") });
       }
     } else {
       out.ok = true;
@@ -1734,6 +2054,7 @@
         }
       }
     }
+    tokDiagPush("set", { nro: it.nro, msg: "qty final=" + wantQty + " (conv=" + convertedQty + ") ok=" + out.ok + " · usedUnit=" + usedUnit + " → " + String(out.message || "").slice(0, 220) });
     return out;
   }
 
@@ -1793,7 +2114,15 @@
         const code = tokArcCode(r.storeText || "");
         // Primero verificar si la card ya tiene la qty correcta (sin re-setear).
         let hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty, code);
-        if (hit && hit.qty >= wantQty) { changed++; continue; }
+        if (hit && hit.qty >= wantQty) {
+          tokDiagPush("verify", {
+            nro: r.nro != null ? r.nro : undefined,
+            msg: String(r.producto || "").slice(0, 40) +
+              " · ARC=" + String(code || "") + " want=" + wantQty + " quedó=" + hit.qty + " " + (r.usedUnit || "").trim() + " · ok sin re-set"
+          });
+          changed++;
+          continue;
+        }
         // Si no, re-setear la cantidad y verificar (máx 3 intentos, 600ms c/u).
         for (let i = 0; i < 3; i++) {
           const cartEls = document.querySelectorAll("article[data-id=cart-product-card]");
@@ -1818,6 +2147,14 @@
           hit = tokCartFindProduct(cards, r.storeText || "", r.usedUnit || "", wantQty, code);
           if (hit && hit.qty >= wantQty) break;
         }
+        // v2.0.60 (rev2): dejar constancia de las re-verificaciones del cierre:
+        // si la card quedó en menos de lo pedido (o en 1), la traza muestra qué
+        // leyó y qué quedó en la card real del carrito.
+        tokDiagPush("verify", {
+          nro: r.nro != null ? r.nro : undefined,
+          msg: String(r.producto || "").slice(0, 40) +
+            " · ARC=" + String(code || "") + " want=" + wantQty + " quedó=" + (hit ? hit.qty : 0) + " " + (r.usedUnit || "").trim() + " · " + String(r.message || "").slice(0, 110)
+        });
         if (hit && hit.qty >= wantQty) {
           changed++;
         } else {
@@ -1962,11 +2299,44 @@
       orderedProducts.add(sd.length >= 4 ? sd : tokNorm(String(it.producto || "").slice(0, 24)));
     }
     const totalProducts = orderedProducts.size || job.total || 0;
+    // v2.0.60: los totales se calculan ANTES del diag "final". Referenciarlos
+    // en la traza antes de declararlos (const en TDZ) lanzaba un
+    // ReferenceError que abortaba el cierre de CADA bloque: sin toast de fin,
+    // sin CART_DONE y sin reporte — la UI quedaba colgada en "Verificando
+    // cantidades en el carrito…" aunque el offscreen estuviera vivo.
     const sinStock = results.filter((x) => !isAdded(x) && /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i.test(x.message || "")).length;
     const notFound = results.filter((x) => !isAdded(x) && /no se encontró/i.test(x.message || "")).length;
     const notConfirmed = results.filter((x) => !isAdded(x) && String(x.message || "").indexOf("no se confirmó") === 0).length;
     const docName = job.docName || "";
+    tokDiagPush("final", { msg: "informe: añadidas=" + added + " total=" + job.total + " prodAdded=" + prodAddedReal + " totalProducts=" + totalProducts + " · carritoReal=" + realCartCount + " · sinStock=" + sinStock + " · noEncontrados=" + notFound + " · noConfirmados=" + notConfirmed });
     const summary = { done: true, ok: added, total: job.total, results, docName, sinStock, notFound, notConfirmed, prodAdded: prodAddedReal, totalProducts };
+    // v2.0.60: reporte del bloque persistido en storage.local por el PROPIO
+    // content script. Si el offscreen está cerrado cuando termina el bloque
+    // (Chrome cierra documentos offscreen por inactividad), el reporte
+    // parcial/final deja de depender de él: el popup (o el offscreen al
+    // recrearse) lo recupera del storage y lo muestra / exporta igual.
+    const report = {
+      savedAt: Date.now(),
+      token: job.token,
+      done: false,
+      docName,
+      results,
+      added,
+      prodAdded: prodAddedReal,
+      totalProducts,
+      sinStock,
+      notFound,
+      notConfirmed,
+      total: job.total,
+      batchTotal: (job.items || []).length,
+      orderTotal: job.orderTotal || job.total,
+      batchIdx: Array.isArray(job.batchIdx) ? job.batchIdx.slice() : [],
+      lastBatch: !!job.lastBatch,
+      batch: { ok: added, total: job.total, sinStock, notFound, notConfirmed },
+    };
+    try {
+      chrome.storage.local.set({ tokinCartReport: report }, () => { void chrome.runtime.lastError; });
+    } catch (e) {}
     try {
       window.__TOKIN_RES__ = summary;
     } catch (e) {}
@@ -2294,6 +2664,18 @@
       case "GET_FIELDS":
         sendResponse({ ok: true, fields: discoverFields() });
         break;
+      case "TOKIN_DIAG":
+        // v2.0.60: el popup baja la trazabilidad en memoria para diagnosticar
+        // ítems que no se pidieron o conversiones mal hechas.
+        {
+          const tally = {};
+          for (const e of tokDiagLog) {
+            const p = e.phase || "?";
+            tally[p] = (tally[p] || 0) + 1;
+          }
+          sendResponse({ ok: true, diag: tokDiagText(), entries: tokDiagLog.length, tally });
+        }
+        break;
       case "FILL_FORM":
         sendResponse({ ok: true, results: fillForm(msg.mapping || []) });
         break;
@@ -2301,7 +2683,7 @@
         sendResponse({ ok: true });
         break;
       case "ADD_TO_CART":
-        tokCartStart(msg.items || [], msg.tabId, msg.filename)
+        tokCartStart(msg.items || [], msg.tabId, msg.filename, { batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch })
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
         break;
@@ -2343,7 +2725,7 @@
         window.postMessage({ __tok: "cart-res", payload: { ok: true, job } }, "*");
         return;
       }
-      const out = await tokCartStart(payload.items || [], null, payload.filename || "");
+      const out = await tokCartStart(payload.items || [], null, payload.filename || "", { batchIdx: payload.batchIdx, orderTotal: payload.orderTotal, lastBatch: payload.lastBatch });
       if (out && !out.ok) {
         window.postMessage({ __tok: "cart-res", payload: out }, "*");
       }

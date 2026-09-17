@@ -123,6 +123,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (!alarm || alarm.name !== "tokin-watchdog") return;
   (async () => {
     if (!(await tokJobRecoverable())) return;
+    // v2.0.60: si hay un lote vivo, asegurar que el offscreen exista. Chrome lo
+    // cierra por inactividad y, sin él, el CART_DONE del bloque se pierde (el
+    // reporte queda huérfano). Recrearlo es barato cuando ya existe.
+    try { await ensureOffscreen(); } catch (e) {}
     const d = await tokStoreGetAsync(CART_RUNNING_TAB_KEY);
     const tabId = d[CART_RUNNING_TAB_KEY];
     if (!tabId) return;
@@ -217,7 +221,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         chrome.storage.local.set({ [CART_RUNNING_TAB_KEY]: store.id }, () => { void chrome.runtime.lastError; });
-        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [], filename: msg.filename || "" }, (res) => {
+        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [], filename: msg.filename || "", batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch }, (res) => {
           if (chrome.runtime.lastError) {
             const errMsg = chrome.runtime.lastError.message || "";
             if (errMsg.indexOf("Receiving end does not exist") !== -1 || errMsg.indexOf("Could not establish connection") !== -1) {

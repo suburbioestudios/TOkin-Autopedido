@@ -82,6 +82,13 @@ function setStatus(status, progress, step) {
   if (progress !== undefined) state.progress = progress;
   if (step) state.step = step;
   state.error = status === "error" ? state.error : "";
+  // v2.0.60: mientras hay trabajo largo (parseo/OCR y carga al carrito,
+  // que pueden tardar minutos SIN mensajes hacia este documento) se mantiene
+  // un oscilador inaudible sonando: un offscreen con reason AUDIO_PLAYBACK se
+  // mantiene vivo mientras reproduzca audio, aunque Chrome lo cierre por
+  // inactividad. En reposo se detiene para no gastar recursos.
+  if (status === "parsing" || status === "loading_cart" || status === "paused") startKeepAlive();
+  else stopKeepAlive();
   persist();
   emitState();
 }
@@ -276,7 +283,14 @@ async function runCart() {
   try {
     // El content script corre un lote resumible por bloque (navega por cada
     // búsqueda) y reporta CART_PROGRESS; al terminar envía CART_DONE.
-    const out = await sendSw({ type: "ADD_TO_CART", items: batch, filename: state.filename || "" });
+    // v2.0.60: junto al bloque se envían batchIdx / orderTotal / lastBatch para
+    // que el content script persista su reporte con la identidad del bloque
+    // (recuperable si este offscreen se cierra a mitad de lote).
+    const lastBatch = state.cartApi.nextOrig >= state.cartApi.orderTotal;
+    const out = await sendSw({
+      type: "ADD_TO_CART", items: batch, filename: state.filename || "",
+      batchIdx, orderTotal: state.cartApi.orderTotal, lastBatch,
+    });
     if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
   } catch (e) {
     if (state.cancellingCart) {
@@ -457,6 +471,38 @@ function playBeep(ok) {
 
 
 
+// v2.0.60: Chrome puede cerrar un offscreen por inactividad incluso con
+// heartbeats cada 20s: un documento offscreen con reason AUDIO_PLAYBACK se
+// mantiene vivo mientras REPRODUZCA audio. Durante el procesamiento (parseo y
+// carga al carrito, que pueden tardar MINUTOS) se deja un oscilador inaudible
+// sonando; en reposo se detiene (el popup también es una actividad válida).
+let keepCtx = null;
+let keepOsc = null;
+function startKeepAlive() {
+  if (keepCtx) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    keepCtx = new Ctx();
+    if (keepCtx.state === "suspended") keepCtx.resume();
+    const osc = keepCtx.createOscillator();
+    const gain = keepCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 60;
+    gain.gain.value = 0.0001;
+    osc.connect(gain);
+    gain.connect(keepCtx.destination);
+    osc.start();
+    keepOsc = osc;
+  } catch (e) {}
+}
+function stopKeepAlive() {
+  try { if (keepOsc) keepOsc.stop(); } catch (e) {}
+  try { if (keepCtx) keepCtx.close(); } catch (e) {}
+  keepOsc = null;
+  keepCtx = null;
+}
+
 // --------------------------------------------------------- mensajes y vida
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -558,6 +604,34 @@ setInterval(() => {
   safeSend({ target: "sw", type: "HEARTBEAT" });
 }, 20000);
 
+// v2.0.60: si Chrome cerró este documento a mitad de un bloque mientras el
+// content script terminaba, el CART_DONE se perdió. El content script persiste
+// su reporte en storage.local (tokinCartReport) al terminar el bloque: al
+// recrear el offscreen, si la sesión restaurada está en loading_cart con un
+// batchIdx que coincide con el del reporte, se aplica el CART_DONE idempotente
+// y la tarea avanza a block_done/done aunque el mensaje original se haya
+// perdido.
+function tryRecoverReport() {
+  chrome.storage.local.get(["tokinCartReport"], function (d) {
+    try {
+      if (state.status !== "loading_cart" && state.status !== "paused") return;
+      var rep = d && d.tokinCartReport;
+      if (!rep || !Array.isArray(rep.results) || !rep.results.length) return;
+      var api = state.cartApi;
+      if (!api || !api.started || !Array.isArray(api.batchIdx)) return;
+      var rb = rep.batchIdx || [];
+      if (rb.length !== api.batchIdx.length) return;
+      for (var i = 0; i < rb.length; i++) {
+        if (Number(rb[i]) !== Number(api.batchIdx[i])) return;
+      }
+      applyCartDone(rep);
+      persist();
+      emitState();
+      try { console.log("[Tokin] reporte de bloque recuperado del storage (" + rep.results.length + " líneas)"); } catch (e) {}
+    } catch (e) {}
+  });
+}
+
 // Al recrear el offscreen (Chrome lo cierra y se vuelve a abrir) se restaura la
 // sesión previa: el formulario queda en el paso donde estaba. Si había un lote
 // en curso (v2.0.27: corriendo O pausado), la sesión vuelve a ese estado para
@@ -583,6 +657,9 @@ function restoreSession() {
             state.cart = s.cart || null;
             state.cartProgress = s.cartProgress || null;
             state.cartApi = s.cartApi || null;
+            // v2.0.60: si este offscreen murió a mitad del bloque y el content
+            // script ya terminó, recuperar el reporte persistido del bloque.
+            if (liveJob) tryRecoverReport();
           } else {
             state.status = "idle";
             state.step = 1;
