@@ -206,7 +206,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
     if (msg.type === "CLEAR_PERSIST") {
+      // v2.0.65: CLEAR es la única puerta de «Terminar»/«Reanudar». Antes solo
+      // limpiaba storage.session: el job (tokinCartJob) y el reporte
+      // (tokinCartReport) quedaban en storage.local, y el watchdog los revivía
+      // al recargar (la "sesión terminada" reaparecía y re-cargaba líneas del
+      // pedido anterior sobre el nuevo). Limpiar todo acá hace imposible esa
+      // resurrección: terminada = terminada.
       chrome.storage.session.remove("tokin_session", () => {
+        try {
+          chrome.storage.local.remove(
+            [CART_JOB_KEY, CART_CANCEL_KEY, CART_RUNNING_TAB_KEY, "tokinCartReport"],
+            () => { void chrome.runtime.lastError; }
+          );
+        } catch (e) {}
         sendResponse({ ok: true });
       });
       return true;

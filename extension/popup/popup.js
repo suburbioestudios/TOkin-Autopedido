@@ -1085,37 +1085,19 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   }
 
   async function reanudar() {
-    // v2.0.49: «Reanudar» en pleno proceso DETIENE la ejecución, vacía el
-    // carrito del store y deja el formulario en cero. Solo retoma la tarea
-    // cuando quedó PAUSADA por falta de señal (phase="paused").
+    // v2.0.65: «Reanudar» = «Terminar»: detiene cualquier ejecución, vacía el
+    // carrito y deja la herramienta en CERO, siempre — sin excepcion de job
+    // "paused": la reanudacion silenciosa de una tarea pausada era la puerta
+    // por la que una sesion vieja volvia a correr y pisaba cantidades/lineas
+    // del pedido nuevo (líneas "que el PDF no pide" y cantidades reaplicadas).
     const res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
     const job = res[JOB_KEY];
     if (job && job.phase && job.phase !== "done") {
       const tab = await getStoreTab();
-      if (job.phase === "paused") {
-        // Tarea pausada por señal: reanudar desde donde quedó.
-        if (!tab || !tab.id) {
-          setStatus("Abrí tokintienda.com.ar/store para reanudar la tarea.", "warn");
-          return;
-        }
-        setStatus("Reanudando la tarea en el store…", "");
-        // Vaciar el carrito del store antes de reanudar para empezar limpio.
-        await sendTab(tab.id, { type: "EMPTY_CART" });
-        const pong = await sendTab(tab.id, { type: "TOKIN_RESUME_NUDGE" });
-        if (!pong || !pong.ok) {
-          // Sin content script (página de error tras el corte de señal):
-          // recargar la pestaña reanuda el lote solo al bootear.
-          try {
-            chrome.tabs.reload(tab.id, {}, () => { void chrome.runtime.lastError; });
-          } catch (e) {}
-        }
-        await syncFromJob();
-        return;
-      }
-      // Lote en pleno proceso (pending/searching): detener la ejecución. El
-      // CANCEL va directo al background (persiste la clave y avisa al content
-      // script; si está navegando, aborta al bootear), se vacía el carrito y se
-      // limpia el formulario.
+      // Lote vivo (pending/searching/paused): detenerlo antes de vaciar el
+      // carrito, asi no vuelve a escribir despues del vaciado. El CLEAR del
+      // offscreen (mas abajo) borra ademas el job y el reporte del storage
+      // local para que nada reviva al recargar.
       setStatus("Deteniendo la carga en curso…", "");
       try { await toSw({ type: "CANCEL_CART" }); } catch (e) {}
       // Esperar a que el lote aborte de verdad (el content script borra el job
@@ -1126,6 +1108,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         const jobd = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
         if (!jobd[JOB_KEY]) break;
       }
+      // CANCEL + CLEAR borran el job apenas el content script/o el offscreen lo
+      // procesen; si en este punto sigue, no confiar en que no escriba de
+      // nuevo y forzar borrado local antes de vaciar el carrito.
       const still = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
       if (tab && tab.id && !still[JOB_KEY]) {
         for (let k = 0; k < 3; k++) {
