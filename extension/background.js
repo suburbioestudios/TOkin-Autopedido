@@ -219,7 +219,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const payload = { [CART_JOB_KEY + "Killed"]: killToken };
           chrome.storage.local.set(payload, () => { void chrome.runtime.lastError; });
           chrome.storage.local.remove(
-            [CART_JOB_KEY, CART_CANCEL_KEY, CART_RUNNING_TAB_KEY, "tokinCartReport"],
+            [CART_JOB_KEY, CART_CANCEL_KEY, CART_RUNNING_TAB_KEY, "tokinCartReport", "tokinCheckout"],
             () => { void chrome.runtime.lastError; }
           );
           // Avisar también a la pestaña en vivo para que deje de escribirlo.
@@ -273,6 +273,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } catch (e) {}
         }
         sendResponse({ ok: true });
+      });
+      return true;
+    }
+    if (msg.type === "CHECKOUT_BATCH") {
+      // v2.0.67: relé al store para confirmar el lote como compra real.
+      chrome.tabs.query({}, (tabs) => {
+        const store = tabs.find(
+          (t) => t.id && t.url && t.url.indexOf("tokintienda.com.ar/store") !== -1
+        );
+        if (!store || !store.id) {
+          sendResponse({ ok: false, message: "Abrí la pestaña del store para confirmar el pedido." });
+          return;
+        }
+        chrome.tabs.sendMessage(store.id, { type: "CHECKOUT_BATCH", lote: msg.lote || 1 }, (res) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ ok: false, message: chrome.runtime.lastError.message || "sin respuesta" });
+          } else {
+            sendResponse({ ok: true, ...(res || {}) });
+          }
+        });
       });
       return true;
     }

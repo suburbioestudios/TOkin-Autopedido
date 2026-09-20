@@ -1334,6 +1334,10 @@
       lastBatch: !!opts.lastBatch,
     };
     await tokStoreRemove(CART_CANCEL_KEY);
+    // v2.0.67: ningún lote nuevo arranca con un estado de checkout viejo
+    // colgado (un «Realizar pedido» pendiente de una sesión anterior podría
+    // confirmar compras a mitad de este lote).
+    await tokStoreRemove("tokinCheckout");
     // v2.0.60 (rev2): el diagnóstico cubre UN pedido. Al arrancar su PRIMER
     // bloque (batchIdx arranca en 0) se limpia el log persistido de corridas
     // anteriores; en el resto de los bloques se va acumulando.
@@ -2743,18 +2747,6 @@
       case "GET_FIELDS":
         sendResponse({ ok: true, fields: discoverFields() });
         break;
-      case "TOKIN_DIAG":
-        // v2.0.60: el popup baja la trazabilidad en memoria para diagnosticar
-        // ítems que no se pidieron o conversiones mal hechas.
-        {
-          const tally = {};
-          for (const e of tokDiagLog) {
-            const p = e.phase || "?";
-            tally[p] = (tally[p] || 0) + 1;
-          }
-          sendResponse({ ok: true, diag: tokDiagText(), entries: tokDiagLog.length, tally });
-        }
-        break;
       case "FILL_FORM":
         sendResponse({ ok: true, results: fillForm(msg.mapping || []) });
         break;
@@ -2794,6 +2786,15 @@
         } catch (e) {}
         sendResponse({ ok: true });
         break;
+      case "CHECKOUT_BATCH":
+        // v2.0.67: confirmación automática del pedido por LOTE. Al terminar un
+        // bloque de 19, el offscreen dispara el checkout: «Revisar pedido» →
+        // «Siguiente» → «Realizar pedido». El flujo es un LOTE ENTERO por el
+        // usuario: pulsa «Enviar a carrito» una sola vez y todo el pedido se
+        // procesa como compras reales lote a lote.
+        tokCheckoutStart(msg.lote || 1);
+        sendResponse({ ok: true });
+        break;
       case "SHOW_PICKER":
         showFilePicker()
           .then((r) => sendResponse({ ok: true, ...r }))
@@ -2823,6 +2824,133 @@
   });
 
   resumeCart();
+
+  // ------------------------------------------------------------- checkout automático (v2.0.67)
+  // Confirma cada lote como compra REAL: «Revisar pedido» → «Siguiente» →
+  // «Realizar pedido», reporta «lote N pedido realizado» y vuelve al store
+  // para que el offscreen dispare el siguiente bloque. El estado vive en
+  // storage.local («tokinCheckout») porque cada clic navega y destruye este
+  // script: al cargar la página siguiente se reanuda en el paso pendiente.
+  const CHECKOUT_KEY = "tokinCheckout";
+  const TOK_CHECKOUT_STEP_TIMEOUT = 12000;
+
+  // Busca un botón/enlace visible cuyo texto matchee la regex (sin acentos).
+  function tokFindBtnByText(re) {
+    const cand = document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]");
+    for (const el of cand) {
+      if (!el.offsetParent && el.tagName !== "INPUT") continue; // oculto
+      const txt = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (!txt) continue;
+      const norm = txt.normalize("NFD").replace(/[̀-ͯ]/g, "");
+      if (re.test(norm)) return el;
+    }
+    return null;
+  }
+
+  async function tokCheckoutDone(ok, note) {
+    tokDiagPush("checkout", { msg: "lote checkout ok=" + ok + (note ? " · " + note : "") });
+    tokToastSet(note || "", ok ? "ok" : "err");
+    try {
+      chrome.runtime.sendMessage(
+        { target: "offscreen", type: "CHECKOUT_DONE", ok: !!ok, message: note || "" },
+        () => { void chrome.runtime.lastError; }
+      );
+    } catch (e) {}
+    try { await tokStoreRemove(CHECKOUT_KEY); } catch (e) {}
+  }
+
+  async function tokCheckoutStep() {
+    let st = await tokStoreGet(CHECKOUT_KEY);
+    if (!st || !st.step) return false;
+    const started = st.started || Date.now();
+    if (Date.now() - started > 12 * 60 * 1000) {
+      await tokCheckoutDone(false, "checkout abandonado: timeout general");
+      return false;
+    }
+    toast(st.step);
+    function toast(s) { try { tokToastSet("Checkout lote " + st.lote + " · paso " + s, ""); } catch (e) {} }
+
+    if (st.step === "revisar") {
+      // Abrir el drawer del carrito por si el botón «Revisar pedido» vive ahí.
+      try {
+        const minicart = document.querySelector("[data-id=navbar-minicart-button]");
+        if (minicart) { minicart.click(); await toksleep(900); }
+      } catch (e) {}
+      const el = await waitForTokin(() => tokFindBtnByText(/revisar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró el botón «Revisar pedido»");
+      st.step = "siguiente";
+      await tokStoreSet(CHECKOUT_KEY, st);
+      el.click();
+      await toksleep(1200);
+      return tokCheckoutStep();
+    }
+    if (st.step === "siguiente") {
+      const el = await waitForTokin(() => tokFindBtnByText(/siguiente|continuar/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró el botón «Siguiente»");
+      st.step = "realizar";
+      await tokStoreSet(CHECKOUT_KEY, st);
+      el.click();
+      await toksleep(1200);
+      return tokCheckoutStep();
+    }
+    if (st.step === "realizar") {
+      const el = await waitForTokin(() => tokFindBtnByText(/realizar\s*pedido|finalizar\s*compra|confirmar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró el botón «Realizar pedido»");
+      st.step = "confirmar";
+      await tokStoreSet(CHECKOUT_KEY, st);
+      el.click();
+      await toksleep(1500);
+      return tokCheckoutStep();
+    }
+    if (st.step === "confirmar") {
+      // Esperar señal de compra concretada: pantalla de éxito (URL o texto) o
+      // carrito vacío. Luego volver al store para el siguiente lote.
+      const okDone = await waitForTokin(() => {
+        const u = location.href.toLowerCase();
+        if (/gracias|confirm|success|exito|order|pedido.*(ok|realizado|confirmado)/i.test(u)) return true;
+        if (tokFindBtnByText(/seguir\s*comprando|volver|ir\s*al\s*inicio|gracias/i)) return true;
+        const okTxt = document.body && /gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test((document.body.innerText || "").normalize("NFD").replace(/[̀-ͯ]/g, ""));
+        return !!okTxt;
+      }, 25000, 500);
+      st.step = "volver";
+      await tokStoreSet(CHECKOUT_KEY, st);
+      try { location.href = location.origin + "/store"; } catch (e) {}
+      await toksleep(1000);
+      if (!okDone) return tokFail("pedido enviado sin confirmación visible");
+      return tokCheckoutStep();
+    }
+    if (st.step === "volver") {
+      // Ya estamos de vuelta en el store (o al menos cargó alguna página).
+      if (location.pathname.indexOf("/store") === 0) {
+        return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado");
+      }
+      // Si siguió navegando fuera del store, forzar retorno.
+      try { location.href = location.origin + "/store"; } catch (e) {}
+      await toksleep(800);
+      return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado (retorno forzado)");
+    }
+    await tokCheckoutDone(false, "checkout en paso desconocido: " + st.step);
+    return false;
+
+    async function tokFail(reason) {
+      // Dejar constancia pero NO clavar el flujo: el offscreen continúa con el
+      // siguiente lote igual (el pedido puede haberse mandado a medias).
+      await tokStoreRemove(CHECKOUT_KEY);
+      return tokCheckoutDone(false, reason);
+    }
+  }
+
+  function tokCheckoutStart(lote) {
+    tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now() })
+      .then(() => tokCheckoutStep());
+  }
+
+  // Al iniciar el content script: si hay un checkout pendiente (p. ej. tras
+  // navegar a «Siguiente»), reanudarlo; tiene prioridad sobre resumeCart porque
+  // durante el checkout NO hay job de carrito.
+  tokStoreGet(CHECKOUT_KEY).then((st) => {
+    if (st && st.step) tokCheckoutStep();
+  });
 
 
 

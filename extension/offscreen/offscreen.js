@@ -366,6 +366,7 @@ function applyCartDone(msg) {
   const batchNotF = batchResults.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
   const batchNotC = batchResults.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
   const allAttempted = api.nextOrig >= api.orderTotal;
+  state.allAttempted = allAttempted;
   state.cart = {
     total: api.orderTotal,
     ok: added,
@@ -390,51 +391,82 @@ function applyCartDone(msg) {
     allLineItems: api.origItems.slice(),
   };
   if (!msg || !msg.canceled) {
-    if (allAttempted) {
-      // Reporte final del pedido ENTERO: la cifra principal sale del carrito
-      // real (prodAdded, cards únicas verificadas), comparable con lo que el
-      // usuario ve en el carrito del store (v2.0.58).
-      const headN = (msg && msg.prodAdded != null) ? msg.prodAdded : added;
-      const headM = state.cart.totalProducts;
-      const parts = [];
-      if (sinStock) parts.push(sinStock + " sin stock");
-      if (notFound) parts.push(notFound + " no encontrados");
-      if (notConfirmed) parts.push(notConfirmed + " pendientes de confirmación");
-      const other = Math.max(0, api.orderTotal - added - sinStock - notFound - notConfirmed);
-      if (other) parts.push(other + " con error");
-      const docNote = state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
-      setStatus(
-        "done",
-        "Pedido cargado en el carrito: " + headN + " de " + headM + " productos." +
-          docNote +
-          (parts.length ? " (" + parts.join(", ") + ")" : "") +
-          (state.line_items.length ? " Quedaron " + state.line_items.length + " líneas para revisar." : ""),
-        4
-      );
-    } else {
-      // Parada entre bloques: reporte parcial preciso y espera al usuario.
-      const parts = [];
-      if (batchSin) parts.push(batchSin + " sin stock");
-      if (batchNotF) parts.push(batchNotF + " no encontrados");
-      if (batchNotC) parts.push(batchNotC + " pendientes de confirmación");
-      const otros = Math.max(0, batchResults.length - batchAdded - batchSin - batchNotF - batchNotC);
-      if (otros) parts.push(otros + " con error");
-      setStatus(
-        "block_done",
-        "Bloque listo: " + batchAdded + " de " + batchResults.length +
-          " líneas en este bloque" + (parts.length ? " (" + parts.join(", ") + ")" : "") +
-          ". Restan " + state.line_items.length + " líneas del pedido. Presioná «Enviar 19 a carrito» para el próximo bloque.",
-        3
-      );
-    }
+    // v2.0.67: después de CADA bloque se confirma la compra de ese lote
+    // (Revisar pedido → Siguiente → Realizar pedido) desde el content script,
+    // y al terminar el último lote, queda todo comprado. El usuario pulsa
+    // «Enviar a carrito» UNA sola vez: el flujo avanza lote a lote solo.
+    const lote = Math.floor(((api.batchIdx || [])[0] || 0) / CART_BLOCK) + 1;
+    state.checkoutLote = lote;
+    setStatus("loading_cart", "Lote " + lote + " cargado al carrito — confirmando el pedido en el store (Revisar pedido → Siguiente → Realizar pedido)…", 3);
+    persist();
+    emitState();
+    sendSw({ type: "CHECKOUT_BATCH", lote }).catch(() => {});
+    // Red de seguridad: si el content script no confirma en ~3 min (página de
+    // checkout caída o botones distintos), continuar igual y no clavar el flujo.
+    clearTimeout(state.checkoutTimer || 0);
+    state.checkoutTimer = setTimeout(() => {
+      if (!state.checkoutLote) return;
+      const loteT = state.checkoutLote;
+      state.checkoutLote = 0;
+      continueAfterCheckout(loteT, "checkout sin confirmación — continuando", true);
+    }, 180000);
+    return;
+  }
+  setStatus("canceled", "Carga del carrito cancelada.", 3);
+}
+
+// v2.0.67: continuar tras el checkout de un lote. Si ya se intentaron todas
+// las líneas, reporte final del pedido entero (compra completada); si restan,
+// dispara el siguiente bloque de 19 sin esperar al usuario (flujo automático
+// de un solo «Enviar a carrito»).
+function continueAfterCheckout(lote, note, degraded) {
+  const api = state.cartApi;
+  clearTimeout(state.checkoutTimer || 0);
+  state.checkoutTimer = 0;
+  if (!api || !api.started) return;
+  const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+  const done = api.results.filter(Boolean);
+  const added = done.filter(isAdded).length;
+  const SIN = /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i;
+  const sinStock = done.filter((r) => !isAdded(r) && SIN.test(r.message || "")).length;
+  const notFound = done.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
+  const notConfirmed = done.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
+  const allAttempted = api.nextOrig >= api.orderTotal;
+  if (allAttempted) {
+    const parts = [];
+    if (sinStock) parts.push(sinStock + " sin stock");
+    if (notFound) parts.push(notFound + " no encontrados");
+    if (notConfirmed) parts.push(notConfirmed + " pendientes de confirmación");
+    const other = Math.max(0, api.orderTotal - added - sinStock - notFound - notConfirmed);
+    if (other) parts.push(other + " con error");
+    const docNote = state.cart && state.cart.docName ? " Documento: " + state.cart.docName + "." : "";
+    setStatus(
+      "done",
+      "Pedido completo: todas las compras realizadas por lote. En el carrito quedaron " + added + " de " + api.orderTotal + " líneas" +
+        docNote + (parts.length ? " (" + parts.join(", ") + ")" : "") +
+        (note ? " · " + note : ""),
+      4
+    );
     playBeep(true);
   } else {
-    setStatus("canceled", "Carga del carrito cancelada.", 3);
+    setStatus(
+      "loading_cart",
+      "lote " + lote + " pedido realizado" + (degraded ? " (sin confirmación visible)" : "") +
+        ". Continuando con el lote " + (lote + 1) + "…",
+      3
+    );
+    playBeep(true);
+    runCart();
   }
+  persist();
+  emitState();
 }
 
 function cancelCart() {
   state.cancellingCart = true;
+  clearTimeout(state.checkoutTimer || 0);
+  state.checkoutTimer = 0;
+  state.checkoutLote = 0;
   setStatus("loading_cart", "Cancelando carga del carrito…", 3);
   sendSw({ type: "CANCEL_CART" });
 }
@@ -586,6 +618,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       emitState();
       sendResponse({ ok: true });
       break;
+    case "CHECKOUT_DONE": {
+      // v2.0.67: el content script terminó el checkout del lote (o falló). Se
+      // continúa con el siguiente bloque o se cierra el pedido completo.
+      const lote = state.checkoutLote || 1;
+      state.checkoutLote = 0;
+      continueAfterCheckout(lote, msg && msg.message ? String(msg.message) : "", !(msg && msg.ok));
+      sendResponse({ ok: true });
+      break;
+    }
     case "CLEAR":
       resetState();
       sendSw({ type: "CLEAR_PERSIST" });

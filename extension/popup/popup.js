@@ -126,18 +126,13 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     showEl("#btn-clear", which === "done" || which === "blocks");
   }
 
-  // v2.0.55: el botón de carrito se llama con la cantidad de líneas que va a
-  // mandar el próximo bloque (paradas de 19). Llega a 19 o menos en la última
-  // tanda.
-  function updateCartBtn(count) {
+  // v2.0.67: el flujo es automático de punta a punta (lotes de 19 + checkout
+  // por lote) y arranca con UNA sola pulsación: el botón siempre dice
+  // "Enviar al carrito", sin importar cuántas líneas queden.
+  function updateCartBtn() {
     const btn = $("#btn-cart");
     if (!btn) return;
-    const rem = typeof count === "number" ? count : (ui.lineItems || []).length;
-    btn.textContent = rem >= 19
-      ? "Enviar 19 a carrito"
-      : rem > 0
-        ? "Enviar " + rem + " a carrito"
-        : "Enviar a carrito";
+    btn.textContent = "Enviar al carrito";
   }
 
   function resetPanels() {
@@ -189,7 +184,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       setAction(ui.lineItems.length ? "cart" : "none");
       updateCartBtn(ui.lineItems.length);
       setStatus(
-        "Pedido reconocido: " + ui.lineItems.length + " líneas. Revisá las filas y tocá «Enviar 19 a carrito».",
+        "Pedido reconocido: " + ui.lineItems.length + " líneas. Revisá las filas y tocá «Enviar al carrito».",
         "ok"
       );
     } else if (st.status === "loading_cart") {
@@ -200,19 +195,20 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       setAction("cancelCart");
       renderCartItems(st.cartProgress, st.cart && (st.cart.batchTotal || st.cart.total));
     } else if (st.status === "block_done") {
-      // Parada del carrito en bloques de 19 (v2.0.55): reporte parcial del
-      // bloque, filas restantes agrupadas y el botón para el próximo bloque.
+      // v2.0.67: estado legado (los lotes avanzan SOLOS con checkout por lote).
+      // Se mantiene el render por compatibilidad si alguna sesión vieja lo
+      // persistió, pero ya no hay botón "siguiente bloque".
       showEl("#items-box", true);
       showEl("#done-summary", true);
       showEl("#cart-results-final", true);
       showEl("#done-hint", false);
       setAction("blocks");
       renderItems();
-      updateCartBtn(ui.lineItems.length);
+      updateCartBtn();
       renderBlockSummary(st);
       renderCartResults(st.cart && st.cart.batchResults, $("#cart-results-final"));
       setStatus(
-        st.progress || "Bloque cargado. Enviá el próximo bloque de 19 líneas.",
+        st.progress || "Bloque cargado — el flujo continúa solo con el siguiente lote.",
         "ok"
       );
     } else if (st.status === "done") {
@@ -1245,89 +1241,6 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     });
   }
 
-  // ------------------------------------------------------------- diagnóstico
-
-  // v2.0.66: baja a un .txt TODO el rastro del flujo: el log de trazabilidad
-  // del content script (fases batch/item/match/units/conv/cap/set/verify) y
-  // una instantánea del storage local (job con sus líneas, token matado,
-  // cancel, reporte) para comparar lo que el carro cargó contra lo que el
-  // reporte dice. Sirve para cazar productos "fantasma" (ej. «IMPULSO 1»).
-  async function descargarDiagnostico() {
-    try {
-      const lines = [];
-      lines.push("=== TOKIN DIAGNÓSTICO ===");
-      lines.push("fecha: " + new Date().toLocaleString("es-AR"));
-      lines.push("");
-
-      // 1) log de trazabilidad del content script de la tienda.
-      const tab = await getStoreTab();
-      let diagTxt = "(sin pestaña de tienda abierta o no respondió)";
-      if (tab && tab.id) {
-        try {
-          const res = await sendTab(tab.id, { type: "TOKIN_DIAG" });
-          if (res && res.ok) {
-            diagTxt = res.diag || "(log vacío)";
-            lines.push("--- tally de fases: " + JSON.stringify(res.tally || {}) + " (" + (res.entries || 0) + " entradas)");
-          }
-        } catch (e) {
-          diagTxt = "(error pidiendo diag: " + String((e && e.message) || e) + ")";
-        }
-      }
-      lines.push("");
-      lines.push("=== TRAZA DEL FLUJO (content script) ===");
-      lines.push(diagTxt);
-
-      // 2) instantánea del storage local: job vivo/muerto + reporte.
-      lines.push("");
-      lines.push("=== STORAGE LOCAL ===");
-      const snap = await new Promise((r) =>
-        chrome.storage.local.get(["tokinCartJob", "tokinCartJobKilled", "tokinCartCancel", "tokinCartReport", "tokinCartRunningTab"], (x) => r(x || {}))
-      );
-      lines.push("killedToken: " + (snap.tokinCartJobKilled || "(none)"));
-      lines.push("cancel: " + (snap.tokinCartCancel === undefined ? "(none)" : JSON.stringify(snap.tokinCartCancel)));
-      lines.push("runningTab: " + JSON.stringify(snap.tokinCartRunningTab || null));
-      const j = snap.tokinCartJob;
-      if (j) {
-        lines.push("job: token=" + j.token + " phase=" + j.phase + " index=" + j.index + "/" + (j.items ? j.items.length : "?") + " file=" + (j.filename || "?") + " tabId=" + j.tabId + " email=" + (j.email || ""));
-        lines.push("job.items (" + (j.items ? j.items.length : 0) + "):");
-        (j.items || []).forEach((it, i) => {
-          lines.push("  [" + i + "] " + JSON.stringify({ nro: it.nro, sku: it.sku, cantidad: it.cantidad, producto: it.producto }));
-        });
-        if (Array.isArray(j.results)) {
-          lines.push("job.results (" + j.results.length + "):");
-          j.results.forEach((r, i) => {
-            if (r) lines.push("  [" + i + "] " + JSON.stringify({ ok: r.ok, added: r.added, usedUnit: r.usedUnit, storeName: r.storeName, message: String(r.message || "").slice(0, 140) }));
-          });
-        }
-      } else {
-        lines.push("job: (none)");
-      }
-      const rep = snap.tokinCartReport;
-      if (rep && Array.isArray(rep.results)) {
-        lines.push("reporte persistido (" + rep.results.length + " líneas):");
-        rep.results.forEach((r, i) => {
-          if (r) lines.push("  [" + i + "] " + JSON.stringify({ producto: r.producto, ok: r.ok, added: r.added, message: String(r.message || "").slice(0, 140) }));
-        });
-      } else {
-        lines.push("reporte persistido: (none)");
-      }
-
-      const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "tokin_diag_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".txt";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        try { URL.revokeObjectURL(a.href); } catch (e) {}
-        a.remove();
-      }, 1500);
-      setStatus("Diagnóstico descargado. Pasame el archivo .txt generado.", "ok");
-    } catch (e) {
-      setStatus("No se pudo generar el diagnóstico: " + String((e && e.message) || e), "err");
-    }
-  }
-
   // ------------------------------------------------------------- bind
 
   function bind() {
@@ -1338,7 +1251,6 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     $("#btn-excel").addEventListener("click", descargarExcel);
     $("#btn-clear").addEventListener("click", terminar);
     $("#btn-reset").addEventListener("click", reanudar);
-    $("#btn-diag").addEventListener("click", descargarDiagnostico);
     $("#items-box").addEventListener("dblclick", (e) => {
       const td = e.target && e.target.closest ? e.target.closest("td[data-field]") : null;
       if (td) startCellEdit(td);
