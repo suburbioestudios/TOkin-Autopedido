@@ -206,20 +206,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
     if (msg.type === "CLEAR_PERSIST") {
-      // v2.0.65: CLEAR es la única puerta de «Terminar»/«Reanudar». Antes solo
-      // limpiaba storage.session: el job (tokinCartJob) y el reporte
-      // (tokinCartReport) quedaban en storage.local, y el watchdog los revivía
-      // al recargar (la "sesión terminada" reaparecía y re-cargaba líneas del
-      // pedido anterior sobre el nuevo). Limpiar todo acá hace imposible esa
-      // resurrección: terminada = terminada.
-      chrome.storage.session.remove("tokin_session", () => {
-        try {
+      // v2.0.66: matar el job por TOKEN, no solo borrarlo. El content script
+      // puede tener el job en memoria y re-escribirlo en storage.local después
+      // del clear (carrera CLEAR vs tokStoreSet), y resumeCart() lo reanudaría
+      // al recargar — era la causa de que volvieran a aparecer líneas viejas
+      // ("IMPULSO" y cia) tras Terminar/Reanudar. Con el token mermo, cualquier
+      // re-escritura del mismo token se ignora y resumeCart lo tira.
+      chrome.storage.local.get([CART_JOB_KEY], (d) => {
+        const job = d ? d[CART_JOB_KEY] : null;
+        const killToken = job && job.token ? String(job.token) : "";
+        const writes = () => {
+          const payload = { [CART_JOB_KEY + "Killed"]: killToken };
+          chrome.storage.local.set(payload, () => { void chrome.runtime.lastError; });
           chrome.storage.local.remove(
             [CART_JOB_KEY, CART_CANCEL_KEY, CART_RUNNING_TAB_KEY, "tokinCartReport"],
             () => { void chrome.runtime.lastError; }
           );
-        } catch (e) {}
-        sendResponse({ ok: true });
+          // Avisar también a la pestaña en vivo para que deje de escribirlo.
+          if (job && job.tabId != null) {
+            try {
+              chrome.tabs.sendMessage(job.tabId, { type: "TOKIN_KILL", token: killToken }, () => { void chrome.runtime.lastError; });
+            } catch (e) {}
+          }
+        };
+        chrome.storage.session.remove("tokin_session", () => {
+          writes();
+          sendResponse({ ok: true });
+        });
       });
       return true;
     }

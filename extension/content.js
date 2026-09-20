@@ -740,12 +740,16 @@
     if (!t) return null;
     const patterns = [
       /max(?:imo|ima)?\s*de\s*pedido/i,
+      /max(?:imo|ima)?\s*de\s*(?:unidades|cantidad)/i,
       /pedido\s*max(?:imo|ima)?/i,
-      /limite\s*de\s*pedido/i,
+      /limite\s*de\s*(?:pedido|unidades)/i,
       /supera(?:s)?\s+(?:el\s+)?(?:limite|maximo)/i,
       /cantidad\s*maxima/i,
       /max(?:imo|ima)?\.?\s*[:=]?\s*\d/i,
       /max(?:imo|ima)?\s*(?:alcanzado|superado)/i,
+      /unidades?\s*alcanzadas?/i,
+      /alcanzado[\s\w]{0,24}(?:maximo|limite)/i,
+      /(?:maximo|limite)[\s\w]{0,24}alcanzado/i,
       /\bcuota\b/i,
       /alcanz(?:ado|o)?\s+(?:el\s+)?(?:maximo|limite)/i,
     ];
@@ -916,6 +920,24 @@
           (p.shared > best.shared || (p.shared === best.shared && p.score > best.score)));
       if (better) {
         best = { el: p.el, btns: p.btns, score: p.score, shared: p.shared, codeMatch: p.codeMatch, isNoStock: p.isNoStock };
+      }
+    }
+    // v2.0.66: en el fallback POR NOMBRE (sin match de código) el match SIEMPRE
+    // se confirma con el código de la card: sin código ARC identificable la
+    // card se rechaza, tenga el score que tenga. Las cards promocionales como
+    // "Chocolates IMPULSO1 C0063" no tienen ARC y se colaban al carrito con
+    // productos que el pedido nunca pidió. Además se exige un piso de
+    // similitud (los matches genuinos rondan 0.55-0.95): las sugerencias
+    // rebuscadas con código pero de score bajo tampoco pasan.
+    if (best && !best.codeMatch && targetCore.length) {
+      const arc = tokArcCode(best.el.innerText || "");
+      if (!arc || best.score < 0.55) {
+        tokDiagPush("reject", {
+          msg: "fallback por nombre rechazado: ARC=" + (arc || "SIN CÓDIGO") +
+            " score=" + Math.round((best.score || 0) * 100) + " shared=" + best.shared +
+            " · card=«" + String((best.el.innerText || "")).replace(/\s+/g, " ").slice(0, 90) + "»"
+        });
+        return null;
       }
     }
     return best;
@@ -1107,6 +1129,14 @@
 
   const CART_JOB_KEY = "tokinCartJob";
   const CART_CANCEL_KEY = "tokinCartCancel";
+  // v2.0.66: token del job que el usuario mató con «Terminar»/«Reanudar».
+  // Borrar el job del storage no basta: este content script puede seguir vivo
+  // con el job en memoria y re-escribirlo en el próximo tokStoreSet, y entonces
+  // resumeCart/watchdog lo reanudarían (era la causa de que reaparecieran
+  // líneas viejas, ej. «IMPULSO», sobre un pedido nuevo). Con el token muerto
+  // registrado, TODA re-escritura de ese token se ignora y resumeCart lo tira.
+  const CART_KILL_KEY = "tokinCartJobKilled";
+  let tokKilledToken = "";
   // v2.0.27: pausa máxima que se auto-reanuda sola (30 min) y umbral de
   // inactividad a partir del cual el watchdog considera muerto el loop del
   // lote (todos los waits del flujo quedan muy por debajo de este valor).
@@ -1126,6 +1156,12 @@
   }
 
   function tokStoreSet(key, value) {
+    // v2.0.66: nunca re-escribir un job cuyo token fue matado (Terminar/Reanudar),
+    // aunque siga vivo en memoria en este content script.
+    if (key === CART_JOB_KEY && value && tokKilledToken && String(value.token) === tokKilledToken) {
+      try { console.log("[Tokin] ignorada re-escritura de job matado (token " + tokKilledToken + ")"); } catch (e) {}
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       try {
         chrome.storage.local.set({ [key]: value }, () => {
@@ -1524,7 +1560,7 @@
       // (para saber si "no lee ítems" es un problema de parseo o de match).
       if (!tokDiagBatchShown) {
         tokDiagBatchShown = true;
-        tokDiagPush("batch", { msg: "lote recibido con " + job.items.length + " líneas (productTotals=" + Object.keys(job.productTotals || {}).length + ") · job.index=" + job.index + " (resume=" + (job.index > 0) + ")" });
+        tokDiagPush("batch", { msg: "lote recibido con " + job.items.length + " líneas (productTotals=" + Object.keys(job.productTotals || {}).length + ") · job.index=" + job.index + " (resume=" + (job.index > 0) + ") · token=" + job.token + " · file=" + (job.filename || "?") });
       }
       tokDiagPush("item", {
         idx: job.index,
@@ -1929,33 +1965,47 @@
         out.usedUnit = usedUnit;
         const capReject = tokLimitInfo(tokCapScan(cardText, out.storeName));
         out.message =
-          "no cargado: el store rechazó la cantidad " + origWantQty + " " + usedUnit +
+          "sin stock: faltante para completar el pedido — el store rechazó la cantidad " + origWantQty + " " + usedUnit +
           (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
           (capReject ? " (" + capReject.text.slice(0, 60) + ")" : "") +
-          " (máximo de pedido alcanzado / sin disponibilidad)";
+          " (máximo de unidades alcanzado / sin disponibilidad)";
         tokDiagPush("cap", { nro: it.nro, msg: "rechazo total: pedido=" + origWantQty + " quedó=0" + (capReject ? " · " + capReject.text.slice(0, 120) : "") + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
         return out;
       }
       const capped = actualQty > 0 && actualQty < wantQty;
       const limitInfo = capped ? tokLimitInfo(tokCapScan(cardText, out.storeName)) : null;
       if (capped && limitInfo) {
-        // v2.0.60: la card tiene tope de pedido (cuota). El store no admite más:
-        // se carga el máximo que permite (la cantidad que quedó real) y se anota
-        // el parcial con el motivo exacto, sin simular éxito completo.
-        await toksleep(500);
-        for (const el of nums) if (el.offsetParent !== null) {
-          const v2 = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
-          if (v2 >= 0 && v2 < wantQty && v2 > 0) actualQty = v2;
-        }
-        wantQty = actualQty;
-        out.ok = true;
-        out.added = actualQty;
+        // v2.0.66: máximo de unidades alcanzado → el producto NO pasa al carro.
+        // Antes se cargaba el parcial (lo que el tope permite) y se reportaba
+        // "agregado parcial": el usuario quiere que quede como FALTANTE DE
+        // STOCK para completar el pedido, sin nada en el carrito. Se pone en 0
+        // la card del producto Y la card del carrito (que es la que persiste
+        // en el servidor), así la línea no queda cargada a la mitad.
+        const code0 = tokArcCode(cardText);
+        try {
+          for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, "0");
+          await toksleep(600);
+          if (code0) {
+            for (const cartEl of document.querySelectorAll("article[data-id=cart-product-card]")) {
+              const sizeEl = cartEl.querySelector("[data-id^=unit-size-ARC-]");
+              const sc = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id") || "") : null;
+              if (sc && (sc === code0 || sc.endsWith(code0) || code0.endsWith(sc))) {
+                const inp = cartEl.querySelector("input[type=number]");
+                if (inp) tokSetValue(inp, "0");
+              }
+            }
+            await toksleep(500);
+          }
+        } catch (e) {}
+        out.ok = false;
+        out.added = 0;
+        wantQty = 0; // evita el re-seteo de la card del carrito más abajo
         out.usedUnit = usedUnit;
         out.message =
-          "agregado parcial: máximo de pedido alcanzado" +
-          (limitInfo.max ? " (" + limitInfo.max + " de " + origWantQty + ")" : "") +
-          ": el store admite " + actualQty + " " + usedUnit;
-        out.unitNote = qty + " " + wantUnit + " (tope " + actualQty + " " + usedUnit + ")";
+          "sin stock: faltante para completar el pedido (máximo de unidades alcanzado" +
+          (limitInfo.max ? ": tope " + limitInfo.max + " < pedido " + origWantQty : "") +
+          " " + usedUnit + (usedUnit === wantUnit ? "" : " = " + qty + " " + wantUnit) + ")";
+        tokDiagPush("cap", { nro: it.nro, msg: "máximo alcanzado → NO CARGADO: pedido=" + origWantQty + " tope=" + (limitInfo.max || "?") + " · se quitó del carrito (qty 0)" });
       } else if (capped && convertedQty > 0) {
         const conv = convertedQty / qty;
         const actualRequestedUnits = Math.floor(actualQty / conv);
@@ -2210,6 +2260,25 @@
             (c) => c.code && (c.code === code3 || c.code.endsWith(code3) || code3.endsWith(c.code)) && c.qty > 0
           );
           if (!card) continue;
+          // v2.0.66: si la línea quedó "sin stock" (el store no alcanzó a
+          // completar el pedido), NADA se pasa al carro: se quita la card
+          // (qty 0, que es lo que persiste en el servidor) y la línea queda
+          // como faltante. Antes esta pasada la "confirmaba" con la qty
+          // parcial que el store había aceptado y el reporte mentía.
+          if (String(r.message || "").indexOf("sin stock") === 0) {
+            for (const cartEl of document.querySelectorAll("article[data-id=cart-product-card]")) {
+              const sizeEl = cartEl.querySelector("[data-id^=unit-size-ARC-]");
+              const sc = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id") || "") : null;
+              if (sc && (sc === code3 || sc.endsWith(code3) || code3.endsWith(sc))) {
+                const inp = cartEl.querySelector("input[type=number]");
+                if (inp) tokSetValue(inp, "0");
+              }
+            }
+            await toksleep(400);
+            tokDiagPush("verify", { msg: String(r.producto || "").slice(0, 40) + " · " + code3 + " · SIN STOCK: quitada del carrito (quedaba " + card.qty + " parcial) — sigue faltante" });
+            changed++;
+            continue;
+          }
           const want3 = r.added || 0;
           r.ok = true;
           r.message =
@@ -2526,16 +2595,26 @@
   async function resumeCart() {
     try {
       const d = await new Promise((res) =>
-        chrome.storage.local.get([CART_JOB_KEY, CART_CANCEL_KEY], (x) => res(x || {}))
+        chrome.storage.local.get([CART_JOB_KEY, CART_CANCEL_KEY, CART_KILL_KEY], (x) => res(x || {}))
       );
       const cancel = d[CART_CANCEL_KEY];
       const job = d[CART_JOB_KEY];
+      tokKilledToken = tokKilledToken || (d[CART_KILL_KEY] ? String(d[CART_KILL_KEY]) : "");
       if (!job) return;
+      // v2.0.66: job matado por «Terminar»/«Reanudar» que alguien re-escribió
+      // antes de morir: eliminarlo y NO reanudar.
+      if (job.token && tokKilledToken && String(job.token) === tokKilledToken) {
+        try { console.log("[Tokin] resumeCart: job matado ignorado (token " + tokKilledToken + ")"); } catch (e) {}
+        return tokStoreRemove(CART_JOB_KEY);
+      }
       if (cancel) return tokAbortCart(job, cancel === "stop");
       const email = getSessionInfo().email;
       const lostSession = (job.email && (!email || email !== job.email));
       const stale = lostSession || (job.started && Date.now() - job.started > 60 * 60 * 1000);
       if (stale) return tokAbortCart(job, true);
+      // v2.0.66: registrar cada reanudación real para detectar reanudaciones
+      // fantasma (líneas "que el pedido no pide" apareciendo de nuevo).
+      tokDiagPush("resume", { msg: "reanudando job token=" + job.token + " phase=" + job.phase + " index=" + job.index + " file=" + (job.filename || "?") + " url=" + location.href.slice(0, 80) });
       if (job.tabId) {
         const me = await tokGetTabId();
         if (!me || me !== job.tabId) return tokAbortCart(job, true);
@@ -2686,6 +2765,15 @@
         tokCartStart(msg.items || [], msg.tabId, msg.filename, { batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch })
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
+        break;
+      case "TOKIN_KILL":
+        // v2.0.66: el background mató este job (Terminar/Reanudar). Marcar el
+        // token para que NADA más de este job se vuelva a escribir, y soltar
+        // cualquier lote en vuelo.
+        tokKilledToken = msg.token ? String(msg.token) : "";
+        cartCancel = true;
+        try { console.log("[Tokin] TOKIN_KILL token=" + tokKilledToken); } catch (e) {}
+        sendResponse({ ok: true });
         break;
       case "CANCEL_CART":
         cartCancel = true;
