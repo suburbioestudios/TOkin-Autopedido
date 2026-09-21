@@ -200,6 +200,10 @@ async function runParse(filename, data) {
 function cartItems() {
   return (state.line_items || [])
     .map((it) => ({
+      // v2.0.69: preservar el nro de ingesta también en el job del carrito,
+      // así la vista del popup (y su encabezado «Bloque N — líneas X a Y»)
+      // sigue al bloque real aunque se reconstruya desde el job persistido.
+      nro: it.nro,
       producto: it.producto || "",
       cantidad: it.cantidad || "",
       unidad: it.unidad || "",
@@ -225,7 +229,9 @@ async function runCart() {
     }
     state.cartApi = {
       started: true,
-      origItems: view.map((it) => Object.assign({}, it)),
+      // v2.0.69: el nro de INGESTA sale siempre (original + 1): sin él el popup
+      // no sabe qué lote está en proceso y títula todo como «Bloque 1».
+      origItems: view.map((it, i) => Object.assign({}, it, { nro: i + 1 })),
       idxOfView: view.map((_, i) => i),
       results: [],
       nextOrig: 0,
@@ -262,6 +268,10 @@ async function runCart() {
   }
   const batchIdx = [];
   for (let i = 0; i < batch.length; i++) batchIdx.push(state.cartApi.nextOrig + i);
+  // v2.0.69: inicio absoluto del bloque en el pedido (para que el popup titule
+  // el lote en curso como "Bloque N — líneas X a Y" sin adivinarlo de la
+  // lista restante, que siempre arranca en 1).
+  const batchStartAbs = state.cartApi.nextOrig;
   state.cartApi.nextOrig += batch.length;
   state.cartApi.batchIdx = batchIdx;
   state.cartApi.batchItems = batch;
@@ -270,6 +280,7 @@ async function runCart() {
     ok: 0,
     results: [],
     batchTotal: batch.length,
+    batchStart: batchStartAbs,
     batchResults: [],
     batch: { ok: 0, total: batch.length, sinStock: 0, notFound: 0, notConfirmed: 0 },
     docName: state.filename || "",

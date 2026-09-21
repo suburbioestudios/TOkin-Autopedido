@@ -2834,17 +2834,43 @@
   const CHECKOUT_KEY = "tokinCheckout";
   const TOK_CHECKOUT_STEP_TIMEOUT = 12000;
 
-  // Busca un botón/enlace visible cuyo texto matchee la regex (sin acentos).
+  // Busca un botón/enlace visible cuyo texto matchee la regex y devuelve el
+  // elementos CLICKEABLE (botón/enlace ancestro si el texto vive en un span
+  // interno — el drawer de la tienda es SPA React y mete el label anidado).
+  // Visibilidad por getBoundingClientRect + estilo (NO offsetParent: con
+  // barras fixed/sticky del checkout offsetParent vale null y se los perdía).
   function tokFindBtnByText(re) {
-    const cand = document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]");
+    const cand = document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit], span, div, label");
     for (const el of cand) {
-      if (!el.offsetParent && el.tagName !== "INPUT") continue; // oculto
+      // Solo hojas o contenedores chicos: evita matchear el <body> entero.
+      if (el.children.length > 3) continue;
       const txt = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      if (!txt) continue;
-      const norm = txt.normalize("NFD").replace(/[̀-ͯ]/g, "");
-      if (re.test(norm)) return el;
+      if (!txt || txt.length > 60) continue;
+      const norm = txt.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+      if (!re.test(norm)) continue;
+      // Subir al controllable más cercano (button/a/role=button) si hay.
+      const target = el.closest("button, a, [role=button], input[type=button], input[type=submit]") || el;
+      const r = target.getBoundingClientRect();
+      if (!r || r.width < 10 || r.height < 10) continue;
+      const cs = getComputedStyle(target);
+      if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) === 0) continue;
+      if (target.disabled || target.getAttribute("aria-disabled") === "true") continue;
+      return target;
     }
     return null;
+  }
+
+  // v2.0.69: click "a la React" (algunos listeners cuelgan del pointerdown /
+  // del ancestro y un .click() plano no dispara la navegación).
+  function tokRealClick(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 }));
+      }
+    } catch (e) {}
+    try { el.click(); } catch (e) {}
   }
 
   async function tokCheckoutDone(ok, note) {
@@ -2867,73 +2893,54 @@
       await tokCheckoutDone(false, "checkout abandonado: timeout general");
       return false;
     }
-    toast(st.step);
-    function toast(s) { try { tokToastSet("Checkout lote " + st.lote + " · paso " + s, ""); } catch (e) {} }
+    try { tokToastSet("Checkout lote " + st.lote + " · paso " + st.step, ""); } catch (e) {}
 
     if (st.step === "revisar") {
-      // Abrir el drawer del carrito por si el botón «Revisar pedido» vive ahí.
+      // Abrir el drawer del carrito (ahí vive «Revisar pedido») y clickearlo.
       try {
         const minicart = document.querySelector("[data-id=navbar-minicart-button]");
-        if (minicart) { minicart.click(); await toksleep(900); }
+        if (minicart) { tokRealClick(minicart); await toksleep(900); }
       } catch (e) {}
-      const el = await waitForTokin(() => tokFindBtnByText(/revisar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró el botón «Revisar pedido»");
+      // El botón directo «Revisar pedido» en el drawer, o un enlace/al botón
+      // que vaya a /checkout/cart.
+      const el = await waitForTokin(() => {
+        return tokFindBtnByText(/revisar\s*pedido/i)
+          || document.querySelector('a[href*="/store/checkout/cart"]');
+      }, TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró «Revisar pedido» ni el drawer del carrito");
       st.step = "siguiente";
       await tokStoreSet(CHECKOUT_KEY, st);
-      el.click();
-      // El click navega a /store/checkout/cart; si no navegó, seguir acá.
-      await toksleep(1800);
-      return tokCheckoutStep();
+      tokRealClick(el);
+      st = await tokWaitCheckUrl("siguiente", st, /\/checkout\/cart/);
+      if (!st) return false;
     }
+
     if (st.step === "siguiente") {
-      // v2.0.68: «Siguiente» solo existe en /store/checkout/cart. Si la página
-      // aún no cambió desde «Revisar pedido», esperar a que la URL diga cart.
-      const onCart = () => /\/checkout\/cart/.test(location.pathname);
-      if (!onCart()) {
-        const nav = await waitForTokin(onCart, 10000, 300);
-        if (!nav) {
-          // Reintentar el «Revisar pedido»: el click anterior no navegó.
-          st.step = "revisar";
-          await tokStoreSet(CHECKOUT_KEY, st);
-          return tokCheckoutStep();
-        }
-      }
-      const el = await waitForTokin(() => tokFindBtnByText(/siguiente|continuar/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró el botón «Siguiente» en /checkout/cart");
+      // Página /store/checkout/cart: botón «Siguiente».
+      const el = await waitForTokin(() => tokFindBtnByText(/^(siguiente|continuar)$/i) || tokFindBtnByText(/siguiente|continuar/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró «Siguiente» en /checkout/cart");
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      el.click();
-      await toksleep(1800);
-      return tokCheckoutStep();
+      tokRealClick(el);
+      st = await tokWaitCheckUrl("realizar", st, /\/checkout\/payment/);
+      if (!st) return false;
     }
+
     if (st.step === "realizar") {
-      // v2.0.68: «Realizar pedido» vive en /store/checkout/payment.
-      const onPay = () => /\/checkout\/payment/.test(location.pathname);
-      if (!onPay()) {
-        const nav = await waitForTokin(onPay, 10000, 300);
-        if (!nav) {
-          st.step = "siguiente";
-          await tokStoreSet(CHECKOUT_KEY, st);
-          return tokCheckoutStep();
-        }
-      }
       const el = await waitForTokin(() => tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró el botón «Realizar pedido» en /checkout/payment");
+      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment");
       st.step = "confirmar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      el.click();
+      tokRealClick(el);
       await toksleep(1500);
-      return tokCheckoutStep();
     }
+
     if (st.step === "confirmar") {
-      // Esperar señal de compra concretada: pantalla de éxito (URL o texto) o
-      // carrito vacío. Luego volver al store para el siguiente lote.
       const okDone = await waitForTokin(() => {
         const u = location.href.toLowerCase();
         if (/gracias|confirm|success|exito|order|pedido.*(ok|realizado|confirmado)/i.test(u)) return true;
         if (tokFindBtnByText(/seguir\s*comprando|volver|ir\s*al\s*inicio|gracias/i)) return true;
-        const okTxt = document.body && /gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test((document.body.innerText || "").normalize("NFD").replace(/[̀-ͯ]/g, ""));
-        return !!okTxt;
+        return !!(/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test((document.body.innerText || "").normalize("NFD").replace(/[̀-ͯ]/g, "")));
       }, 25000, 500);
       st.step = "volver";
       await tokStoreSet(CHECKOUT_KEY, st);
@@ -2943,11 +2950,9 @@
       return tokCheckoutStep();
     }
     if (st.step === "volver") {
-      // Ya estamos de vuelta en el store (o al menos cargó alguna página).
       if (location.pathname.indexOf("/store") === 0) {
         return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado");
       }
-      // Si siguió navegando fuera del store, forzar retorno.
       try { location.href = location.origin + "/store"; } catch (e) {}
       await toksleep(800);
       return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado (retorno forzado)");
@@ -2956,11 +2961,24 @@
     return false;
 
     async function tokFail(reason) {
-      // Dejar constancia pero NO clavar el flujo: el offscreen continúa con el
-      // siguiente lote igual (el pedido puede haberse mandado a medias).
       await tokStoreRemove(CHECKOUT_KEY);
       return tokCheckoutDone(false, reason);
     }
+  }
+
+  // Esperar a que la URL actual cumpla el patrón del paso siguiente (el SPA
+  // navega sin recargar el documento muchas veces). Si no llega a navegar
+  // dentro del timeout, reintentar el flujo desde el paso anterior (un segundo
+  // click al botón del paso actual). Devuelve null cuando reintentó (el frame
+  // externo debe cortar acá: la recursión continúa el flujo).
+  async function tokWaitCheckUrl(stepNow, st, urlRe) {
+    const nav = await waitForTokin(() => urlRe.test(location.pathname), 10000, 300);
+    if (nav) return st;
+    // No navegó: un intento más de click por si el primero no quedó.
+    st.step = stepNow === "siguiente" ? "revisar" : "siguiente";
+    await tokStoreSet(CHECKOUT_KEY, st);
+    await tokCheckoutStep();
+    return null;
   }
 
   function tokCheckoutStart(lote) {
