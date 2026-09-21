@@ -393,12 +393,17 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       return;
     }
     let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
-    let lastSep = -1;
+    let lastBlockN = -1;
     rest.forEach((r) => {
-      const blockStart = Math.floor(r.orig / GROUP) * GROUP;
-      if (blockStart !== lastSep) {
-        html += blockRow(list, blockStart, 4);
-        lastSep = blockStart;
+      // v2.0.68: el bloque sale del NRO DE INGESTA (persistente por línea), no
+      // de la posición dentro de la lista restante: esa posición vuelve a 0 en
+      // cada lote y el separador quedaba siempre "Bloque 1 — líneas 1 a 19".
+      const nro = (r.it && r.it.nro) || (r.orig + 1);
+      const blockN = Math.floor((nro - 1) / GROUP) + 1;
+      if (blockN !== lastBlockN) {
+        html += '<tr class="bloque"><td colspan="4">Bloque ' + blockN +
+          " — líneas " + ((blockN - 1) * GROUP + 1) + " a " + (blockN * GROUP) + "</td></tr>";
+        lastBlockN = blockN;
       }
       const unidad = r.it.categoria || r.it.unidad || "";
       html +=

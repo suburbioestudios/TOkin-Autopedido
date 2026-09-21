@@ -2881,21 +2881,44 @@
       st.step = "siguiente";
       await tokStoreSet(CHECKOUT_KEY, st);
       el.click();
-      await toksleep(1200);
+      // El click navega a /store/checkout/cart; si no navegó, seguir acá.
+      await toksleep(1800);
       return tokCheckoutStep();
     }
     if (st.step === "siguiente") {
+      // v2.0.68: «Siguiente» solo existe en /store/checkout/cart. Si la página
+      // aún no cambió desde «Revisar pedido», esperar a que la URL diga cart.
+      const onCart = () => /\/checkout\/cart/.test(location.pathname);
+      if (!onCart()) {
+        const nav = await waitForTokin(onCart, 10000, 300);
+        if (!nav) {
+          // Reintentar el «Revisar pedido»: el click anterior no navegó.
+          st.step = "revisar";
+          await tokStoreSet(CHECKOUT_KEY, st);
+          return tokCheckoutStep();
+        }
+      }
       const el = await waitForTokin(() => tokFindBtnByText(/siguiente|continuar/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró el botón «Siguiente»");
+      if (!el) return tokFail("no se encontró el botón «Siguiente» en /checkout/cart");
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
       el.click();
-      await toksleep(1200);
+      await toksleep(1800);
       return tokCheckoutStep();
     }
     if (st.step === "realizar") {
-      const el = await waitForTokin(() => tokFindBtnByText(/realizar\s*pedido|finalizar\s*compra|confirmar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró el botón «Realizar pedido»");
+      // v2.0.68: «Realizar pedido» vive en /store/checkout/payment.
+      const onPay = () => /\/checkout\/payment/.test(location.pathname);
+      if (!onPay()) {
+        const nav = await waitForTokin(onPay, 10000, 300);
+        if (!nav) {
+          st.step = "siguiente";
+          await tokStoreSet(CHECKOUT_KEY, st);
+          return tokCheckoutStep();
+        }
+      }
+      const el = await waitForTokin(() => tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      if (!el) return tokFail("no se encontró el botón «Realizar pedido» en /checkout/payment");
       st.step = "confirmar";
       await tokStoreSet(CHECKOUT_KEY, st);
       el.click();
