@@ -2914,6 +2914,16 @@
     try { console.log("[Tokin] checkout lote " + st.lote + " · paso=" + st.step + " url=" + location.href); } catch (e) {}
 
     if (st.step === "revisar") {
+      // v2.0.71: el checkout SIEMPRE arranca desde la portada del store. Si el
+      // content script se carga sobre una página vieja de checkout (p. ej. la
+      // pestaña quedó en /store/checkout/cart de la tanda anterior), volver al
+      // inicio primero: el drawer del carrito (donde vive «Revisar pedido»)
+      // solo abre desde ahí.
+      if (location.pathname !== "/store" && location.pathname !== "/store/") {
+        try { location.href = location.origin + "/store"; } catch (e) {}
+        await toksleep(1200);
+        return; // la nueva carga re-ejecuta tokCheckoutStep desde el init
+      }
       // Abrir el drawer del carrito (ahí vive «Revisar pedido») y clickearlo.
       try {
         const minicart = document.querySelector("[data-id=navbar-minicart-button]");
@@ -2992,17 +3002,34 @@
     }
 
     if (st.step === "confirmar") {
-      const okDone = await waitForTokin(() => {
+      // v2.0.71: SÓLO se vuelve al store cuando la compra quedó REALIZADA de
+      // verdad. Señales válidas, la más fuerte según la tienda: el carrito
+      // queda VACÍO ("el carro se vacía solo al enviar el pedido"). Si vuelve
+      // antes, el siguiente lote se apila sobre el carro del lote anterior.
+      let okDone = false;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
         const u = location.href.toLowerCase();
-        if (/gracias|confirm|success|exito|order|pedido.*(ok|realizado|confirmado)/i.test(u)) return true;
-        if (tokFindBtnByText(/seguir\s*comprando|volver|ir\s*al\s*inicio|gracias/i)) return true;
-        return !!(/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test((document.body.innerText || "").normalize("NFD").replace(/[̀-ͯ]/g, "")));
-      }, 25000, 500);
+        if (/gracias|confirm|success|exito|order|thank/i.test(u)) { okDone = true; break; }
+        const bodyTxt = ((document.body && document.body.innerText) || "").normalize("NFD").replace(/[̀-ͯ]/g, "");
+        if (/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test(bodyTxt)) { okDone = true; break; }
+        // Señal de la tienda: carrito vacío (el store lo vacía al confirmar).
+        try {
+          const cards = tokCartCards();
+          if (cards && cards.filter((c) => c.qty > 0).length === 0) { okDone = true; break; }
+        } catch (e) {}
+        await toksleep(700);
+      }
+      if (!okDone) {
+        // No confirmó: quedarse acá, NO volver al store, y reportar fallo.
+        return tokFail("el pedido no se confirmó (el carrito sigue cargado): revisar el checkout del store");
+      }
+      // Esperar que la pantalla de éxito renderice y volver al store.
+      await toksleep(1500);
       st.step = "volver";
       await tokStoreSet(CHECKOUT_KEY, st);
       try { location.href = location.origin + "/store"; } catch (e) {}
-      await toksleep(1000);
-      if (!okDone) return tokFail("pedido enviado sin confirmación visible");
+      await toksleep(1200);
       return tokCheckoutStep();
     }
     if (st.step === "volver") {

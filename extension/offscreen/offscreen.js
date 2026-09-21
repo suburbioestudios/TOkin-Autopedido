@@ -430,11 +430,26 @@ function applyCartDone(msg) {
 // las líneas, reporte final del pedido entero (compra completada); si restan,
 // dispara el siguiente bloque de 19 sin esperar al usuario (flujo automático
 // de un solo «Enviar a carrito»).
-function continueAfterCheckout(lote, note, degraded) {
+function continueAfterCheckout(lote, _note, degraded) {
   const api = state.cartApi;
   clearTimeout(state.checkoutTimer || 0);
   state.checkoutTimer = 0;
   if (!api || !api.started) return;
+  // v2.0.71: si el checkout del lote NO confirmó (el carrito sigue cargado en
+  // el store), NO lanzar el siguiente lote: cargaría líneas encima del lote
+  // sin comprar y arruinaría la compra siguiente. Frenar con error claro.
+  if (degraded) {
+    setStatus(
+      "error",
+      "No se pudo confirmar la compra del lote " + lote + " en el store (el carrito sigue cargado). " +
+        "Revisá la pestaña de tokintienda y confirmá el pedido a mano; después tocá «Terminar».",
+      3
+    );
+    playBeep(false);
+    persist();
+    emitState();
+    return;
+  }
   const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
   const done = api.results.filter(Boolean);
   const added = done.filter(isAdded).length;
@@ -455,15 +470,14 @@ function continueAfterCheckout(lote, note, degraded) {
       "done",
       "Pedido completo: todas las compras realizadas por lote. En el carrito quedaron " + added + " de " + api.orderTotal + " líneas" +
         docNote + (parts.length ? " (" + parts.join(", ") + ")" : "") +
-        (note ? " · " + note : ""),
+        (_note ? " · " + _note : ""),
       4
     );
     playBeep(true);
   } else {
     setStatus(
       "loading_cart",
-      "lote " + lote + " pedido realizado" + (degraded ? " (sin confirmación visible)" : "") +
-        ". Continuando con el lote " + (lote + 1) + "…",
+      "lote " + lote + " pedido realizado" + ". Continuando con el lote " + (lote + 1) + "…",
       3
     );
     playBeep(true);
