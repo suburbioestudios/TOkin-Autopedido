@@ -2835,23 +2835,27 @@
   const TOK_CHECKOUT_STEP_TIMEOUT = 12000;
 
   // Busca un botón/enlace visible cuyo texto matchee la regex y devuelve el
-  // elementos CLICKEABLE (botón/enlace ancestro si el texto vive en un span
+  // elemento CLICKEABLE (botón/enlace ancestro si el texto vive en un span
   // interno — el drawer de la tienda es SPA React y mete el label anidado).
   // Visibilidad por getBoundingClientRect + estilo (NO offsetParent: con
   // barras fixed/sticky del checkout offsetParent vale null y se los perdía).
+  // v2.0.71: también mira aria-label/title/data-id/class con el texto ("next",
+  // "siguiente", "revisar pedido", "realizar pedido") porque la tienda usa
+  // iconos o divs con clase y no siempre texto plano.
   function tokFindBtnByText(re) {
     const cand = document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit], span, div, label");
     for (const el of cand) {
-      // Solo hojas o contenedores chicos: evita matchear el <body> entero.
-      if (el.children.length > 3) continue;
-      const txt = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      if (!txt || txt.length > 60) continue;
-      const norm = txt.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+      if (el.children.length > 4) continue; // evita el <body> entero
+      const txt = (
+        el.innerText || el.value || el.getAttribute("aria-label") ||
+        el.getAttribute("title") || el.getAttribute("data-id") || el.className || ""
+      ).replace(/\s+/g, " ").trim();
+      if (!txt || txt.length > 80) continue;
+      const norm = String(txt).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
       if (!re.test(norm)) continue;
-      // Subir al controllable más cercano (button/a/role=button) si hay.
       const target = el.closest("button, a, [role=button], input[type=button], input[type=submit]") || el;
       const r = target.getBoundingClientRect();
-      if (!r || r.width < 10 || r.height < 10) continue;
+      if (!r || r.width < 6 || r.height < 6) continue;
       const cs = getComputedStyle(target);
       if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) === 0) continue;
       if (target.disabled || target.getAttribute("aria-disabled") === "true") continue;
@@ -2860,17 +2864,30 @@
     return null;
   }
 
-  // v2.0.69: click "a la React" (algunos listeners cuelgan del pointerdown /
-  // del ancestro y un .click() plano no dispara la navegación).
-  function tokRealClick(el) {
+  // Intenta clickear. Algunos botones de la tienda solo responden a
+  // pointer events con coordenadas; otros (React SPA) escuchan click en
+  // ancestros. Ademas, si el botón es un <a> con href, forzar navegación.
+  async function tokRealClick(el) {
+    try {
+      el.scrollIntoView({ block: "center", behavior: "instant" });
+    } catch (e) { try { el.scrollIntoView(true); } catch (e2) {} }
+    await toksleep(120);
     try {
       const r = el.getBoundingClientRect();
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const cx = Math.max(1, r.left + Math.min(r.width / 2, r.width - 2));
+      const cy = Math.max(1, r.top + Math.min(r.height / 2, r.height - 2));
       for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 }));
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, isTrusted: false }));
       }
     } catch (e) {}
     try { el.click(); } catch (e) {}
+    try {
+      const href = el.tagName === "A" ? (el.getAttribute("href") || "") : (el.querySelector("a[href]") && el.querySelector("a[href]").getAttribute("href")) || "";
+      if (href && href.indexOf("javascript:") !== 0 && href !== "#") {
+        const url = new URL(href, location.href);
+        location.href = url.href;
+      }
+    } catch (e) {}
   }
 
   async function tokCheckoutDone(ok, note) {
@@ -2894,6 +2911,7 @@
       return false;
     }
     try { tokToastSet("Checkout lote " + st.lote + " · paso " + st.step, ""); } catch (e) {}
+    try { console.log("[Tokin] checkout lote " + st.lote + " · paso=" + st.step + " url=" + location.href); } catch (e) {}
 
     if (st.step === "revisar") {
       // Abrir el drawer del carrito (ahí vive «Revisar pedido») y clickearlo.
@@ -2916,22 +2934,60 @@
     }
 
     if (st.step === "siguiente") {
-      // Página /store/checkout/cart: botón «Siguiente».
-      const el = await waitForTokin(() => tokFindBtnByText(/^(siguiente|continuar)$/i) || tokFindBtnByText(/siguiente|continuar/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
-      if (!el) return tokFail("no se encontró «Siguiente» en /checkout/cart");
+      // Página /store/checkout/cart: botón «Siguiente». El selector EXACTO del
+      // store es [data-id="next-step-button"] (botón React con texto
+      // «Siguiente», clase disabled:* cuando aún no está habilitado). Se busca
+      // primero por data-id y luego por texto/otros fallbacks.
+      const el = await waitForTokin(() => {
+        const direct = document.querySelector('button[data-id="next-step-button"]:not([disabled]):not([aria-disabled="true"])')
+          || document.querySelector('[data-id="next-step-button"]');
+        if (direct) return direct;
+        return tokFindBtnByText(/siguiente|continuar/i)
+          || document.querySelector("[data-id*=next], [data-id*=siguiente], [class*=next-step], a[href*=\"/checkout/payment\"]");
+      }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
+      if (!el) {
+        try { console.log("[Tokin] checkout siguiente: botón no hallado, ir directo a payment"); } catch (e) {}
+        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
+        st.step = "realizar";
+        await tokStoreSet(CHECKOUT_KEY, st);
+        await toksleep(1000);
+        st = await tokStoreGet(CHECKOUT_KEY);
+        if (!st || !st.step) return false;
+        return tokCheckoutStep();
+      }
+      // Si el botón está disabled, esperar a que se habilite (el checkout lo
+      // activa al terminar de calcular envío/totales) antes de clickear.
+      try {
+        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
+      } catch (e) {}
+      try { console.log("[Tokin] checkout siguiente: click en «" + String((el.innerText || el.getAttribute("data-id") || "")).slice(0, 40) + "» (" + el.tagName + ") disabled=" + !!el.disabled); } catch (e) {}
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      tokRealClick(el);
+      await tokRealClick(el);
       st = await tokWaitCheckUrl("realizar", st, /\/checkout\/payment/);
       if (!st) return false;
     }
 
     if (st.step === "realizar") {
-      const el = await waitForTokin(() => tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido/i), TOK_CHECKOUT_STEP_TIMEOUT, 300);
+      // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
+      // "place-order-button" (botón React, disabled hasta que terminan los
+      // cálculos de envío/pago).
+      const el = await waitForTokin(() => {
+        const direct = document.querySelector('button[data-id="place-order-button"]:not([disabled]):not([aria-disabled="true"])')
+          || document.querySelector('[data-id="place-order-button"]');
+        if (direct) return direct;
+        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido|place.?order/i);
+      }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
       if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment");
+      // Esperar a que quede habilitado antes de clickear (el toggle es por
+      // clase/atributo disabled mientras el store calcula envío).
+      try {
+        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true" && !/disabled-/.test(el.className || ""), 20000, 300);
+      } catch (e) {}
+      try { console.log("[Tokin] checkout realizar: click place-order-button disabled=" + !!el.disabled); } catch (e) {}
       st.step = "confirmar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      tokRealClick(el);
+      await tokRealClick(el);
       await toksleep(1500);
     }
 
