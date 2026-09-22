@@ -2914,31 +2914,37 @@
     try { console.log("[Tokin] checkout lote " + st.lote + " · paso=" + st.step + " url=" + location.href); } catch (e) {}
 
     if (st.step === "revisar") {
-      // v2.0.71: el checkout SIEMPRE arranca desde la portada del store. Si el
-      // content script se carga sobre una página vieja de checkout (p. ej. la
-      // pestaña quedó en /store/checkout/cart de la tanda anterior), volver al
-      // inicio primero: el drawer del carrito (donde vive «Revisar pedido»)
-      // solo abre desde ahí.
-      if (location.pathname !== "/store" && location.pathname !== "/store/") {
+      // v2.0.72: el checkout SIEMPRE arranca desde la portada del store. El
+      // drawer del carrito (donde vive «Revisar Pedido»,
+      // [data-id=go-to-checkout-buton], PROBADO en vivo) solo abre desde una
+      // página /store normal — no desde una ruta de checkout vieja.
+      if (location.pathname.indexOf("/store/checkout") === 0) {
         try { location.href = location.origin + "/store"; } catch (e) {}
         await toksleep(1200);
         return; // la nueva carga re-ejecuta tokCheckoutStep desde el init
       }
-      // Abrir el drawer del carrito (ahí vive «Revisar pedido») y clickearlo.
+      // Abrir el drawer del carrito y clickear «Revisar Pedido» (data-id exacto
+      // verificado con Playwright en la sesión real).
       try {
-        const minicart = document.querySelector("[data-id=navbar-minicart-button]");
-        if (minicart) { tokRealClick(minicart); await toksleep(900); }
+        const minicart = document.querySelector('[data-id=navbar-minicart-button]:not([disabled])')
+          || document.querySelector("[data-id=navbar-minicart-button]");
+        if (minicart) { await tokRealClick(minicart); await toksleep(1200); }
       } catch (e) {}
-      // El botón directo «Revisar pedido» en el drawer, o un enlace/al botón
-      // que vaya a /checkout/cart.
       const el = await waitForTokin(() => {
-        return tokFindBtnByText(/revisar\s*pedido/i)
+        return document.querySelector('[data-id="go-to-checkout-buton"]:not([disabled]):not([aria-disabled="true"])')
+          || document.querySelector('[data-id="go-to-checkout-buton"]')
+          || tokFindBtnByText(/revisar\s*pedido/i)
           || document.querySelector('a[href*="/store/checkout/cart"]');
       }, TOK_CHECKOUT_STEP_TIMEOUT, 300);
       if (!el) return tokFail("no se encontró «Revisar pedido» ni el drawer del carrito");
+      // Si el botón quedó disabled, esperar a que se habilite (el carrito ya se
+      // llenó: el drawer lo habilita solo cuando detecta ítems cargados).
+      try {
+        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
+      } catch (e) {}
       st.step = "siguiente";
       await tokStoreSet(CHECKOUT_KEY, st);
-      tokRealClick(el);
+      await tokRealClick(el);
       st = await tokWaitCheckUrl("siguiente", st, /\/checkout\/cart/);
       if (!st) return false;
     }
