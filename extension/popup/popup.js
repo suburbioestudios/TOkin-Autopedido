@@ -362,10 +362,21 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const added = res.filter(isAdded).length;
     let html =
       '<p class="hint">Agregados al carrito: ' + added + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>";
+    // v2.0.73: el REPORTE FINAL se divide en bloques de 19 líneas (en el orden
+    // de ingesta): cada uno arranca con el separador «Lote N pedido realizado»
+    // para poder ver de un vistazo qué lote se compró completo y qué juntó más
+    // faltantes.
     html += res
-      .map((r) => {
+      .map((r, i) => {
+        const nro = (r && (r.nro != null ? r.nro : (r.itemNro != null ? r.itemNro : null))) || (i + 1);
+        const blockN = Math.floor((nro - 1) / GROUP) + 1;
+        const isFirstOfBlock = (i === 0) ||
+          Math.floor(((res[i - 1] && (res[i - 1].nro != null ? res[i - 1].nro : (res[i - 1].itemNro != null ? res[i - 1].itemNro : i))) - 1) / GROUP) + 1 !== blockN;
         const cls = isAdded(r) ? "ok" : r.ok ? "warn" : "err";
-        return '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
+        const sep = isFirstOfBlock
+          ? '<div class="bloque-sep" style="font-weight:600;padding:6px 0;border-bottom:1px solid #cbd5e1;margin-top:8px">Lote ' + blockN + " pedido realizado</div>"
+          : "";
+        return sep + '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
       })
       .join("");
     box.innerHTML = html;
@@ -375,30 +386,36 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const box = $("#items-box");
     const list = ui.lineItems || [];
     const done = progress && typeof progress.index === "number" ? progress.index : -1;
-    const count = Math.min(done + 1, total || list.length);
+    const cart = ui.cart || {};
+    // v2.0.73: el bloque en proceso se calcula desde batchStart ABSOLUTO que
+    // emite el offscreen (número de ingesta), no del índice del slice visible.
+    const batchStart = typeof cart.batchStart === "number" ? cart.batchStart : 0;
+    const batchSize = cart.batchTotal || total || 0;
+    const curBlock = Math.floor(batchStart / GROUP) + 1;
+    const curFirst = batchStart + 1;
+    const curLast = batchStart + (batchSize || GROUP);
+    const progressInBatch = Math.min(Math.max(done + 1, 0), batchSize || 1);
     if (total || list.length) {
-      setStatus("Cargando carrito (" + count + " de " + (total || list.length) + ")…", "");
+      setStatus("Bloque " + curBlock + " — líneas " + curFirst + " a " + curLast + " · cargando " + progressInBatch + " de " + (batchSize || total || list.length) + "…", "");
     }
-    // v2.0.60: los separadores se calculan sobre las posiciones ORIGINALES del
-    // pedido (list), no sobre el slice "remaining" que se re-filtra con cada
-    // avance, para que el rango de cada lote quede FIJO mientras se carga
-    // ("Bloque 2 — líneas 20 a 38") y no se recalcule como X+19 por lote. La
-    // primera fila que queda emite el separador del lote al que pertenece
-    // (aunque ese lote esté a medias) con su rango completo original.
     const rest = list
       .map((it, i) => ({ it, orig: i }))
       .filter((r) => r.orig > done);
+    // Lotes ya REALIZADOS, acumulados arriba: cada bloque que ya confirmó la
+    // compra queda como una fila «Lote N pedido realizado» en la parte
+    // superior — se lee el pedido completo procesado mientras avanza.
+    let html = "";
+    for (let b = 1; b < curBlock; b++) {
+      html += '<tr class="bloque"><td colspan="4">Lote ' + b + " pedido realizado</td></tr>";
+    }
     if (!rest.length) {
-      box.innerHTML = "";
+      box.innerHTML = html ? "<table><tbody>" + html + "</tbody></table>" : "";
       return;
     }
-    let html = '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
     let lastBlockN = -1;
     rest.forEach((r) => {
-      // v2.0.68: el bloque sale del NRO DE INGESTA (persistente por línea), no
-      // de la posición dentro de la lista restante: esa posición vuelve a 0 en
-      // cada lote y el separador quedaba siempre "Bloque 1 — líneas 1 a 19".
-      const nro = (r.it && r.it.nro) || (r.orig + 1);
+      const nro = (r.it && r.it.nro) || (batchStart + r.orig + 1);
       const blockN = Math.floor((nro - 1) / GROUP) + 1;
       if (blockN !== lastBlockN) {
         html += '<tr class="bloque"><td colspan="4">Bloque ' + blockN +
@@ -408,9 +425,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       const unidad = r.it.categoria || r.it.unidad || "";
       html +=
         "<tr>" +
-        // v2.0.56: número de INGESTA original (la posición se sigue usando solo
-        // para saber qué quedó por procesar).
-        '<td class="mono">' + (r.it.nro || r.orig + 1) + "</td>" +
+        '<td class="mono">' + nro + "</td>" +
         "<td>" + esc(r.it.producto) + "</td>" +
         "<td>" + esc(r.it.cantidad) + "</td>" +
         "<td>" + esc(unidad) + "</td>" +
@@ -1005,6 +1020,11 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         r,
       };
       const estado = estadoDe(r);
+      // v2.0.73: fila separadora de LOTE cuando empieza un bloque nuevo de 19
+      // (por nro de ingesta), reconocible en la planilla como «Lote N».
+      if (row.nro && (row.nro - 1) % GROUP === 0) {
+        generalAoa.push(["LOTE " + (Math.floor((row.nro - 1) / GROUP) + 1), "", "", "", "", "", "— pedido realizado"]);
+      }
       generalAoa.push([
         row.nro,
         String(row.sku || "N/A"),
@@ -1037,8 +1057,14 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         (r.convFactor > 0 ? " | factor conv: " + r.convFactor + " (pedido " + r.usedUnit + ")" : "") +
         (r.storeButtons ? " | botones card: " + r.storeButtons : "");
 
+      const nroPend = recovered ? (r.nro || pendIdx) : (it.nro || pendIdx);
+      // v2.0.73: separador de lote también en la hoja de faltantes/observados.
+      if (nroPend && (nroPend - 1) % GROUP === 0) {
+        pendingAoa.push(["LOTE " + (Math.floor((nroPend - 1) / GROUP) + 1), "", "", "", "", "", "", "", "— pedido realizado"]);
+      }
       pendingAoa.push([
-        recovered ? (r.nro || pendIdx) : (it.nro || pendIdx),
+        nroPend,
+        String(recovered ? (r.sku || "") : (it.sku || "N/A")),
         String(recovered ? (r.sku || "") : (it.sku || "N/A")),
         String(it.producto || ""),
         String(recovered ? (r.qty || "") : (it.cantidad || "1")),
