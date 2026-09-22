@@ -362,10 +362,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const added = res.filter(isAdded).length;
     let html =
       '<p class="hint">Agregados al carrito: ' + added + " de " + res.length + ". Revisá el carrito en el store para confirmar.</p>";
-    // v2.0.73: el REPORTE FINAL se divide en bloques de 19 líneas (en el orden
-    // de ingesta): cada uno arranca con el separador «Lote N pedido realizado»
-    // para poder ver de un vistazo qué lote se compró completo y qué juntó más
-    // faltantes.
+    // v2.0.75: el reporte se divide en bloques con el separador de lote
+    // NÚENEGRITA y con el título que corresponde según si la compra se
+    // confirmó de verdad (lotChecks del offscreen) o no.
+    const checksRep = (ui.sessionState && ui.sessionState.lotChecks) || {};
     html += res
       .map((r, i) => {
         const nro = (r && (r.nro != null ? r.nro : (r.itemNro != null ? r.itemNro : null))) || (i + 1);
@@ -373,8 +373,12 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         const isFirstOfBlock = (i === 0) ||
           Math.floor(((res[i - 1] && (res[i - 1].nro != null ? res[i - 1].nro : (res[i - 1].itemNro != null ? res[i - 1].itemNro : i))) - 1) / GROUP) + 1 !== blockN;
         const cls = isAdded(r) ? "ok" : r.ok ? "warn" : "err";
+        const okConf = checksRep && checksRep[String(blockN)];
+        const sepTitle = okConf
+          ? "LOTE " + blockN + " PEDIDO REALIZADO"
+          : "LOTE " + blockN + " CARGADO EN CARRITO (SIN CONFIRMAR)";
         const sep = isFirstOfBlock
-          ? '<div class="bloque-sep" style="font-weight:600;padding:6px 0;border-bottom:1px solid #cbd5e1;margin-top:8px">Lote ' + blockN + " pedido realizado</div>"
+          ? '<div class="bloque-sep" style="font-weight:800;text-transform:uppercase;padding:8px 0;border-bottom:1px solid #cbd5e1;margin-top:10px">' + sepTitle + "</div>"
           : "";
         return sep + '<div class="cart-row ' + cls + '"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
       })
@@ -401,15 +405,27 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const rest = list
       .map((it, i) => ({ it, orig: i }))
       .filter((r) => r.orig > done);
-    // Lotes ya REALIZADOS, acumulados arriba: cada bloque que ya confirmó la
-    // compra queda como una fila «Lote N pedido realizado» en la parte
-    // superior — se lee el pedido completo procesado mientras avanza.
-    let html = "";
+    // Lotes ya REALIZADOS o no, con el texto correcto (v2.0.75):
+    // «LOTE N PEDIDO REALIZADO» solo si el checkout de ese lote quedó
+    // confirmado de verdad por el offscreen (lotChecks). En negrita y
+    // mayúsculas, acumulados en la parte superior mientras avanza el proceso.
+    const checks = (ui.sessionState && ui.sessionState.lotChecks) || (ui.lotChecks) || {};
+    const lotTitle = (n) => {
+      const checked = checks && checks[String(n)];
+      if (checked) return "LOTE " + n + " PEDIDO REALIZADO";
+      return "LOTE " + n + " CARGADO EN CARRITO (SIN CONFIRMAR)";
+    };
+    // Lotes que ya cerraron su ciclo (anteriores al bloque en curso).
+    let htmlLots = "";
     for (let b = 1; b < curBlock; b++) {
-      html += '<tr class="bloque"><td colspan="4">Lote ' + b + " pedido realizado</td></tr>";
+      const cls = checks && checks[String(b)] ? "ok" : "warn";
+      htmlLots += '<tr class="bloque ' + cls + '" style="font-weight:700;text-transform:uppercase;"><td colspan="4">' + lotTitle(b) + "</td></tr>";
     }
+    // Lotes terminados primero (cada uno su OWN fila de la tabla) y luego la
+    // tabla del bloque en curso con su encabezado.
+    let html = htmlLots ? "<table><tbody>" + htmlLots + "</tbody></table>" : "";
     if (!rest.length) {
-      box.innerHTML = html ? "<table><tbody>" + html + "</tbody></table>" : "";
+      box.innerHTML = html;
       return;
     }
     html += '<table><thead><tr><th>#</th><th>Producto</th><th>Cant.</th><th>Unidad</th></tr></thead><tbody>';
@@ -1020,10 +1036,13 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         r,
       };
       const estado = estadoDe(r);
-      // v2.0.73: fila separadora de LOTE cuando empieza un bloque nuevo de 19
-      // (por nro de ingesta), reconocible en la planilla como «Lote N».
+      // v2.0.75: fila separadora de LOTE con el estado HONESTO: «PEDIDO
+      // REALIZADO» solo si el checkout quedó confirmado; si no, «CARGADO EN
+      // CARRITO (SIN CONFIRMAR)».
+      const checksXls = (ui.sessionState && ui.sessionState.lotChecks) || {};
       if (row.nro && (row.nro - 1) % GROUP === 0) {
-        generalAoa.push(["LOTE " + (Math.floor((row.nro - 1) / GROUP) + 1), "", "", "", "", "", "— pedido realizado"]);
+        const lbl = checksXls[String(Math.floor((row.nro - 1) / GROUP) + 1)] ? "PEDIDO REALIZADO" : "CARGADO EN CARRITO (SIN CONFIRMAR)";
+        generalAoa.push(["LOTE " + (Math.floor((row.nro - 1) / GROUP) + 1), "", "", "", "", "", "— " + lbl]);
       }
       generalAoa.push([
         row.nro,
@@ -1060,7 +1079,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       const nroPend = recovered ? (r.nro || pendIdx) : (it.nro || pendIdx);
       // v2.0.73: separador de lote también en la hoja de faltantes/observados.
       if (nroPend && (nroPend - 1) % GROUP === 0) {
-        pendingAoa.push(["LOTE " + (Math.floor((nroPend - 1) / GROUP) + 1), "", "", "", "", "", "", "", "— pedido realizado"]);
+        pendingAoa.push(["LOTE " + (Math.floor((nroPend - 1) / GROUP) + 1), "", "", "", "", "", "", "", "— " + (checksXls[String(Math.floor((nroPend - 1) / GROUP) + 1)] ? "PEDIDO REALIZADO" : "CARGADO EN CARRITO (SIN CONFIRMAR)")]);
       }
       pendingAoa.push([
         nroPend,

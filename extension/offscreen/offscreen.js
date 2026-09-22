@@ -40,6 +40,10 @@ const state = {
   // CART_DONE matchee resultados contra las líneas correctas aunque el
   // offscreen se haya recreado a mitad de lote.
   cartApi: null,
+  // v2.0.75: lotes cuya COMPRA se confirmó de verdad (checkout completo: el
+  // carrito quedó vacío / pantalla de éxito). Solo esos pueden decir
+  // «pedido realizado» en la UI y en el Excel. Clave = número de lote.
+  lotChecks: {},
 };
 
 function sessionView() {
@@ -54,6 +58,7 @@ function sessionView() {
     cart: state.cart,
     cartProgress: state.cartProgress,
     cartApi: state.cartApi,
+    lotChecks: state.lotChecks,
   };
 }
 
@@ -107,6 +112,7 @@ function resetState() {
   state.cancelRequested = false;
   state.cancellingCart = false;
   state.cartApi = null;
+  state.lotChecks = {};
 }
 
 // Los mensajes de chrome.runtime se serializan como JSON: los binarios deben
@@ -648,6 +654,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // continúa con el siguiente bloque o se cierra el pedido completo.
       const lote = state.checkoutLote || 1;
       state.checkoutLote = 0;
+      // v2.0.75: registrar si la compra de ESTE lote quedó confirmada de verdad
+      state.lotChecks = state.lotChecks || {};
+      state.lotChecks[lote] = !!(msg && msg.ok);
       continueAfterCheckout(lote, msg && msg.message ? String(msg.message) : "", !(msg && msg.ok));
       sendResponse({ ok: true });
       break;
