@@ -979,10 +979,10 @@
     } catch (e) {}
   }
 
-  function tokProgress(message, index, total, ok) {
+  function tokProgress(message, index, total, ok, batchStart) {
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CART_PROGRESS", message: String(message || ""), index, total, ok: !!ok },
+        { target: "offscreen", type: "CART_PROGRESS", message: String(message || ""), index, total, ok: !!ok, batchStart: typeof batchStart === "number" ? batchStart : 0 },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
@@ -2119,7 +2119,10 @@
         String(job.items[job.index].producto || "").slice(0, 30),
       job.index,
       job.total,
-      ok
+      ok,
+      // v2.0.76: el job sabe su lugar en el pedido completo (batchIdx[0]); sin
+      // él el popup no puede titular "Bloque N" — sin esto todo parecía Bloque 1.
+      Array.isArray(job.batchIdx) && job.batchIdx.length ? job.batchIdx[0] : 0
     );
     job.index++;
     job.qIdx = 0;

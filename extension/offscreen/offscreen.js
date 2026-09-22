@@ -609,7 +609,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (state.status === "loading_cart" || msg.message) {
         state.progress = msg.message || state.progress;
         if (typeof msg.index === "number") {
-          state.cartProgress = { index: msg.index, total: msg.total, ok: !!msg.ok };
+          // v2.0.76: batchStart viaja en cada progreso desde el content script;
+          // sin esto el popup solo veía posiciones 0–18 y títulaba siempre
+          // "Bloque 1" durante cualquier lote.
+          state.cartProgress = { index: msg.index, total: msg.total, ok: !!msg.ok, batchStart: typeof msg.batchStart === "number" ? msg.batchStart : 0 };
+          if (typeof msg.batchStart === "number" && state.cart) state.cart.batchStart = msg.batchStart;
         }
         persist();
         emitState();
@@ -657,6 +661,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // v2.0.75: registrar si la compra de ESTE lote quedó confirmada de verdad
       state.lotChecks = state.lotChecks || {};
       state.lotChecks[lote] = !!(msg && msg.ok);
+      // Anotar adentro del reporte persistido (storage.local) para que un
+      // popup que se abre con la sesión muerta igual sepa qué lotes fueron
+      // de verdad confirmados.
+      try {
+        chrome.storage.local.get(["tokinCartReport"], (d) => {
+          const rep = d && d.tokinCartReport;
+          if (rep) {
+            rep.lotChecks = state.lotChecks;
+            chrome.storage.local.set({ tokinCartReport: rep }, () => { void chrome.runtime.lastError; });
+          }
+        });
+      } catch (e) {}
       continueAfterCheckout(lote, msg && msg.message ? String(msg.message) : "", !(msg && msg.ok));
       sendResponse({ ok: true });
       break;
@@ -732,6 +748,7 @@ function restoreSession() {
             state.cart = s.cart || null;
             state.cartProgress = s.cartProgress || null;
             state.cartApi = s.cartApi || null;
+            state.lotChecks = (s && s.lotChecks) || state.lotChecks || {};
             // v2.0.60: si este offscreen murió a mitad del bloque y el content
             // script ya terminó, recuperar el reporte persistido del bloque.
             if (liveJob) tryRecoverReport();
@@ -758,6 +775,7 @@ function restoreSession() {
       state.cart = s.cart || null;
       state.cartProgress = s.cartProgress || null;
       state.cartApi = s.cartApi || null;
+      state.lotChecks = s.lotChecks || {};
       persist();
       emitState();
     } catch (e) {}

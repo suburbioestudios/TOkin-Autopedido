@@ -122,7 +122,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     showEl("#btn-cart", which === "cart" || which === "blocks");
     showEl("#btn-cancel-cart", which === "cancelCart");
     showEl("#btn-open-store", which === "done" || which === "blocks");
-    showEl("#btn-excel", which === "done" || which === "blocks");
+    showEl("#btn-excel", which === "done" || which === "blocks" || which === "error");
     showEl("#btn-clear", which === "done" || which === "blocks");
   }
 
@@ -249,9 +249,23 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       renderCartItems(st.cartProgress, st.cart && st.cart.total);
       setStatus(st.progress || "Tarea pausada — se reanuda sola cuando vuelva la señal.", "warn");
     } else if (st.status === "error") {
+      // v2.0.76: en estado de error el informe y el Excel deben seguir
+      // teniendo salida (el usuario necesita bajar lo que pasó, no quedarse
+      // sin datos porque el flujo falló en algún lote).
+      const c = st.cart || ui.cart || { results: [], total: 0 };
+      const hasData = (c && ((c.results && c.results.length) || (c.allLineItems && c.allLineItems.length)));
       resetPanels();
       setStatus(st.error || st.progress || "Ocurrió un error.", "err");
-      if (st.step === 3 && ui.lineItems.length) {
+      if (hasData) {
+        // Mantener la vista con lo que ya se procesó y el Excel a mano.
+        showEl("#done-summary", true);
+        showEl("#cart-results-final", true);
+        renderDone(st);
+        const act = "error";
+        setAction(act);
+        showEl("#btn-excel", true);
+        showEl("#btn-clear", true);
+      } else if (st.step === 3 && ui.lineItems.length) {
         showEl("#items-box", true);
         setAction("cart");
       }
@@ -393,7 +407,9 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const cart = ui.cart || {};
     // v2.0.73: el bloque en proceso se calcula desde batchStart ABSOLUTO que
     // emite el offscreen (número de ingesta), no del índice del slice visible.
-    const batchStart = typeof cart.batchStart === "number" ? cart.batchStart : 0;
+    const batchStart = (progress && typeof progress.batchStart === "number" && progress.batchStart >= 0)
+      ? progress.batchStart
+      : (typeof cart.batchStart === "number" ? cart.batchStart : 0);
     const batchSize = cart.batchTotal || total || 0;
     const curBlock = Math.floor(batchStart / GROUP) + 1;
     const curFirst = batchStart + 1;
@@ -530,7 +546,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         categoria: it.categoria || "",
         sku: it.sku || "",
       })),
-      cart: { total: job.total || 0, docName: job.docName || "" },
+      cart: { total: job.total || 0, docName: job.docName || "", batchStart: Array.isArray(job.batchIdx) && job.batchIdx.length ? job.batchIdx[0] : 0, batchTotal: job.items ? job.items.length : 0 },
       // Igual semántica que CART_PROGRESS: index = última línea intentada.
       cartProgress: { index: Math.max(0, idx - 1), total: job.total || 0 },
     };
@@ -986,7 +1002,25 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   // Excel de cierre (v2.0.40): 2 hojas:
   // 1) "Reporte General": todos los ítems (#, SKU, Producto, Cant, Unidad, Estado, Diagnóstico).
   // 2) "Faltantes y Observados": ítems no cargados con columnas de detalle adicionales.
-  function descargarExcel() {
+  async function descargarExcel() {
+    // v2.0.76: si el popup perdió la sesión (error / refresh / el offscreen se
+    // cerró) el intento usa el último reporte persistido en storage.local; así
+    // NUNCA se va a "hay que descargar pero no hay datos".
+    if (!(ui.cart && ui.cart.results && ui.cart.results.length)) {
+      try {
+        const saved = await new Promise((r) => chrome.storage.local.get("tokinCartReport", (x) => r(x && x.tokinCartReport)));
+        if (saved && (saved.results && saved.results.length || saved.allLineItems && saved.allLineItems.length || saved.done)) {
+          ui.cart = ui.cart || {};
+          ui.cart.results = saved.results || [];
+          if (!ui.cart.allLineItems && saved.allLineItems) ui.cart.allLineItems = saved.allLineItems;
+          if (!ui.cart.docName && saved.docName) ui.cart.docName = saved.docName;
+          if (ui.cart.prodAdded == null && saved.prodAdded != null) ui.cart.prodAdded = saved.prodAdded;
+          if (ui.cart.totalProducts == null && saved.totalProducts != null) ui.cart.totalProducts = saved.totalProducts;
+          if (!ui.sessionState) ui.sessionState = { lotChecks: saved.lotChecks || {} };
+          else if (saved.lotChecks) ui.sessionState.lotChecks = saved.lotChecks;
+        }
+      } catch (e) {}
+    }
     const allItems = (ui.cart && ui.cart.allLineItems) || ui.lineItems || [];
     const results = ((ui.cart && ui.cart.results) || []).slice();
     const baseName = (ui.cart && ui.cart.docName) || "informe";
