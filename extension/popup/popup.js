@@ -1080,7 +1080,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       }
       generalAoa.push([
         row.nro,
-        String(row.sku || "N/A"),
+        String(row.sku || "—"),
         String(row.producto || ""),
         String(row.cantidad || "1"),
         String(row.unidad || ""),
@@ -1117,14 +1117,14 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       }
       pendingAoa.push([
         nroPend,
-        String(recovered ? (r.sku || "") : (it.sku || "N/A")),
-        String(recovered ? (r.sku || "") : (it.sku || "N/A")),
+        String(recovered ? (r.sku || "") : (it.sku || "—")),
+        String(recovered ? (r.sku || "") : (it.sku || "—")),
         String(it.producto || ""),
         String(recovered ? (r.qty || "") : (it.cantidad || "1")),
         String(unidad || ""),
         estado,
-        String(r.storeName || r.storeText || "N/A"),
-        String(r.usedUnit || unidad || "N/A"),
+        String(r.storeName || r.storeText || "—"),
+        String(r.usedUnit || unidad || "—"),
         String(r.message || "Sin mensaje de respuesta") + diagExtra
       ]);
     });

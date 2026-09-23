@@ -1939,10 +1939,56 @@
         return els.length ? els : null;
       }, 8000, 250);
       if (!nums) {
-        out.ok = true;
-        out.added = wantQty > 0 ? wantQty : 1;
+        // v2.0.77: ya no se reporta "agregado sin poder fijar cantidad" — eso
+        // confiaba a ciegas en el click. Se abre el drawer del carrito y se lee
+        // la qty real de la card (por código ARC). Si coincide con lo pedido,
+        // ok; si no, honesto: no se pudo fijar.
+        const codeChk = tokArcCode(cardText);
+        let cartQty = null;
+        if (codeChk) {
+          try {
+            const drawerBtn = document.querySelector("[data-id=navbar-minicart-button]");
+            if (drawerBtn) { drawerBtn.click(); await toksleep(900); }
+            const cartInp = await waitForTokin(() => {
+              for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+                const sc = tokArcCode(
+                  (el.querySelector("[data-id^=unit-size-ARC-]") || { getAttribute: () => "" }).getAttribute("data-id") || ""
+                );
+                if (sc && (sc === codeChk || sc.endsWith(codeChk) || codeChk.endsWith(sc))) {
+                  const inp = el.querySelector("input[type=number]");
+                  if (inp) return inp;
+                }
+              }
+              return null;
+            }, 6000, 250);
+            if (cartInp) {
+              const v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+              cartQty = isNaN(v) ? null : v;
+            }
+          } catch (e) {}
+          try {
+            const closeBtn = document.querySelector("[data-id=minicart-close-drawer-button]");
+            if (closeBtn) closeBtn.click();
+          } catch (e) {}
+        }
+        const wantChk = wantQty > 0 ? wantQty : 1;
+        if (cartQty != null && cartQty > 0 && cartQty >= wantChk) {
+          out.ok = true;
+          out.added = cartQty;
+          out.usedUnit = usedUnit;
+          out.message = (usedUnit === wantUnit
+            ? "agregado: " + qty + " " + wantUnit
+            : "agregado: " + qty + " " + wantUnit + " (" + cartQty + " " + usedUnit + ")") + " (verificado en el carrito)";
+          return out;
+        }
+        out.ok = false;
+        out.added = 0;
         out.usedUnit = usedUnit;
-        out.message = "agregado sin poder fijar cantidad" + unitNote;
+        out.message =
+          "no cargado: el store no dejó fijar la cantidad " + wantChk + " " + usedUnit +
+          (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+          (cartQty != null ? " (el carrito quedó en " + cartQty + ")" : " (sin card del código en el carrito)");
+        tokDiagPush("nofix", { nro: it.nro, msg: "card sin input ni link al carrito confiable · want=" + wantChk + " " + usedUnit + " cartQty=" + cartQty });
         return out;
       }
     }
@@ -1950,17 +1996,42 @@
     if (wantQty > 0) {
       for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, String(wantQty));
       await toksleep(650);
-      // v2.0.60: leer SIEMPRE el valor que quedó en la card del store (antes
-      // solo cuando había conversión). El store capa la cantidad cuando el
-      // pedido supera el MÁXIMO de pedido del producto ("máximo de pedido
-      // alcanzado") o el stock. Si el input quedó en menos, se reporta con
-      // honestidad (cargado parcial/tope) y NUNCA se inventa que pasó completo.
-      let actualQty = wantQty;
+      // v2.0.77: ANTI-RESET. Después de fijar el valor el SPA del store puede
+      // re-renderizar el input (p. ej. reseteo a 1 tras el add-to-cart) y lo
+      // viejo honraba lo último que se hubiera escrito. Se RELEE con pausas
+      // crecientes y si quedó menos que lo pedido sin mensaje de tope, se
+      // vuelve a intentar una vez más antes de reportar.
+      const tokReadQty = () => {
+        let v = wantQty;
+        for (const el of nums) {
+          if (el.offsetParent !== null) {
+            const n = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+            if (!isNaN(n) && n >= 0) v = n;
+          }
+        }
+        return v;
+      };
+      let actualQty = tokReadQty();
       const origWantQty = wantQty;
-      for (const el of nums) {
-        if (el.offsetParent !== null) {
-          const v = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
-          if (v >= 0) actualQty = v;
+      if (actualQty < wantQty) {
+        // no hay cartel de cap: alternativa fiable (fallback del SPA).
+        let capPeek = null;
+        try { capPeek = tokLimitInfo(tokCapScan(cardText, out.storeName)); } catch (e) {}
+        if (!capPeek) {
+          await toksleep(400);
+          actualQty = tokReadQty();
+          if (actualQty < wantQty) {
+            await toksleep(400);
+            actualQty = tokReadQty();
+          }
+          if (actualQty < wantQty) {
+            // Segundo intento: setear el valor de nuevo sobre el estado fresco.
+            try {
+              for (const el of nums) if (el.offsetParent !== null) tokSetValue(el, String(wantQty));
+            } catch (e) {}
+            await toksleep(600);
+            actualQty = tokReadQty();
+          }
         }
       }
       if (actualQty === 0) {
