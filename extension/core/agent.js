@@ -278,8 +278,13 @@ const OCR_WORKERS = 3;
 // un trazado, sin capa de texto). 3.5 es la escala más precisa (evita errores de
 // transcripción: Tesseract confunde dígitos cercanos a escalas bajas, 3→31,
 // 12→22), así que TODO el OCR corre a 3.5, incluida la detección de orientación.
-const OCR_SCALE = 3.5;
-const OCR_DETECT_SCALE = 3.5;
+// v2.0.78: la escala 4.5 es el nuevo punto de equilibrio. A 3.5 el OCR
+// confundía la letra de la celda de UNIDAD (b/d/a) con ruido de la impresión
+// (la "DI" salía como "UN" en ROSARIO) y, peor, dejaba letras pegadas en la
+// descripción ("GOMITAS"→"COMITAS"); a 4.5 el kernel rescata los trazos finos
+// sin saturar al punto de inventar glifos (por encima de 5.0 ya se deforman).
+const OCR_SCALE = 4.5;
+const OCR_DETECT_SCALE = 4.5;
 const ROT_CANDIDATES = [270, 0, 90];
 
 // Palabras funcionales y claves del documento de pedido. El texto girado produce

@@ -384,6 +384,67 @@
     } catch (e) {}
   }
 
+  // v2.0.78: escribir en un input de React como si fuera tecleo HUMANO (click
+  // centrado, Ctrl+A, dígito a dígito con keydown/beforeinput/input/keyup y
+  // blur). tokSetValue asigna el valor por JS pepe React lo ignora cuando el
+  // componente controla el valor (el input de qty del carrito): visualmente
+  // quedaba el nuevo valor pero el servidor no lo registraba y la compra
+  // quedaba con 1. Este flujo lo fuerza de verdad.
+  async function tokTypeInto(el, value) {
+    try { el.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) {}
+    try { el.focus(); } catch (e) {}
+    try {
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+        el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 }));
+      }
+    } catch (e) {}
+    const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    const setVal = (v) => { if (desc && desc.set) desc.set.call(el, v); else el.value = v; };
+    // Ctrl+A y borrar el contenido antes de escribir el valor nuevo.
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "a", code: "KeyA", ctrlKey: true, bubbles: true }));
+      setVal("");
+      el.dispatchEvent(new InputEvent("beforeinput", { data: null, inputType: "deleteContent", bubbles: true, cancelable: true }));
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: "a", code: "KeyA", ctrlKey: true, bubbles: true }));
+    } catch (e) {}
+    // Teclear cada dígito (el servidor escucha los onInput/change que esto gatilla).
+    const s = String(value);
+    for (const ch of s) {
+      try {
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+        el.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+        setVal(String(el.value || "") + ch);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+      } catch (e) {}
+    }
+    await toksleep(150);
+    try {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+      el.blur();
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) {}
+  }
+
+  // Fijar qty en la card del CARRITO con la confirmación del valor que quedó.
+  async function tokCartSetQty(cartInp, wantQty) {
+    // v2.0.78
+    if (!cartInp) return null;
+    await tokTypeInto(cartInp, wantQty);
+    await toksleep(700);
+    let v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+    if (isNaN(v) || v !== wantQty) {
+      tokSetValue(cartInp, String(wantQty));
+      await toksleep(700);
+      v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+    }
+    return isNaN(v) ? null : v;
+  }
+
   // v2.0.60: DIAGNÓSTICO. Registro en memoria de todas las decisiones de la
   // corrida (cada ítem, la card elegida, sus botones/factores, la conversión,
   // los valores seteados y el resultado). El popup lo baja con "TOKIN_DIAG" y
@@ -1939,56 +2000,85 @@
         return els.length ? els : null;
       }, 8000, 250);
       if (!nums) {
-        // v2.0.77: ya no se reporta "agregado sin poder fijar cantidad" — eso
-        // confiaba a ciegas en el click. Se abre el drawer del carrito y se lee
-        // la qty real de la card (por código ARC). Si coincide con lo pedido,
-        // ok; si no, honesto: no se pudo fijar.
+        // v2.0.77 (rev2): la card no mostró input — en vez de pasar, se resuelve
+        // contra el CARRITO: abrir drawer, localizar la card por ARC y FIJAR la
+        // qty ahí (el store acepta el update de qty desde la card del carrito).
+        // Recién después se reporta el resultado real.
         const codeChk = tokArcCode(cardText);
-        let cartQty = null;
-        if (codeChk) {
-          try {
-            const drawerBtn = document.querySelector("[data-id=navbar-minicart-button]");
-            if (drawerBtn) { drawerBtn.click(); await toksleep(900); }
-            const cartInp = await waitForTokin(() => {
-              for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
-                const sc = tokArcCode(
-                  (el.querySelector("[data-id^=unit-size-ARC-]") || { getAttribute: () => "" }).getAttribute("data-id") || ""
-                );
-                if (sc && (sc === codeChk || sc.endsWith(codeChk) || codeChk.endsWith(sc))) {
-                  const inp = el.querySelector("input[type=number]");
-                  if (inp) return inp;
-                }
+        const wantChk = wantQty > 0 ? wantQty : 1;
+        if (!codeChk) {
+          out.ok = false;
+          out.added = 0;
+          out.usedUnit = usedUnit;
+          out.message = "no cargado: sin input en la card y sin código ARC para identificar la card en el carrito";
+          tokDiagPush("nofix", { nro: it.nro, msg: "sin ARC para encontrar el carrito" });
+          return out;
+        }
+        // Abrir drawer del carrito y esperar a que aparezca la card.
+        let cartInp = null;
+        let itemEl = null;
+        try {
+          const drawerBtn = document.querySelector("[data-id=navbar-minicart-button]");
+          if (drawerBtn) { drawerBtn.click(); await toksleep(900); }
+          const found = await waitForTokin(() => {
+            for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+              const sc = tokArcCode(
+                (el.querySelector("[data-id^=unit-size-ARC-]") || { getAttribute: () => "" }).getAttribute("data-id") || ""
+              );
+              if (sc && (sc === codeChk || sc.endsWith(codeChk) || codeChk.endsWith(sc))) {
+                const inp = el.querySelector("input[type=number]");
+                if (inp) return { el, inp };
               }
-              return null;
-            }, 6000, 250);
-            if (cartInp) {
-              const v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
-              cartQty = isNaN(v) ? null : v;
             }
-          } catch (e) {}
+            return null;
+          }, 6000, 250);
+          if (found) { cartInp = found.inp; itemEl = found.el; }
+        } catch (e) {}
+
+        if (cartInp) {
+          // v2.0.78: fijar la qty con el tipeo React-friendly (servidor confirma).
+          // Antes solo leía y confiaba; si quedaba en 1, reportaba "no se pudo
+          // fijar" — ahora INTENTAMOS fijarla con teclado simulado y se valida.
+          let cur = await tokCartSetQty(cartInp, wantChk);
+          if (cur == null || cur !== wantChk) cur = await tokCartSetQty(cartInp, wantChk);
+          if (!cur || cur < wantChk) {
+            const cartText = (itemEl && itemEl.innerText) || "";
+            let capInfo = null;
+            try { capInfo = tokLimitInfo(tokCapScan(cartText, out.storeName)); } catch (e) {}
+            if (capInfo) {
+              try { tokCartSetQty(cartInp, 0); await toksleep(400); } catch (e) {}
+            }
+            try {
+              const closeBtn = document.querySelector("[data-id=minicart-close-drawer-button]");
+              if (closeBtn) closeBtn.click();
+            } catch (e) {}
+            out.ok = false;
+            out.added = 0;
+            out.usedUnit = usedUnit;
+            out.message = capInfo
+              ? "sin stock: faltante para completar el pedido (máximo de unidades alcanzado: el store no aceptó " + wantChk + " " + usedUnit + (usedUnit === wantUnit ? "" : " = " + qty + " " + wantUnit) + ")"
+              : "no cargado: el store no aceptó la cantidad " + wantChk + " " + usedUnit + (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") + " (quedó en " + (cur == null ? "?" : cur) + ")";
+            tokDiagPush("nofix", { nro: it.nro, msg: "cart-drawer · want=" + wantChk + " " + usedUnit + " quedó=" + cur + " cap=" + !!capInfo });
+            return out;
+          }
           try {
             const closeBtn = document.querySelector("[data-id=minicart-close-drawer-button]");
             if (closeBtn) closeBtn.click();
           } catch (e) {}
-        }
-        const wantChk = wantQty > 0 ? wantQty : 1;
-        if (cartQty != null && cartQty > 0 && cartQty >= wantChk) {
           out.ok = true;
-          out.added = cartQty;
+          out.added = cur;
           out.usedUnit = usedUnit;
           out.message = (usedUnit === wantUnit
             ? "agregado: " + qty + " " + wantUnit
-            : "agregado: " + qty + " " + wantUnit + " (" + cartQty + " " + usedUnit + ")") + " (verificado en el carrito)";
+            : "agregado: " + qty + " " + wantUnit + " (" + cur + " " + usedUnit + ")") + " (verificado en el carrito)";
           return out;
         }
+        // No se pudo abrir la card del carrito.
         out.ok = false;
         out.added = 0;
         out.usedUnit = usedUnit;
-        out.message =
-          "no cargado: el store no dejó fijar la cantidad " + wantChk + " " + usedUnit +
-          (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
-          (cartQty != null ? " (el carrito quedó en " + cartQty + ")" : " (sin card del código en el carrito)");
-        tokDiagPush("nofix", { nro: it.nro, msg: "card sin input ni link al carrito confiable · want=" + wantChk + " " + usedUnit + " cartQty=" + cartQty });
+        out.message = "no cargado: el store no dejó fijar " + wantChk + " " + usedUnit + (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") + " (sin card del código en el carrito)";
+        tokDiagPush("nofix", { nro: it.nro, msg: "sin card en carrito" });
         return out;
       }
     }
@@ -2174,7 +2264,10 @@
             tokSetValue(cartInp, String(wantQty - 1));
             await toksleep(250);
           }
-          tokSetValue(cartInp, String(wantQty));
+          // v2.0.78: el seteo en la card del carrito se hace con tipeo robusto
+          // (tecla por tecla): tokSetValue solo asignaba el value y React del
+          // drawer podía resetearlo sin registrarlo en el servidor.
+          await tokCartSetQty(cartInp, wantQty);
           await toksleep(500);
         }
       }
@@ -2265,7 +2358,8 @@
                   tokSetValue(inp, String(wantQty - 1));
                   await toksleep(200);
                 }
-                tokSetValue(inp, String(wantQty));
+                // v2.0.78: re-seteo del cierre con tipeo React-friendly.
+                await tokCartSetQty(inp, wantQty);
               }
               break;
             }
@@ -2349,7 +2443,8 @@
               const sc = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id") || "") : null;
               if (sc && (sc === code3 || sc.endsWith(code3) || code3.endsWith(sc))) {
                 const inp = cartEl.querySelector("input[type=number]");
-                if (inp) tokSetValue(inp, "0");
+                // v2.0.78: quitar con tipeo robusto (tokBadge directo no persistía 0).
+                if (inp) await tokCartSetQty(inp, 0);
               }
             }
             await toksleep(400);
