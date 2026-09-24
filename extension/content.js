@@ -3099,6 +3099,15 @@
           || document.querySelector("[data-id=navbar-minicart-button]");
         if (minicart) { await tokRealClick(minicart); await toksleep(1200); }
       } catch (e) {}
+      // v2.0.79: snapshot inicial del carrito. Queda grabado en el estado para
+      // distinguir «la confirmación vació el carrito» (éxito real) de «el
+      // carrito ya venía vacío cuando empecé» (falso positivo en el paso de
+      // confirmación).
+      try {
+        const cards0 = tokCartCards();
+        st.hadItems = Array.isArray(cards0) ? cards0.filter((c) => c.qty > 0).length > 0 : true;
+        await tokStoreSet(CHECKOUT_KEY, st);
+      } catch (e) {}
       const el = await waitForTokin(() => {
         return document.querySelector('[data-id="go-to-checkout-buton"]:not([disabled]):not([aria-disabled="true"])')
           || document.querySelector('[data-id="go-to-checkout-buton"]')
@@ -3189,9 +3198,12 @@
         const bodyTxt = ((document.body && document.body.innerText) || "").normalize("NFD").replace(/[̀-ͯ]/g, "");
         if (/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test(bodyTxt)) { okDone = true; break; }
         // Señal de la tienda: carrito vacío (el store lo vacía al confirmar).
+        // v2.0.79: solo cuenta como éxito si el checkout empezó con el carrito
+        // CARGADO (st.hadItems). Si ya venía vacío desde antes, no es prueba
+        // de nada y caería en un segundo checkout-inqusitivo sin haber comprado.
         try {
           const cards = tokCartCards();
-          if (cards && cards.filter((c) => c.qty > 0).length === 0) { okDone = true; break; }
+          if (cards && cards.filter((c) => c.qty > 0).length === 0 && st.hadItems !== false) { okDone = true; break; }
         } catch (e) {}
         await toksleep(700);
       }
@@ -3240,8 +3252,27 @@
   }
 
   function tokCheckoutStart(lote) {
-    tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now() })
-      .then(() => tokCheckoutStep());
+    // v2.0.79: GUARDIA CONTRA CHECKOUT DOBLE. Si ya hay un checkout EN CURSO
+    // para este mismo lote (p. ej. porque el offscreen se recreó y re-envió el
+    // CHECKOUT_BATCH por el tryRecoverReport), NO se inicia uno nuevo: el
+    // segundo se descarta con log en el diagnóstico. Esto hace imposible que
+    // un mismo pedido quede confirmado dos veces.
+    tokStoreGet(CHECKOUT_KEY).then((existing) => {
+      try {
+        const now = Date.now();
+        if (
+          existing && existing.step && existing.step !== "volver" &&
+          existing.lote === lote &&
+          existing.started && (now - existing.started) < 10 * 60 * 1000
+        ) {
+          console.log("[Tokin] checkout DUPLICADO ignorado para lote " + lote + " (paso actual: " + existing.step + ")");
+          tokDiagPush("checkout", { msg: "duplicado descartado lote=" + lote + " pasoReal=" + existing.step });
+          return;
+        }
+      } catch (e) {}
+      tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now() })
+        .then(() => tokCheckoutStep());
+    });
   }
 
   // Al iniciar el content script: si hay un checkout pendiente (p. ej. tras

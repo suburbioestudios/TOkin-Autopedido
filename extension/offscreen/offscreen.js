@@ -413,6 +413,21 @@ function applyCartDone(msg) {
     // y al terminar el último lote, queda todo comprado. El usuario pulsa
     // «Enviar a carrito» UNA sola vez: el flujo avanza lote a lote solo.
     const lote = Math.floor(((api.batchIdx || [])[0] || 0) / CART_BLOCK) + 1;
+    // v2.0.79: guardia contra el CHECKOUT duplicado. Si ya hay un checkout en
+    // vuelo para mismo lote (un CART_DONE rejugado por tryRecoverReport o un
+    // mensaje duplicado), NO se re-envía; tampoco un lote ya confirmado.
+    state.lotChecks = state.lotChecks || {};
+    if (state.checkoutLote === lote) {
+      try { console.log("[Tokin] CART_DONE rejugado sin duplicar checkout de lote " + lote); } catch (e) {}
+      persist();
+      emitState();
+      return;
+    }
+    if (state.lotChecks[lote]) {
+      // Este lote ya quedó confirmado: no re-comprar. Avanzar al siguiente.
+      continueAfterCheckout(lote, "", false);
+      return;
+    }
     state.checkoutLote = lote;
     setStatus("loading_cart", "Lote " + lote + " cargado al carrito — confirmando el pedido en el store (Revisar pedido → Siguiente → Realizar pedido)…", 3);
     persist();
