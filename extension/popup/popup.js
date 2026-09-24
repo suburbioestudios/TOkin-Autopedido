@@ -1036,6 +1036,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     const headM = (ui.cart && ui.cart.totalProducts) || results.length;
     const summaryStr = `Pedido cargado: ${headN} de ${headM} productos del pedido | Sin stock: ${sinStock} | No encontrados: ${notFound}` +
       (counts.faltaUnidades ? " | Falta unidades: " + counts.faltaUnidades : "");
+    // v2.0.79: el mapeo de lotes se declara acá, ANTES de las dos hojas. Estaba
+    // dentro del primer forEach y se usaba en el segundo → ReferenceError que
+    // mataba la generación del Excel sin bajar nada ("no aparece el informe").
+    const checksXls = (ui.sessionState && ui.sessionState.lotChecks) || {};
 
     // 1. Hoja 1: REPORTE GENERAL — 7 columnas simples
     const genHeaders = ["#", "Código SKU", "Producto Solicitado", "Cant. Pedida", "Unidad Pedida", "Estado", "Diagnóstico Detallado"];
@@ -1073,7 +1077,6 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       // v2.0.75: fila separadora de LOTE con el estado HONESTO: «PEDIDO
       // REALIZADO» solo si el checkout quedó confirmado; si no, «CARGADO EN
       // CARRITO (SIN CONFIRMAR)».
-      const checksXls = (ui.sessionState && ui.sessionState.lotChecks) || {};
       if (row.nro && (row.nro - 1) % GROUP === 0) {
         const lbl = checksXls[String(Math.floor((row.nro - 1) / GROUP) + 1)] ? "PEDIDO REALIZADO" : "CARGADO EN CARRITO (SIN CONFIRMAR)";
         generalAoa.push(["LOTE " + (Math.floor((row.nro - 1) / GROUP) + 1), "", "", "", "", "", "— " + lbl]);
