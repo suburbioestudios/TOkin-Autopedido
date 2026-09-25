@@ -5,6 +5,15 @@
 (function () {
   "use strict";
 
+  // v2.0.81: GUARDIA ANTI-DOBLE-INSTANCIA. Si el content script queda inyectado
+  // dos veces (extensión re-cargada sobre una pestaña viva, duplicado por
+  // manifest/reload), AMBAS corren el carrito y el checkout y el pedido llega
+  // duplicado. No comparten JS ni storage pero SÍ el DOM de la página: la marca
+  // data-tokin-ap es el semáforo — la segunda instancia se autodesactiva.
+  if (document.documentElement.getAttribute("data-tokin-ap")) {
+    try { console.warn("[Tokin] otra instancia ya controla esta página — esta no hace nada"); } catch (e) {}
+    return;
+  }
   document.documentElement.setAttribute("data-tokin-ap", "1");
 
   let highlightStyleInjected = false;
@@ -3045,7 +3054,11 @@
       const r = el.getBoundingClientRect();
       const cx = Math.max(1, r.left + Math.min(r.width / 2, r.width - 2));
       const cy = Math.max(1, r.top + Math.min(r.height / 2, r.height - 2));
-      for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      // v2.0.81: la cadena de puntero (pointerdown/up + mousedown/up) basta — el
+      // SPA los captura igual que un click nativo. NO se agrega un MouseEvent
+      // "click": el doble click lo era (pointer events + el.click() de abajo
+      // disparaban el handler DOS VECES y el pedido se confirmaba duplicado).
+      for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
         el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, isTrusted: false }));
       }
     } catch (e) {}
