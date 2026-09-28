@@ -1095,6 +1095,13 @@ function _build_doc_from_sheets(sheets, doc) {
     }
   }
   doc.kv_pairs.push(..._rows_to_pairs(preRows));
+  // v2.0.82: texto crudo de las filas que están ANTES de la tabla (encabezado del
+  // pedido). Ahí viven declaraciones como "1 Bulto = 24 Unidad(s)" que
+  // _rows_to_pairs no conserva (son celdas sueltas, no pares clave/valor) pero
+  // que sirven como factor de empaque.
+  doc.head_text = preRows
+    .map((r) => (r || []).map((c) => (c == null ? "" : String(c))).join(" "))
+    .join("\n");
   doc.tables.push(...tables);
   doc.line_items.push(...allItems);
   return doc;
@@ -1202,8 +1209,64 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
     if (!doc.kv_pairs.length) doc.kv_pairs = [{ key: "error", value: doc.error }];
   }
 
+  // v2.0.82: factor de empaque declarado en el ENCABEZADO del pedido
+  // ("1 Bulto = 24 Unidad(s)", "24 Unidades = 1 Bulto"). Es una declaración del
+  // propio cliente, así que sirve como fuente de conversión cuando la card del
+  // store no repite el factor. Se busca en el texto, en los pares clave/valor y
+  // en las celdas (el encabezado puede caer como fila de la planilla).
+  doc.pack_factors = _pack_factors_from_text(
+    [doc.markdown, doc.head_text || ""]
+      .concat(doc.kv_pairs.map((p) => p.key + " " + p.value))
+      .concat(
+        doc.tables.map((t) =>
+          (t.headers || []).join(" ") + " " + (t.rows || []).map((r) => Object.keys(r).map((k) => r[k]).join(" ")).join(" ")
+        )
+      )
+      .join("\n")
+  );
+  // Se estampa en cada línea: el carrito necesita el factor de la línea, no del
+  // documento entero.
+  for (const it of doc.line_items) it.pack_factors = doc.pack_factors;
+
   doc.fingerprint = await _fingerprint(doc);
   return doc;
+}
+
+// v2.0.82: "1 Bulto = 24 Unidad(s)" -> { bulto: 24 }. Devuelve el factor en el
+// vocabulario de unidades que usa el content (display / bulto / caja). Solo se
+// acepta una relación con un lado en 1: "1 Bulto = 24 Unidades" y
+// "24 Unidades = 1 Bulto" son el mismo dato; cualquier otra cosa ("2 Bultos =
+// 48 Unidades") no define un factor y se ignora.
+function _pack_factors_from_text(text) {
+  const out = {};
+  const canon = {
+    display: "display", disp: "display", displayx: "display",
+    bulto: "bulto", bultos: "bulto",
+    caja: "caja", cajas: "caja", envase: "caja", envases: "caja",
+  };
+  const BASE = new Set(["unidad", "unidades", "u", "uds", "und", "un"]);
+  const unit = (w) => canon[w] || (BASE.has(w) ? "unidad" : null);
+  const t = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    // El encabezado real escribe "1 Bulto = 24 Unidad(s)": el "(s)" va dentro del
+    // paréntesis, así que se aplana antes de buscar la relación.
+    .replace(/\(\s*s\s*\)/g, "s");
+  const re =
+    /(\d{1,4})\s*(display|disp|bulto|bultos|caja|cajas|envase|envases|unidad|unidades|u|uds|und|un)\s*=\s*(\d{1,4})\s*(display|disp|bulto|bultos|caja|cajas|envase|envases|unidad|unidades|u|uds|und|un)/g;
+  let m;
+  while ((m = re.exec(t))) {
+    const a = parseInt(m[1], 10);
+    const au = unit(m[2]);
+    const b = parseInt(m[3], 10);
+    const bu = unit(m[4]);
+    if (!(a > 0) || !(b > 0) || !au || !bu) continue;
+    // "1 Bulto = 24 Unidades" -> el bulto vale 24. "24 Unidades = 1 Bulto" -> igual.
+    if (a === 1 && au !== "unidad") out[au] = b;
+    else if (b === 1 && bu !== "unidad") out[bu] = a;
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------ mapeo
@@ -1321,6 +1384,7 @@ export function summarize(doc) {
     fingerprint: doc.fingerprint,
     error: doc.error || "",
     kv_pairs: doc.kv_pairs.slice(0, 20),
+    pack_factors: doc.pack_factors || {},
     tables: doc.tables.map((t) => ({
       sheet: t.sheet,
       headers: t.headers,

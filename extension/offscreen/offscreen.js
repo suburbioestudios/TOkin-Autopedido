@@ -44,6 +44,12 @@ const state = {
   // carrito quedó vacío / pantalla de éxito). Solo esos pueden decir
   // «pedido realizado» en la UI y en el Excel. Clave = número de lote.
   lotChecks: {},
+  // v2.0.82: tanda de ajustes manuales en vuelo. Las líneas corregidas a mano
+  // se reprocesan con su propio número de tanda ("A1", "A2"…) para que el
+  // checkout NO se saltee por el guardia de lote ya confirmado (los lotes
+  // numéricos del pedido ya están comprados y nunca deben volver a comprarse).
+  cartIsManual: false,
+  manualRun: 0,
 };
 
 function sessionView() {
@@ -59,6 +65,11 @@ function sessionView() {
     cartProgress: state.cartProgress,
     cartApi: state.cartApi,
     lotChecks: state.lotChecks,
+    // v2.0.82: memoria de grupos con la foto del carrito previa a cada
+    // checkout (carrito vacío => "no verificable", nunca inventado).
+    grupos: (state.cartApi && state.cartApi.grupos) || {},
+    cartIsManual: state.cartIsManual,
+    manualRun: state.manualRun,
   };
 }
 
@@ -113,6 +124,8 @@ function resetState() {
   state.cancellingCart = false;
   state.cartApi = null;
   state.lotChecks = {};
+  state.cartIsManual = false;
+  state.manualRun = 0;
 }
 
 // Los mensajes de chrome.runtime se serializan como JSON: los binarios deben
@@ -243,6 +256,12 @@ async function runCart() {
       nextOrig: 0,
       orderTotal: view.length,
       batchIdx: [],
+      // v2.0.82: memoria de GRUPOS. Cada grupo es un momento de compra: los
+      // lotes del pedido ("1".."N") y las tandas de ajustes manuales ("A1".."An").
+      // Guardamos la foto del carrito en el instante previo al checkout de cada
+      // grupo (es el único momento en que se puede responder qué había cargado) y
+      // si la compra quedó confirmada de verdad.
+      grupos: {},
     };
   } else {
     // Entre bloques el usuario pudo editar filas pendientes (UPDATE_LINE_ITEMS):
@@ -254,31 +273,59 @@ async function runCart() {
       state.cartApi.origItems[oi] = Object.assign({}, state.cartApi.origItems[oi], view[k]);
     }
   }
-  if (state.cartApi.nextOrig >= state.cartApi.orderTotal) {
+  // v2.0.82: COLA DE AJUSTES MANUALES. Cuando el cliente toca «Enviar al
+  // carrito» sobre las filas de "Requiere revisión manual", el offscreen arma
+  // una cola con los índices originales de las líneas que NO quedaron cargadas y
+  // las reprocesa (con las cantidades/unidades que el cliente haya editado). El
+  // snapshot del pedido (origItems/results/orderTotal) NO se toca, así que el
+  // informe sigue mostrando el pedido completo y las líneas corregidas pisan su
+  // resultado anterior en vez de duplicarse.
+  const api = state.cartApi;
+  const cola = api && Array.isArray(api.retryIdx) && api.retryIdx.length ? api.retryIdx : null;
+  const finPedido = () => {
+    const done = api.results.filter(Boolean);
+    const added = done.filter((r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0)).length;
+    const man = done.length - added;
+    setStatus(
+      "done",
+      "Todas las líneas del pedido ya fueron procesadas (" + added + " de " + api.orderTotal + " en el carrito" +
+        (man ? ", " + man + " para revisión manual" : "") + ").",
+      4
+    );
+    playBeep(true);
+  };
+  if (api.nextOrig >= api.orderTotal && !cola) {
     // Sin líneas nuevas por intentar: todo el pedido ya se procesó.
-    const api = state.cartApi;
-    const done = api.results.filter(Boolean);
-    const added = done.filter((r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0)).length;
-    setStatus("done", "Todas las líneas del pedido ya fueron procesadas (" + added + " de " + api.orderTotal + " en el carrito).", 4);
-    playBeep(true);
+    finPedido();
     return;
   }
-  const batch = state.cartApi.origItems.slice(state.cartApi.nextOrig, state.cartApi.nextOrig + CART_BLOCK);
+  let batch = [];
+  let batchIdx = [];
+  let batchStartAbs = 0;
+  if (cola) {
+    // Tanda manual: solo las líneas en cola, aunque estén dispersas en el
+    // pedido (no se reprocesa nada que ya haya quedado cargado).
+    state.cartIsManual = true;
+    const take = cola.slice(0, CART_BLOCK);
+    batch = take.map((i) => api.origItems[i]).filter(Boolean);
+    batchIdx = take.slice(0, batch.length);
+    batchStartAbs = batchIdx.length ? batchIdx[0] : 0;
+    api.retryIdx = cola.slice(batch.length);
+  } else {
+    state.cartIsManual = false;
+    batch = api.origItems.slice(api.nextOrig, api.nextOrig + CART_BLOCK);
+    if (!batch.length) {
+      finPedido();
+      return;
+    }
+    batchStartAbs = api.nextOrig;
+    for (let i = 0; i < batch.length; i++) batchIdx.push(api.nextOrig + i);
+    api.nextOrig += batch.length;
+  }
   if (!batch.length) {
-    const api = state.cartApi;
-    const done = api.results.filter(Boolean);
-    const added = done.filter((r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0)).length;
-    setStatus("done", "Todas las líneas del pedido ya fueron procesadas (" + added + " de " + api.orderTotal + " en el carrito).", 4);
-    playBeep(true);
+    finPedido();
     return;
   }
-  const batchIdx = [];
-  for (let i = 0; i < batch.length; i++) batchIdx.push(state.cartApi.nextOrig + i);
-  // v2.0.69: inicio absoluto del bloque en el pedido (para que el popup titule
-  // el lote en curso como "Bloque N — líneas X a Y" sin adivinarlo de la
-  // lista restante, que siempre arranca en 1).
-  const batchStartAbs = state.cartApi.nextOrig;
-  state.cartApi.nextOrig += batch.length;
   state.cartApi.batchIdx = batchIdx;
   state.cartApi.batchItems = batch;
   state.cart = {
@@ -296,7 +343,12 @@ async function runCart() {
   // Persistir ANTES de mandar el mensaje: si el offscreen se recrea a mitad del
   // lote, la sesión restaurada conoce el bloque (batchIdx) y al volver el
   // CART_DONE matchea los resultados a las líneas correctas.
-  setStatus("loading_cart", "Cargando carrito (bloque de " + batch.length + " líneas)…", 3);
+  setStatus(
+    "loading_cart",
+    (state.cartIsManual ? "Cargando ajustes manuales" : "Cargando carrito") +
+      " (bloque de " + batch.length + " líneas)…",
+    3
+  );
   try {
     // El content script corre un lote resumible por bloque (navega por cada
     // búsqueda) y reporta CART_PROGRESS; al terminar envía CART_DONE.
@@ -307,6 +359,7 @@ async function runCart() {
     const out = await sendSw({
       type: "ADD_TO_CART", items: batch, filename: state.filename || "",
       batchIdx, orderTotal: state.cartApi.orderTotal, lastBatch,
+      manual: state.cartIsManual,
     });
     if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
   } catch (e) {
@@ -319,6 +372,85 @@ async function runCart() {
   } finally {
     state.cancellingCart = false;
   }
+}
+
+// v2.0.82: TANDA DE AJUSTES MANUALES. El popup manda las filas de «Requiere
+// revisión manual» con las cantidades/unidades corregidas a mano (por su nro
+// original). Se reprocesan SÓLO esas: las que ya quedaron cargadas no se tocan
+// (no se duplican productos en el carrito) y su resultado en el informe se
+// pisa con el de la corrección. El snapshot del pedido (origItems, results,
+// orderTotal) se mantiene, así que el Excel y los lotes siguen describiendo el
+// pedido completo.
+async function startManualBatch(msg) {
+  if (state.status === "loading_cart" || state.status === "paused") {
+    return { ok: false, message: "Hay una carga en curso. Esperá a que termine." };
+  }
+  const api = state.cartApi;
+  if (!api || !api.started || !Array.isArray(api.origItems) || !api.origItems.length) {
+    return { ok: false, message: "Primero hay que procesar el pedido al carrito." };
+  }
+  const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+
+  // 1) Aplicar los ajustes del popup sobre el snapshot original, por nro.
+  const ajustes = Array.isArray(msg && msg.items) ? msg.items : [];
+  let aplicados = 0;
+  for (const a of ajustes) {
+    const nro = parseInt(a && a.nro, 10);
+    if (!(nro >= 1 && nro <= api.origItems.length)) continue;
+    const it = api.origItems[nro - 1];
+    if (!it) continue;
+    if (a.cantidad != null && a.cantidad !== "") it.cantidad = a.cantidad;
+    if (a.categoria != null && a.categoria !== "") it.categoria = a.categoria;
+    else if (a.unidad != null && a.unidad !== "") it.unidad = a.unidad;
+    if (a.producto != null && a.producto !== "") it.producto = a.producto;
+    it.nro = nro;
+    aplicados++;
+  }
+
+  // 2) Cola = índices originales SIN resultado cargado. Sin código ARC el
+  //    reintento solo puede volver a fallar igual, así que no se encola.
+  const cola = [];
+  let sinCodigo = 0;
+  for (let i = 0; i < api.origItems.length; i++) {
+    const r = api.results[i];
+    if (r && isAdded(r)) continue;
+    if (!(api.origItems[i] && api.origItems[i].sku || "").trim()) sinCodigo++;
+    cola.push(i);
+  }
+  if (!cola.length) {
+    return { ok: true, message: "No hay líneas pendientes de revisión manual." };
+  }
+  const descartadas = cola.filter((i) => !String((api.origItems[i] && api.origItems[i].sku) || "").trim());
+  const colaReal = cola.filter((i) => String((api.origItems[i] && api.origItems[i].sku) || "").trim());
+  if (!colaReal.length) {
+    return {
+      ok: false,
+      message:
+        "Las " + descartadas.length + " líneas pendientes no tienen código ARC, así que la extensión no las " +
+        "puede cargar: cargalas a mano en el store (marcadas en la hoja «Requiere revisión manual» del Excel).",
+    };
+  }
+
+  // 3) Limpiar el resultado SOLO de las que se van a reintentar: si el popup se
+  //    abre durante la tanda, la vista de trabajo debe ser la lista de pendientes.
+  //    Las sin código ARC NO se tocan: su resultado ("no se encontró" / "revisión
+  //    manual") es la evidencia de que no hay match de código y tiene que seguir
+  //    en el Excel final; borrarlo las haría desaparecer del reporte.
+  for (const i of colaReal) api.results[i] = null;
+  api.retryIdx = colaReal;
+  state.manualRun = (state.manualRun || 0) + 1;
+  state.cartIsManual = true;
+  state.line_items = colaReal.map((i) => Object.assign({}, api.origItems[i], { nro: i + 1 }));
+  state.cartApi.idxOfView = colaReal.slice();
+  persist();
+  emitState();
+  runCart();
+  return {
+    ok: true,
+    message:
+      "Cargando " + colaReal.length + " ajuste(s) manual(es)" +
+      (descartadas.length ? " · " + descartadas.length + " sin código ARC quedan para carga a mano" : "") + "…",
+  };
 }
 
 function applyCartDone(msg) {
@@ -339,10 +471,27 @@ function applyCartDone(msg) {
     return m ? "c:" + m[1] : "t:" + String(r.producto || "").trim();
   };
   const api = state.cartApi;
+  // v2.0.82: identidad del grupo que termina de cargarse. Los lotes del pedido
+  // son "1".."N"; las tandas de ajustes manuales, "A1".."An".
+  const grupo = state.cartIsManual
+    ? "A" + Math.max(1, state.manualRun || 1)
+    : String(Math.floor(((api && api.batchIdx && api.batchIdx[0]) || 0) / CART_BLOCK) + 1);
   if (api && api.started && Array.isArray(api.batchIdx)) {
     for (let k = 0; k < results.length; k++) {
       const oi = api.batchIdx[k];
-      if (oi != null && oi >= 0 && oi < api.origItems.length) api.results[oi] = results[k];
+      if (oi == null || oi < 0 || oi >= api.origItems.length) continue;
+      const rr = results[k];
+      if (rr && typeof rr === "object") {
+        // En qué grupo se resolvió la línea y cuánta cantidad quedó realmente
+        // en el carrito: el Excel responde con estos dos datos, sin recalcular.
+        rr.grupo = grupo;
+        rr.cantCargada = isAdded(rr) ? (Number(rr.added) || 0) : 0;
+        // marcar el resultado si viene de una tanda de ajustes manuales, para
+        // que el informe diga que esa línea se corrigió a mano (y con qué
+        // número de tanda) en lugar de parecer cargada en la primera pasada.
+        if (state.cartIsManual) rr.manualRound = state.manualRun || 1;
+      }
+      api.results[oi] = rr;
     }
   }
   if (!api || !api.started) return;
@@ -384,6 +533,64 @@ function applyCartDone(msg) {
   const batchNotC = batchResults.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
   const allAttempted = api.nextOrig >= api.orderTotal;
   state.allAttempted = allAttempted;
+  // v2.0.82: FOTO DEL GRUPO en el instante previo al checkout. Se guarda tal cual
+  // la leyó el content script del drawer del store. Si vino vacía, el reporte la
+  // muestra como "carrito no verificable" en vez de suponer un estado.
+  // Una tanda manual puede necesitar más de un checkout (se parte en bloques de
+  // 19), así que el grupo se ACUMULA: mismo grupo, varias fotos en distintos
+  // instantes, que es exactamente lo que pasó.
+  api.grupos = api.grupos || {};
+  const foto = Array.isArray(msg && msg.carrito) ? msg.carrito : [];
+  const lineasGrupo = api.batchIdx.map((oi) => {
+    const r = api.results[oi];
+    return {
+      nro: oi + 1,
+      sku: (r && (r.sku || r.code)) || (api.origItems[oi] && api.origItems[oi].sku) || "",
+      producto: (r && r.producto) || (api.origItems[oi] && api.origItems[oi].producto) || "",
+      cantCargada: r && r.cantCargada != null ? r.cantCargada : (isAdded(r) ? Number(r.added) || 0 : 0),
+      cargada: isAdded(r),
+      estado: (r && r.message) || "",
+    };
+  });
+  const gPrevio = api.grupos[grupo];
+  if (gPrevio) {
+    // mismo grupo, segundo checkout: se agregan las líneas nuevas (por nro, la
+    // última versión manda) y se acumulan fotos y contadores.
+    const byNro = {};
+    for (const l of gPrevio.lineas || []) byNro[l.nro] = l;
+    for (const l of lineasGrupo) byNro[l.nro] = l;
+    const todasFotos = (gPrevio.foto || []).slice();
+    for (const c of foto) {
+      const k = (c.code || "") + "|" + (c.nombre || "") + "|" + (c.qty != null ? c.qty : "");
+      if (!todasFotos.some((x) => ((x.code || "") + "|" + (x.nombre || "") + "|" + (x.qty != null ? x.qty : "")) === k)) {
+        todasFotos.push(c);
+      }
+    }
+    gPrevio.lineas = Object.keys(byNro).map((k) => byNro[k]).sort((a, b) => a.nro - b.nro);
+    gPrevio.cargadas = (gPrevio.cargadas || 0) + batchAdded;
+    gPrevio.totalLineas = (gPrevio.lineas || []).length;
+    gPrevio.productosEnCarrito = (msg && msg.prodAdded != null) ? msg.prodAdded : gPrevio.productosEnCarrito;
+    gPrevio.checkouts = (gPrevio.checkouts || 1) + 1;
+    gPrevio.foto = todasFotos;
+    gPrevio.verificado = gPrevio.verificado || todasFotos.length > 0;
+    gPrevio.confirmado = false;
+    gPrevio.ultimoCheckout = new Date().toISOString();
+  } else {
+    api.grupos[grupo] = {
+      grupo: grupo,
+      manual: !!state.cartIsManual,
+      fecha: new Date().toISOString(),
+      lineas: lineasGrupo,
+      cargadas: batchAdded,
+      totalLineas: lineasGrupo.length,
+      productosEnCarrito: (msg && msg.prodAdded != null) ? msg.prodAdded : prodAdded,
+      // carrito vacío = no se pudo leer el drawer en ese instante.
+      verificado: foto.length > 0,
+      foto: foto,
+      checkouts: 1,
+      confirmado: false,
+    };
+  }
   state.cart = {
     total: api.orderTotal,
     ok: added,
@@ -412,7 +619,13 @@ function applyCartDone(msg) {
     // (Revisar pedido → Siguiente → Realizar pedido) desde el content script,
     // y al terminar el último lote, queda todo comprado. El usuario pulsa
     // «Enviar a carrito» UNA sola vez: el flujo avanza lote a lote solo.
-    const lote = Math.floor(((api.batchIdx || [])[0] || 0) / CART_BLOCK) + 1;
+    // v2.0.82: las tandas de ajustes manuales llevan clave propia ("A1", "A2"…):
+    // los lotes numéricos del pedido ya están comprados y su guardia los saltaría
+    // — sin clave nueva, el checkout de lo corregido a mano NUNCA se dispara y
+    // esas líneas quedarían en el carrito sin comprar.
+    const lote = state.cartIsManual
+      ? "A" + Math.max(1, state.manualRun || 1)
+      : Math.floor(((api.batchIdx || [])[0] || 0) / CART_BLOCK) + 1;
     // v2.0.79: guardia contra el CHECKOUT duplicado. Si ya hay un checkout en
     // vuelo para mismo lote (un CART_DONE rejugado por tryRecoverReport o un
     // mensaje duplicado), NO se re-envía; tampoco un lote ya confirmado.
@@ -479,7 +692,7 @@ function continueAfterCheckout(lote, _note, degraded) {
   const notFound = done.filter((r) => !isAdded(r) && /no se encontró/i.test(r.message || "")).length;
   const notConfirmed = done.filter((r) => !isAdded(r) && String(r.message || "").indexOf("no se confirmó") === 0).length;
   const allAttempted = api.nextOrig >= api.orderTotal;
-  if (allAttempted) {
+  if (allAttempted && !(api.retryIdx && api.retryIdx.length)) {
     const parts = [];
     if (sinStock) parts.push(sinStock + " sin stock");
     if (notFound) parts.push(notFound + " no encontrados");
@@ -496,9 +709,12 @@ function continueAfterCheckout(lote, _note, degraded) {
     );
     playBeep(true);
   } else {
+    const quedan = (api.retryIdx || []).length;
     setStatus(
       "loading_cart",
-      "lote " + lote + " pedido realizado" + ". Continuando con el lote " + (lote + 1) + "…",
+      (state.cartIsManual
+        ? "Ajustes manuales tanda " + lote + " pedido realizado. Quedan " + quedan + " líneas por confirmar…"
+        : "lote " + lote + " pedido realizado" + ". Continuando con el lote " + (lote + 1) + "…"),
       3
     );
     playBeep(true);
@@ -599,6 +815,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: true });
       break;
+    case "START_MANUAL_BATCH":
+      startManualBatch(msg)
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, message: String((e && e.message) || e) }));
+      return true;
     case "ADD_TO_CART":
       runCart()
         .then(() => sendResponse({ ok: true }))
@@ -676,6 +897,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // v2.0.75: registrar si la compra de ESTE lote quedó confirmada de verdad
       state.lotChecks = state.lotChecks || {};
       state.lotChecks[lote] = !!(msg && msg.ok);
+      // v2.0.82: mismo dato en la memoria de grupos (que además tiene la foto del
+      // carrito previa al checkout). Si el grupo no existe —carrito ya
+      // confirmado por otra vía— se ignora en vez de inventarlo.
+      try {
+        const api = state.cartApi;
+        if (api && api.grupos && api.grupos[lote]) {
+          api.grupos[lote].confirmado = !!(msg && msg.ok);
+          api.grupos[lote].confirmadoFecha = new Date().toISOString();
+        }
+      } catch (e) {}
       // Anotar adentro del reporte persistido (storage.local) para que un
       // popup que se abre con la sesión muerta igual sepa qué lotes fueron
       // de verdad confirmados.
@@ -684,6 +915,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const rep = d && d.tokinCartReport;
           if (rep) {
             rep.lotChecks = state.lotChecks;
+            // v2.0.82: los grupos con su foto del carrito viajan al reporte
+            // persistido para que el Excel se arme igual aunque el offscreen
+            // ya haya muerto.
+            rep.grupos = (state.cartApi && state.cartApi.grupos) || {};
             chrome.storage.local.set({ tokinCartReport: rep }, () => { void chrome.runtime.lastError; });
           }
         });

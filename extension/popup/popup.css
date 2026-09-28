@@ -219,6 +219,49 @@ tr:nth-child(even) td { background: #faf8ff; }
 .cart-row.warn { background: var(--orange-soft); border-color: #fed7aa; }
 .cart-row.err { background: var(--err-soft); border-color: #fecaca; }
 
+/* v2.0.82: bloque "Requiere revisión manual" al final del informe. Las filas
+   se muestran en columna (no como la fila compacta ok) porque llevan motivo,
+   sugerencia y los campos editables de cantidad/unidad que se van a reenviar. */
+.manual-sep {
+  margin: 14px 0 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+  font-weight: 800;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .2px;
+}
+.manual-hint { color: #9a3412; }
+.cart-row.manual-row {
+  display: block;
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+.manual-row > b { display: block; color: #7c2d12; }
+.manual-nro { color: #9a3412; opacity: .8; }
+.manual-sku {
+  font-weight: 400; font-size: 11px; color: #9a3412;
+  border: 1px solid #fdba74; border-radius: 4px; padding: 0 4px; margin-left: 4px;
+}
+.manual-msg { display: block; margin-top: 2px; color: #7c2d12; }
+.manual-sug { display: block; margin-top: 2px; font-weight: 600; color: #166534; }
+.manual-edit {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px;
+}
+.manual-edit label {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #7c2d12;
+}
+.manual-edit input {
+  width: 84px; box-sizing: border-box;
+  border: 1px solid #fdba74; border-radius: 4px;
+  padding: 2px 4px; font: inherit; background: #fff;
+}
+.manual-edit input:focus { outline: 2px solid #fdba74; }
+
 footer {
   position: relative; z-index: 1;
   display: flex; justify-content: space-between; align-items: center;
