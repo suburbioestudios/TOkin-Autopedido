@@ -513,6 +513,23 @@ function _first_digits(t) {
   return m ? m[0] : null;
 }
 
+// Regla de negocio: en estos pedidos no existe "1 unidad" (1 display, 1 bulto o
+// 1 caja sí son válidos). Cuando la celda de unidad dice UNIDAD y la cantidad es
+// 1, lo más probable es que esa celda esté degradada: el caso documentado en este
+// archivo es la "DI" (display) leída como "UN" por el OCR a escala baja. La fila se
+// marca como sospechosa para que entre al re-OCR de banda (que recupera la unidad
+// real) y, si aun así queda en "1 unidad", el content script BLOQUEE la línea antes
+// de tocar el carrito en vez de mandar una unidad suelta.
+//
+// Importante: solo cuenta si la unidad viene DE VERDAD del archivo. Las líneas sin
+// columna de unidad llegan con unidad vacía (el content script las asume "Unidad"
+// por defecto) y NO deben dispararse por esto.
+function _es_unidad_sospechosa(cantidad, unidad) {
+  if (medida_categoria(unidad) !== "unidad") return false;
+  const n = parseInt(String(cantidad == null ? "" : cantidad).replace(/[^\d]/g, ""), 10);
+  return n === 1;
+}
+
 // Columna de unidad del proveedor: el OCR puede dar la letra (b/d/a) o la
 // nomenclatura UN/DI/BU (unidad/display/bulto). Devuelve siempre la letra
 // canónica que consume el carrito: a=unidad, b=bulto, d=display.
@@ -737,7 +754,8 @@ function _pdf_row_info(width, row) {
     unit === null ||
     pedida === null ||
     pedidaXf > 0.33 ||
-    (pedida !== null && /^\d{4,}$/.test(pedida));
+    (pedida !== null && /^\d{4,}$/.test(pedida)) ||
+    _es_unidad_sospechosa(pedida, unit);
   const cy = (row[sku_i].y0 + row[sku_i].y1) / 2;
   return {
     item: {
@@ -746,6 +764,10 @@ function _pdf_row_info(width, row) {
       cantidad: pedida || "",
       unidad: unit || "",
       categoria: medida_categoria(unit),
+      // "1 unidad" no existe en el pedido: la fila se marca para revisión y, si
+      // el re-OCR de banda no la corrige, la carga se bloquea. Se recalcula
+      // después del fix (ver _pdf_text) porque el fix puede cambiar la unidad.
+      unidadSospechosa: _es_unidad_sospechosa(pedida, unit),
       // Posición de la fila en la página: clave para aplicar los fixes del
       // re-OCR de banda (p.qtyFix) sin depender del sku, que puede ser un
       // token degradado o repetirse entre filas.
@@ -1033,6 +1055,9 @@ function _build_table_obj(sheet, rows, headerIdx) {
         cantidad,
         unidad,
         categoria: medida_categoria(unidad),
+        // "1 unidad" no existe en el pedido (1 display/bulto/caja sí): se marca
+        // para que la carga se bloquee y la línea quede a revisión manual.
+        unidadSospechosa: _es_unidad_sospechosa(cantidad, unidad),
         precio: idxPrice != null && idxPrice < row.length ? String(row[idxPrice]).trim() : "",
         importe: idxImport != null && idxImport < row.length ? String(row[idxImport]).trim() : "",
       });
@@ -1176,6 +1201,11 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
                 it.unidad = f.unidad;
                 it.categoria = medida_categoria(f.unidad);
               }
+              // El flag se RECALCULA después del re-OCR: una fila que entró como
+              // sospechosa por "1 UN" y el refinado corrigió a "1 DI" deja de estar
+              // sospechosa, y al revés una "1 DI" degradada que el refinado leyó
+              // como "1 UN" pasa a estarlo (y la carga se bloqueará).
+              it.unidadSospechosa = _es_unidad_sospechosa(it.cantidad, it.unidad);
             }
           }
           // Descarta filas que no son líneas de pedido: sin Cant. Pedida NI
@@ -1192,6 +1222,7 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
               cantidad: it.cantidad,
               unidad: it.unidad,
               categoria: it.categoria,
+              unidadSospechosa: !!it.unidadSospechosa,
             })),
             line_items: items2,
             col_indexes: { sku: 0, producto: 1, cantidad: 2, unidad: 3 },

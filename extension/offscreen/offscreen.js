@@ -228,6 +228,15 @@ function cartItems() {
       unidad: it.unidad || "",
       categoria: it.categoria || "",
       sku: it.sku || "",
+      // v2.0.84: "1 unidad" no existe en el pedido: el parser marca la línea y,
+      // si el re-OCR no la corrigió, el content script bloquea la carga. El flag
+      // tiene que viajar al job o el bloqueo nunca se aplica.
+      unidadSospechosa: it.unidadSospechosa === true,
+      // v2.0.84: los factores de pack declarados en el encabezado del pedido
+      // ("1 Bulto = 24 Unidad(s)") llegaban hasta acá pero se perdían en este
+      // whitelist: el content script los usa como fuente de conversión y caía
+      // siempre al pack del título, que es menos confiable.
+      pack_factors: it.pack_factors || null,
     }))
     .filter((it) => (it.producto || it.sku || "").trim());
 }

@@ -1068,6 +1068,52 @@
     };
   }
 
+  // v2.0.84: MATCH ENDURECIDO. El cliente pidió que coincidan LOS TRES: código,
+  // nombre y gramaje. Antes el match por CÓDIGO se aceptaba solo (el ARC de la
+  // card se tomaba como identidad del producto) y por eso una card con el mismo
+  // código pero otro nombre/gramaje pasaba, que es exactamente el caso de "la
+  // card tenía el input correcto y aun así se mandó el item equivocado".
+  //
+  // Ahora el código es la puerta de entrada (flexible: exacto, sufijo o combo) y
+  // el NOMBRE tiene que estar íntegro en la card, y el GRAMAJE tiene que
+  // reconciliar. Excepciones deliberadas, para no dejar afuera productos legítimos
+  // por un dato que el store no publica:
+  //   - el pedido sin nombre (solo código) no tiene nada que comparar;
+  //   - la card sin palabras de nombre (solo marca/código) no tiene nada que
+  //     comparar, y en ese caso se exige que el gramaje sí lo confirme: si la
+  //     card no dice ni una palabra de nombre ni un gramaje, no hay con qué
+  //     confirmar que sea el producto pedido y se rechaza.
+  function tokMatchStrict(target, cardText) {
+    const targetCore = Array.from(new Set(tokCoreName(target).split(" ").filter(Boolean)));
+    const cardCore = Array.from(new Set(tokCoreName(cardText).split(" ").filter(Boolean)));
+    if (!targetCore.length) {
+      // Pedido solo por código: el código alcanza como identidad.
+      return { ok: true, why: "", name: "sin nombre en el pedido", grams: "" };
+    }
+    if (!cardCore.length) {
+      // Card sin nombre legible: solo se admite si el gramaje la confirma.
+      const tg = tokGrams(target);
+      const ag = tokGrams(cardText);
+      if (tg.length && ag.length) {
+        const g = tokGramsExact(target, cardText);
+        if (g.ok) return { ok: true, why: "", name: "card sin nombre, confirmada por gramaje", grams: "ok" };
+        return { ok: false, why: g.why, name: "card sin nombre", grams: "distinto" };
+      }
+      return {
+        ok: false,
+        why: "el store no muestra el nombre ni el gramaje de «" + targetCore.join(" ") +
+          "»: sin nombre no se puede confirmar que sea el producto pedido",
+        name: "card sin nombre",
+        grams: "",
+      };
+    }
+    const name = tokNameExact(target, cardText);
+    if (!name.ok) return { ok: false, why: name.why, name: "distinto", grams: "" };
+    const grams = tokGramsExact(target, cardText);
+    if (!grams.ok) return { ok: false, why: grams.why, name: "ok", grams: "distinto" };
+    return { ok: true, why: "", name: "ok", grams: "ok" };
+  }
+
   // Selecciona la mejor card del store: prioriza coincidencia exacta por SKU.
   // Si no hay match por código SKU, no descarta las cards de la búsqueda, sino que
   // pasa a matchear por nombre de producto, gramaje y estado de stock (v2.0.30).
@@ -1088,11 +1134,12 @@
         if (cardCore.some((c) => tokWordMatch(w, c))) shared++;
       }
       const isNoStock = /sin stock/i.test(t);
-      // v2.0.82: para el fallback por nombre el match tiene que ser PERFECTO
-      // (nombre íntegro + gramaje coherente). El match por CÓDIGO no se toca:
-      // el ARC de la card ES la identidad del producto en el store.
-      const nameEx = tokNameExact(target, t);
-      const gramsEx = nameEx.ok ? tokGramsExact(target, t) : { ok: false, why: "" };
+      // v2.0.84: match endurecido para TODOS los caminos, incluido el de código.
+      // Antes el match por CÓDIGO se aceptaba sin mirar nombre ni gramaje: una
+      // card con el mismo ARC y otro producto pasaba, y era la forma de que se
+      // cargara el item equivocado. Ahora código + nombre + gramaje tienen que
+      // coincidir (ver tokMatchStrict para las excepciones deliberadas).
+      const strictRes = tokMatchStrict(target, t);
       parsed.push({
         el: a,
         btns,
@@ -1100,14 +1147,18 @@
         shared,
         score: tokArticleScore(target, t),
         isNoStock,
-        strict: nameEx.ok && gramsEx.ok,
-        strictWhy: nameEx.why || gramsEx.why,
+        strict: strictRes.ok,
+        strictWhy: strictRes.why,
+        strictName: strictRes.name,
+        strictGrams: strictRes.grams,
       });
     }
 
     const byCode = parsed.filter((p) => p.codeMatch);
-    // Prioridad 1: cards con match de código SKU.
-    // Prioridad 2 (fallback): cards que comparten nombre/términos/gramos o que indican sin stock.
+    // Prioridad 1: cards con match de código SKU, que además pasan el gate
+    //             estricto (nombre íntegro + gramaje reconciliado).
+    // Prioridad 2 (fallback): cards que comparten nombre/términos/gramos o que
+    // indican sin stock, también bajo el gate estricto.
     // v2.0.58: cuando el pedido tiene nombre (tokens reales), la card elegida
     // tiene que compartir AL MENOS un término con ese nombre. Las cards que solo
     // entran por score>0.1 sin compartir NINGÚN término son sugerencias /
@@ -1116,13 +1167,28 @@
     // v2.0.82: además tienen que pasar el criterio estricto (nombre íntegro +
     // gramaje). Un "shared > 0" con otro producto es exactamente el match
     // equivocado que se quiere evitar.
-    const pool = byCode.length
-      ? byCode
+    // v2.0.84: el gate estricto también filtra las cards con match de CÓDIGO.
+    const codePool = byCode.filter((p) => p.strict);
+    const codePoolLen = codePool.length;
+    const pool = codePoolLen
+      ? codePool
       : targetCore.length
         ? parsed.filter((p) => p.strict && (p.shared > 0 || (p.isNoStock && p.score > 0.1)))
         : parsed.filter((p) => p.strict && (p.shared > 0 || p.score > 0.1 || p.isNoStock));
     if (!pool.length) {
-      if (!byCode.length) {
+      if (byCode.length) {
+        // Había una card con el código del pedido pero el nombre o el gramaje no
+        // coinciden: es un producto DISTINTO con el mismo ARC, o un nombre de
+        // card que no se puede confirmar. No se carga: a revisión manual.
+        const bad = byCode[0];
+        tokStrictReject = bad.strictWhy || "el nombre o el gramaje del store no coinciden con los del pedido";
+        tokDiagPush("reject", {
+          msg:
+            "código coincide pero el match estricto no: «" + String(target).replace(/\s+/g, " ").slice(0, 60) + "» · " +
+            tokStrictReject +
+            " · card=«" + String(bad.el.innerText || "").replace(/\s+/g, " ").slice(0, 90) + "»",
+        });
+      } else if (!byCode.length) {
         const near = parsed.filter((p) => p.shared > 0);
         const bestNear = near.sort((a, b) => b.score - a.score)[0];
         tokStrictReject = bestNear
@@ -1147,7 +1213,22 @@
         (p.codeMatch === best.codeMatch &&
           (p.shared > best.shared || (p.shared === best.shared && p.score > best.score)));
       if (better) {
-        best = { el: p.el, btns: p.btns, score: p.score, shared: p.shared, codeMatch: p.codeMatch, isNoStock: p.isNoStock };
+        best = {
+          el: p.el,
+          btns: p.btns,
+          score: p.score,
+          shared: p.shared,
+          codeMatch: p.codeMatch,
+          isNoStock: p.isNoStock,
+          // v2.0.84: con qué se verificó el match. codeMatch=false significa que
+          // el producto se encontró por nombre+gramaje y el store le muestra un
+          // código DISTINTO al del pedido: es un match válido pero sin código
+          // confirmado, y por eso un "sin stock" así NO cuenta como confirmado
+          // (el cliente lo pidió solo con el match de código flexible).
+          matchName: p.strictName,
+          matchGrams: p.strictGrams,
+          matchByCode: !!p.codeMatch,
+        };
       }
     }
     // v2.0.66: en el fallback POR NOMBRE (sin match de código) el match SIEMPRE
@@ -2008,6 +2089,80 @@
       return tokAdvance(job, r.ok);
   }
 
+  // v2.0.84: "1 unidad" no existe en el pedido. 1 display, 1 bulto y 1 caja SÍ son
+  // válidos (por eso el bloqueo es solo para la categoría unidad). La unidad tiene
+  // que venir DE VERDAD del archivo: si la línea no trae columna de unidad no se
+  // juzga (el "Unidad" por defecto de tokUnitLabel no cuenta, o bloquearía
+  // pedidos enteros que el proveedor no manda con U.M.).
+  const TOK_UNIDAD_ALIASOS = new Set(["unidad", "unidades", "un", "und", "unid", "uni", "uds", "ud", "u", "a"]);
+  // v2.0.84: la unidad del pedido es un "UNIDAD" explícito y la cantidad que se
+  // va a dejar en la card es 1. Se mira el TOTAL del producto en todo el pedido
+  // (wantQty), no el de la línea: si el mismo producto aparece en dos filas de
+  // "1 unidad", el total es 2 y la card puede perfectamente tomar 2 unidades, así
+  // que no hay nada sospechoso. Sólo se bloquea cuando de verdad se pretende
+  // dejar una única unidad suelta en el carrito, que es el caso que el store
+  // resolvía con un click que nadie audita.
+  function tokUnidadSospechosa(item, totalQty) {
+    if (!item) return false;
+    const decl = String(item.categoria || item.unidad || "").trim();
+    if (!decl) return false;
+    if (item.unidadSospechosa !== true) {
+      // El parser ya lo marcó: es su forma de decir "acá hay una unidad
+      // explícita", pero el total manda igual (caso de las líneas duplicadas).
+      if (!TOK_UNIDAD_ALIASOS.has(tokNorm(decl))) return false;
+    }
+    const n = totalQty != null && totalQty !== ""
+      ? Math.floor(Number(String(totalQty).replace(/[^\d.]/g, ""))) || 0
+      : parseInt(String(item.cantidad == null ? "" : item.cantidad).replace(/[^\d]/g, ""), 10);
+    return n === 1;
+  }
+
+  // v2.0.84: ¿está RESUELTA la conversión de la unidad pedida a unidades del
+  // store? Es el cuarto requisito del match y el que faltaba: sin él no se puede
+  // afirmar un faltante. Si el pedido pide "2 caja" y no se sabe de cuántas
+  // unidades es esa caja, el reporte no puede decir "de las 48 unidades pedidas no
+  // hay ninguna": eso no es un hecho, es una incógnita, y va a revisión manual.
+  // Se considera resuelta cuando:
+  //   - la unidad pedida NO es un pack (unidad suelta o combo): el store la carga
+  //     1:1, no hay nada que convertir;
+  //   - la unidad pedida es un pack y su factor se conoce (botones de la card,
+  //     texto de la card, título del pedido o encabezado con pack_factors).
+  function tokConversionResuelta(it, wantType, cardText) {
+    const wt = String(wantType || (it && (it.categoria || it.unidad)) || "").trim().toLowerCase();
+    if (!TOK_PACK_TYPES.has(wt)) return true;
+    if (!it) return false;
+    const f = tokConvFactor([], cardText || "", it.producto || "", wt, it.pack_factors) || tokTitlePack(it.producto || "");
+    return f > 0;
+  }
+
+  // v2.0.84: SIN STOCK es un HECHO DEL STORE, no una falla de la extensión: si el
+  // producto se verificó con código flexible + nombre + gramaje Y la conversión
+  // está resuelta, el faltante es real y definitivo. Se marca `confirmado` para
+  // que entre al reporte como observación confirmada y NO se reabra para ajuste
+  // manual.
+  // Un "sin stock" encontrado SOLO por nombre (sin código coincidente) NO se
+  // confirma: sin el código del store no se puede asegurar que sea el mismo
+  // producto, y va a revisión manual.
+  function tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText) {
+    if (!out || out.ok) return false;
+    if (!/sin stock/i.test(String(out.message || ""))) return false;
+    if (!cand || !cand.matchByCode) return false;
+    // Tiene que haberse verificado el nombre y el gramaje de verdad (no el caso
+    // "pedido solo por código" ni el de "card sin nombre", que no verifican).
+    if (cand.matchName !== "ok" || cand.matchGrams !== "ok") return false;
+    // Cuarto requisito: la conversión de la unidad pedida tiene que estar
+    // resuelta, o el faltante no es afirmable (ver tokConversionResuelta). Se
+    // acepta que ya se haya aplicado de verdad (convFactor > 0, que solo se
+    // escribe cuando la cantidad se multiplicó por un factor real) o que sea
+    // deducible de los datos de la card y del pedido.
+    if (!(out.convFactor > 0) && !tokConversionResuelta(it, wantType, cardText)) return false;
+    // Un tope de stock (el store tomó menos de lo pedido) SÍ es un hecho
+    // confirmado; una cantidad que no se pudo fijar en el carrito no lo es.
+    if (/no pu(do|do) registrar|no se pudo verificar|no asenta/i.test(String(out.message || ""))) return false;
+    out.confirmado = true;
+    return true;
+  }
+
   async function tokProcessCard(cand, it, target, wantType, wantUnit, wantedGrams, wantQty, byName) {
     byName = !!byName;
     const card = cand.el;
@@ -2016,6 +2171,28 @@
     // Cantidad pedida original (en unidades de venta): wantQty se reescribe al
     // convertir, y acá queda el valor para el diagnóstico de convFactor.
     const wantQtyRaw = wantQty;
+
+    // v2.0.84: BLOQUEO DE "1 UNIDAD", antes de tocar el store. Va primero a
+    // propósito: el click del botón de unidad ES el alta en el carrito, así que a
+    // la altura de los demás controles el producto ya está cargado en 1 y la
+    // única forma de no mandarlo es cortar antes de cualquier click. La línea
+    // queda a revisión manual con el motivo, y el cliente la corrige desde el
+    // popup (por ejemplo a "1 display") y la reenvía en la tanda de ajustes.
+    if (tokUnidadSospechosa(it, wantQty)) {
+      out.ok = false;
+      out.added = 0;
+      out.manual = true;
+      out.usedUnit = wantUnit;
+      out.message =
+        "revisión manual: en este proveedor no existe el pedido de 1 unidad (" +
+        (it.producto || it.sku || "").toString().slice(0, 60) + ") - " +
+        "si es 1 display o 1 bulto, corregí la unidad y volvé a enviarla";
+      tokDiagPush("nofix", {
+        nro: it.nro,
+        msg: "BLOQUEADO '1 unidad' (total del pedido = " + wantQty + " " + (it.categoria || it.unidad || "unidad") + ") · nro=" + it.nro + " · " + String(out.message).slice(0, 160),
+      });
+      return out;
+    }
 
     let unitBtn = null;
     let usedUnit = wantUnit;
@@ -2052,6 +2229,16 @@
         const arc = tokArcCode(cardText);
         out.ok = true;
         out.message = "encontrado pero sin stock" + (arc ? " (" + arc + ")" : "");
+        // v2.0.84: el producto se verificó (código + nombre + gramaje + conversión
+        // resuelta) y el store no lo tiene: es un faltante real y definitivo, no
+        // una falla de la extensión, así que NO se reabre para ajuste manual. Si
+        // el match no se verificó entero, la línea queda a revisión manual.
+        if (!tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) {
+          out.ok = false;
+          out.message =
+            "revisión manual: sin stock, pero el store no lo confirma por código+nombre+gramaje+conversión — " +
+            "revisá si es el mismo producto: " + out.message;
+        }
         return out;
       }
       // La card quedó cargada: refrescar sus datos y seguir el flujo normal.
@@ -2191,34 +2378,72 @@
       return out;
     }
 
-    let nums = await waitForTokin(() => {
+    // v2.0.84: los inputs de LA CARD CON LA QUE SE HIZO EL ALTA, identificados por
+    // su ARC. Antes, después del click del botón de unidad, se volvía a correr el
+    // ranking completo (tokBestArticle) para retomar los inputs: si el SPA
+    // re-renderiza los resultados o el ranking se da vuelta, los inputs venían de
+    // OTRA card, la cantidad se escribía en el producto equivocado y el que se
+    // había agregado quedaba en 1 — el caso "la card tenía el input correcto y
+    // aun así se mandó el item equivocado". Con el ARC no hay ambigüedad: se
+    // escribe siempre en el producto que se agregó.
+    // Sin ARC (combos, que no muestran ARC-XXXX) se cae al ranking, como antes.
+    const arcAlta = tokArcCode(cardText);
+    const findNums = () => {
+      if (arcAlta) {
+        for (const a of document.querySelectorAll("article")) {
+          if (a.getAttribute("data-id") === "cart-product-card" || !tokIsProductCard(a)) continue;
+          if (tokArcCode(a.innerText || "") !== arcAlta) continue;
+          const els = a.querySelectorAll("input[type=number]");
+          if (els.length) return els;
+        }
+        return null;
+      }
       const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
       if (!c) return null;
       const els = c.el.querySelectorAll("input[type=number]");
       return els.length ? els : null;
-    }, 5000, 250);
+    };
+
+    let nums = await waitForTokin(findNums, 5000, 250);
 
     if (!nums) {
       const addBtn = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
-        if (!c) return null;
-        const b = c.el.querySelector("[data-id=add-to-cart-button]");
-        return b && !b.disabled ? b : null;
+        const c = arcAlta
+          ? (function () {
+              for (const a of document.querySelectorAll("article")) {
+                if (a.getAttribute("data-id") === "cart-product-card" || !tokIsProductCard(a)) continue;
+                if (tokArcCode(a.innerText || "") !== arcAlta) continue;
+                const b = a.querySelector("[data-id=add-to-cart-button]");
+                if (b && !b.disabled) return b;
+              }
+              return null;
+            })()
+          : (function () {
+              const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
+              if (!c) return null;
+              const b = c.el.querySelector("[data-id=add-to-cart-button]");
+              return b && !b.disabled ? b : null;
+            })();
+        return c || null;
       }, 6000, 250);
       if (!addBtn) {
         out.message = isNoStock
           ? "encontrado pero sin stock"
           : "sin botón Agregar habilitado";
         out.ok = !!isNoStock;
+        // v2.0.84: mismo criterio que las otras salidas de sin stock: si el
+        // producto quedó verificado por código+nombre+gramaje+conversión resuelta,
+        // el faltante es un hecho del store y la línea no se reabre para ajuste
+        // manual.
+        if (isNoStock && !tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) {
+          out.ok = false;
+          out.message =
+            "revisión manual: sin stock sin verificación de código+nombre+gramaje+conversión — " + out.message;
+        }
         return out;
       }
       addBtn.click();
-      nums = await waitForTokin(() => {
-        const c = tokBestArticle(target, wantType, wantedGrams, it.sku, byName);
-        if (!c) return null;
-        const els = c.el.querySelectorAll("input[type=number]");
-        return els.length ? els : null;
-      }, 8000, 250);
+      nums = await waitForTokin(findNums, 8000, 250);
       if (!nums) {
         // v2.0.77 (rev2): la card no mostró input — en vez de pasar, se resuelve
         // contra el CARRITO: abrir drawer, localizar la card por ARC y FIJAR la
@@ -2310,7 +2535,11 @@
       // agregar- se quedaba en 1 aunque el input mostrara el número correcto:
       // la línea pasaba de largo con "error de 1 qty" (caso 11777) y después
       // se reportaba como "sin stock" cuando en realidad nunca se pidió esa qty.
-      for (const el of nums) {
+      // v2.0.84: se tipea sobre los nodos VIVOS de la card del alta (por ARC).
+      // Los nodos capturados antes del click pueden haber sido desmontados por un
+      // re-render del SPA: escribir ahí deja el store en 1 mientras el input viejo
+      // muestra el número correcto.
+      for (const el of findNums() || nums) {
         if (el.offsetParent === null) continue;
         try { await tokTypeInto(el, wantQty); } catch (e) {}
       }
@@ -2326,14 +2555,23 @@
         // input de la misma card que todavía mostraba la cantidad pedida, y la
         // línea pasaba como correcta. Si no hay ningún input legible se
         // devuelve null (indeterminado) en vez de asumir que quedó bien.
-        let v = null;
-        for (const el of nums) {
-          if (el.offsetParent !== null) {
-            const n = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
-            if (!isNaN(n) && n >= 0) v = v == null ? n : Math.min(v, n);
+        // v2.0.84: se relee la card VIVA por ARC y no el NodeList capturado. La
+        // confirmación anterior se autodvalidaba contra los mismos nodos que
+        // acababa de tipear, así que un nodo desmontado (que igual muestra el
+        // valor escrito) daba la línea por correcta con el carrito en 1.
+        const leer = (els) => {
+          let v = null;
+          for (const el of els) {
+            if (el.offsetParent !== null) {
+              const n = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
+              if (!isNaN(n) && n >= 0) v = v == null ? n : Math.min(v, n);
+            }
           }
-        }
-        return v;
+          return v;
+        };
+        const frescos = findNums();
+        if (frescos && frescos.length) return leer(frescos);
+        return leer(nums);
       };
       let actualQty = tokReadQty();
       if (actualQty == null) actualQty = wantQty;
@@ -2356,7 +2594,7 @@
             // con tipeo robusto (v2.0.82) y no con la asignación por JS que React
             // ignora: era lo que dejaba al store con la cantidad mínima (1).
             try {
-              for (const el of nums) {
+              for (const el of findNums() || nums) {
                 if (el.offsetParent === null) continue;
                 await tokTypeInto(el, wantQty);
               }
@@ -2377,6 +2615,10 @@
           (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
           (capReject ? " (" + capReject.text.slice(0, 60) + ")" : "") +
           " (máximo de unidades alcanzado / sin disponibilidad)";
+        // v2.0.84: el store rechazó la cantidad sobre un producto verificado
+        // (código+nombre+gramaje+conversión): es un faltante real y definitivo,
+        // no se reabre para ajuste manual.
+        tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
         tokDiagPush("cap", { nro: it.nro, msg: "rechazo total: pedido=" + origWantQty + " quedó=0" + (capReject ? " · " + capReject.text.slice(0, 120) : "") + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
         return out;
       }
@@ -2392,7 +2634,9 @@
         // sí hay (si el cliente acepta menos unidades, lo ajusta a mano).
         await toksleep(500);
         let second = 0;
-        for (const el of nums) if (el.offsetParent !== null) {
+        // v2.0.84: relectura sobre los nodos VIVOS de la card del alta, como el
+        // resto de las verificaciones de cantidad.
+        for (const el of findNums() || nums) if (el.offsetParent !== null) {
           const v2 = parseInt(String(el.value || "").replace(/\D+/g, ""), 10);
           if (!isNaN(v2) && v2 > second) second = v2;
         }
@@ -2412,7 +2656,6 @@
           out.ok = false;
           out.added = 0;
           out.usedUnit = usedUnit;
-          out.manual = true;
           const conv = convertedQty > 0 ? convertedQty / qty : 0;
           const alcanza = conv > 0 ? Math.floor(took / conv) : 0;
           // Sugerencia para el cliente: cargar lo que el store SÍ tomó, que
@@ -2432,11 +2675,18 @@
             : "sin stock: no alcanza para completar " + qty + " " + wantUnit +
               " (" + pedidoEnStore + " " + usedUnit + "), el store solo tomó " + took + " " + usedUnit +
               (alcanza > 0 ? " (alcanza solo para " + alcanza + " " + wantUnit + ")" : "");
+          // v2.0.84: el store tomó menos de lo pedido sobre un producto
+          // verificado por código+nombre+gramaje+conversión: el faltante es un
+          // hecho del store, así que la línea entra CONFIRMADA al reporte y NO se
+          // reabre para ajuste manual (la sugerencia queda a la vista en el
+          // Excel). Sin el match entero, o sin poder verificar la cantidad,
+          // sigue siendo revisión manual.
+          if (!tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) out.manual = true;
           tokDiagPush("cap", {
             nro: it.nro,
             msg: "store capó la qty → NO CARGADO: pedido=" + origWantQty + " tomó=" + took +
               " · tope=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "sin mensaje de tope") +
-              " · se quitó del carrito (qty 0)",
+              " · se quitó del carrito (qty 0) · " + (out.confirmado ? "CONFIRMADO" : "revisión manual"),
           });
         }
       } else {
@@ -2470,7 +2720,13 @@
     // valor no dispara el onChange de React y el servidor quedaría corto).
     if (out.ok && wantQty > 0) {
       const code = tokArcCode(cardText);
-      if (code) {
+      // v2.0.84: los COMBOS (C123) no muestran ARC-XXXX, así que no hay card del
+      // carrito que buscar por código y no hay nada que verificar contra el
+      // servidor: para ellos el flujo sigue como antes. Para todo lo demás, la
+      // ausencia de código significa que la card del producto no lo muestra y la
+      // línea NO puede darse por cargada sin confirmar.
+      const esCombo = !!tokComboSku(it.sku);
+      if (code || esCombo) {
         const findCartInp = () => {
           for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
             const sc = tokArcCode(
@@ -2487,8 +2743,13 @@
         if (cartInp) {
           const cur = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10) || 0;
           if (cur === wantQty && wantQty > 1) {
-            tokSetValue(cartInp, String(wantQty - 1));
-            await toksleep(250);
+            // v2.0.84: la perturbación se hace con tipeo, no con tokSetValue. La
+            // asignación por JS es justamente el mecanismo que React ignora (por
+            // eso existe tokTypeInto): el DOM bajaba a N-1 y el servidor se
+            // quedaba con el valor viejo. Además, si algo se interrumpía entre
+            // esta línea y el seteo de abajo, el carrito quedaba en N-1.
+            try { await tokTypeInto(cartInp, wantQty - 1); } catch (e) { tokSetValue(cartInp, String(wantQty - 1)); }
+            await toksleep(350);
           }
           // v2.0.78: el seteo en la card del carrito se hace con tipeo robusto
           // (tecla por tecla): tokSetValue solo asignaba el value y React del
@@ -2519,6 +2780,19 @@
           }
           if (real == null) {
             tokDiagPush("verify", { nro: it.nro, msg: "no se pudo leer la qty en el carrito (want=" + wantQty + " " + usedUnit + ")" });
+            // v2.0.84: se cierra el agujero: no se pudo leer la cantidad, así que
+            // NO se puede afirmar que esté cargada. La línea sale del reporte de
+            // cargadas y va a revisión manual.
+            try { await tokCartSetQty(findCartInp() || cartInp, 0); await toksleep(400); } catch (e) {}
+            out.ok = false;
+            out.added = 0;
+            out.manual = true;
+            out.usedUnit = usedUnit;
+            out.message =
+              "revisión manual: no se pudo verificar la cantidad " + wantQty + " " + usedUnit +
+              (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+              " en el carrito — cargala a mano";
+            tokDiagPush("nofix", { nro: it.nro, msg: "qty ilegible en el carrito · want=" + wantQty + " " + usedUnit + " · línea a revisión manual" });
           } else if (real < wantQty) {
             // La cantidad no quedó asentada: la línea NO pasa como cargada, se
             // saca del carrito y queda para revisión manual.
@@ -2535,9 +2809,39 @@
           } else {
             tokDiagPush("verify", { nro: it.nro, msg: "qty verificada en el carrito: " + real + "/" + wantQty + " " + usedUnit });
           }
+        } else if (esCombo) {
+          // Combo sin ARC: no hay contra qué verificar, se deja pasar (el combo
+          // no expone unidad ni cantidad en el carrito).
+          tokDiagPush("verify", { nro: it.nro, msg: "combo sin ARC: sin verificación de cantidad en el carrito (want=" + wantQty + ")" });
         } else {
+          // v2.0.84: se cierra el agujero. Antes esto solo escribía un
+          // diagnóstico y la línea quedaba CARGADA sin haberla verificado una
+          // sola vez contra el carrito: era el pass en silencio por el que se
+          // podían mandar ítems equivocados sin que nadie se enterara.
           tokDiagPush("verify", { nro: it.nro, msg: "sin card del código en el carrito para verificar (want=" + wantQty + " " + usedUnit + ")" });
+          out.ok = false;
+          out.added = 0;
+          out.manual = true;
+          out.usedUnit = usedUnit;
+          out.message =
+            "revisión manual: el producto ARC-" + code + " no aparece en el carrito para verificar la cantidad " +
+            wantQty + " " + usedUnit + (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+            " — revisá si se agregó y cargala a mano";
+          tokDiagPush("nofix", { nro: it.nro, msg: "producto ausente del carrito · ARC-" + code + " · línea a revisión manual" });
         }
+      } else {
+        // v2.0.84: producto con card pero sin ARC visible. Sin código no se puede
+        // verificar nada contra el carrito, así que tampoco pasa en silencio.
+        tokDiagPush("verify", { nro: it.nro, msg: "card sin ARC: sin verificación de cantidad (want=" + wantQty + " " + usedUnit + ")" });
+        out.ok = false;
+        out.added = 0;
+        out.manual = true;
+        out.usedUnit = usedUnit;
+        out.message =
+          "revisión manual: la card del store no muestra código ARC, no se puede verificar la cantidad " +
+          wantQty + " " + usedUnit + (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+          " — revisá el carrito y cargala a mano";
+        tokDiagPush("nofix", { nro: it.nro, msg: "card sin ARC · línea a revisión manual" });
       }
     }
     tokDiagPush("set", { nro: it.nro, msg: "qty final=" + wantQty + " (conv=" + convertedQty + ") ok=" + out.ok + " · usedUnit=" + usedUnit + " → " + String(out.message || "").slice(0, 220) });

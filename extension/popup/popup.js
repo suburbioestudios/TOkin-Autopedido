@@ -387,9 +387,32 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
 
   // v2.0.82: una línea está CARGADA solo si su mensaje arranca con "agregado".
   // Todo lo demás (conversión no exacta, qty que el store no registró, sin
-  // stock, no encontrado) quedó FUERA del carrito y es revisión manual.
+  // stock, no encontrado) quedó FUERA del carrito.
   function isCargada(r) {
     return !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+  }
+
+  // v2.0.84: SIN STOCK CONFIRMADO. El content script marca `confirmado` cuando el
+  // producto quedó verificado por código flexible + nombre + gramaje y el store
+  // no lo tiene (o tomó menos de lo pedido). Es un hecho del store, no una falla
+  // de la extensión: entra al reporte como observación confirmada y NO se reabre
+  // para ajuste manual, porque no hay nada que el cliente pueda cambiar.
+  function esSinStockConfirmado(r) {
+    return !!(r && r.confirmado === true && !isCargada(r));
+  }
+
+  // v2.0.84: RONDA MANUAL DEFINITIVA. Una línea que ya pasó por la tanda de
+  // ajustes manuales tiene su resultado FINAL: si después de corregirla a mano
+  // cae en sin stock o no encontrado, eso es lo que queda. No se abre una
+  // segunda tanda para la misma línea.
+  function esAjusteDefinitivo(r) {
+    return !!(r && r.manualRound);
+  }
+
+  // v2.0.84: lo que efectivamente se puede corregir a mano. Fuera de la lista
+  // quedan (a) los sin stock confirmados, que son un hecho del store, y (b) las  // líneas que ya pasaron por una tanda de ajuste, cuyo resultado es definitivo.
+  function esPendienteDeAjuste(r) {
+    return !isCargada(r) && !esSinStockConfirmado(r) && !esAjusteDefinitivo(r);
   }
 
   // v2.0.82: nro de línea del pedido de un resultado (el que se usa para
@@ -458,7 +481,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     // encabezado "Requiere revisión manual". Así el cliente ve la tarea terminada
     // y, debajo, exactamente lo que tiene que corregir a mano.
     const cargadas = res.filter(isCargada);
-    const manuales = res.filter((r) => !isCargada(r));
+    const manuales = res.filter(esPendienteDeAjuste);
     let html =
       '<p class="hint">Agregados al carrito: ' + cargadas.length + " de " + res.length +
       (manuales.length
@@ -505,10 +528,13 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     updateCartBtn();
   }
 
-  // Cuántas líneas del informe actual quedaron fuera del carrito (para el botón).
+  // Cuántas líneas del informe actual quedan para la ronda manual. Cuenta sólo lo
+  // que todavía se puede corregir: los sin stock confirmados ya son un hecho del
+  // store y las que ya pasaron por una tanda manual tienen resultado definitivo,
+  // así que en ambos casos el botón no ofrece una segunda vuelta.
   function manualCount() {
     const res = ((ui.cart && ui.cart.results) || []).filter(Boolean);
-    return res.filter((r) => !isCargada(r)).length;
+    return res.filter(esPendienteDeAjuste).length;
   }
 
   function renderCartItems(progress, total) {
@@ -621,8 +647,10 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     // v2.0.82: lo que quedó fuera del carrito se anuncia arriba también, no
     // solo en el listado: el cliente tiene que enterarse de que el pedido NO
     // terminó y que hay algo que hacer.
-    const man = ((c.results || []).filter(Boolean) || []).filter((r) => !isCargada(r)).length;
+    const man = ((c.results || []).filter(Boolean) || []).filter(esPendienteDeAjuste).length;
     if (man) parts.push("Requiere revisión manual: " + man);
+    const def = ((c.results || []).filter(Boolean) || []).filter((r) => esAjusteDefinitivo(r) && !isCargada(r)).length;
+    if (def) parts.push("Definitivos tras ajuste manual: " + def + " (sin segunda ronda)");
     // v2.0.57: no existe "sin confirmar" en el informe final.
     if (parts.length) html += "\n" + parts.join(" · ");
     $("#done-summary").textContent = html;
@@ -1066,12 +1094,16 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     // v2.0.82: pedido terminado con líneas sin cargar → TANDA DE AJUSTES
     // MANUALES. Se reenvían solo esas, con lo que el cliente corrigió, sin
     // tocar lo que ya quedó en el carrito (no se duplican productos).
+    // v2.0.84: es la ÚNICA ronda. Sólo entran las líneas que de verdad se pueden
+    // corregir: los sin stock confirmados son un hecho del store y, para todo lo
+    // que salga de esta tanda, el resultado que quede es el definitivo aunque siga
+    // sin cargarse.
     const st = ui.sessionState || {};
     const res = ((ui.cart && ui.cart.results) || []).filter(Boolean);
-    const manuales = res.filter((r) => !isCargada(r));
+    const manuales = res.filter(esPendienteDeAjuste);
     if (st.status === "done" && manuales.length) {
       setAction("cancelCart");
-      setStatus("Cargando los ajustes manuales…");
+      setStatus("Cargando los ajustes manuales… (ronda única: lo que quede es el resultado final)");
       const r = await toOff({ type: "START_MANUAL_BATCH", items: manualPayload(manuales) });
       if (!r || !r.ok) {
         setStatus((r && r.message) || "No se pudo cargar la tanda manual.", "err");
@@ -1112,7 +1144,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   // Antes era un regex genérico /unidad/i que etiquetaba "ERROR UNIDAD" hasta
   // la falta de stock ("el store solo tiene N unidades..."). Ahora cada caso
   // real tiene su estado propio.
-  function estadoDe(r) {
+  function estadoBase(r) {
     const msg = String((r && r.message) || "");
     if (r && r.ok && msg.indexOf("agregado") === 0) {
       // La línea quedó en el carrito; si quedó con menos cantidad de la pedida
@@ -1135,6 +1167,19 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     return "NO CARGADO";
   }
 
+  // v2.0.84: el estado que se muestra y se escribe en el Excel. Se le antepone
+  // "DEFINITIVO" a toda línea que ya pasó por una tanda de ajuste manual y no
+  // quedó cargada: su resultado es el final y no hay una segunda vuelta. Y los
+  // sin stock confirmados se marcan como tales, que es lo que los hace entrar al
+  // reporte como observación firme y no como pendiente de corregir.
+  function estadoDe(r) {
+    const base = estadoBase(r);
+    if (base === "CARGADO") return base;
+    if (esSinStockConfirmado(r)) return "SIN STOCK CONFIRMADO";
+    if (esAjusteDefinitivo(r)) return "DEFINITIVO · " + base;
+    return base;
+  }
+
   function estadoCounts(results) {
     const res = results || [];
     const added = res.filter(isCargada);
@@ -1143,28 +1188,30 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       // v2.0.82: solo para reconocer sesiones viejas; la versión actual nunca
       // reporta una línea parcial como cargada.
       faltaUnidades: added.filter((r) => /falta de unidades para completar stock|agregado parcial/.test(String(r.message || ""))).length,
-      sinStock: res.filter((r) => estadoDe(r) === "SIN STOCK").length,
-      notFound: res.filter((r) => estadoDe(r) === "NO ENCONTRADO").length,
+      sinStock: res.filter((r) => estadoBase(r) === "SIN STOCK").length,
+      sinStockConfirmado: res.filter(esSinStockConfirmado).length,
+      notFound: res.filter((r) => estadoBase(r) === "NO ENCONTRADO").length,
       // v2.0.82: todo lo que no quedó cargado y necesita una decisión del
       // cliente (conversión, match o cantidad que el store no tomó).
-      manual: res.filter((r) => estadoDe(r) === "REVISIÓN MANUAL").length,
+      manual: res.filter((r) => estadoBase(r) === "REVISIÓN MANUAL").length,
+      // v2.0.84: lo que queda realmente editable a mano: sin stock confirmados y
+      // resultados definitivos ya quedan afuera.
+      pendienteAjuste: res.filter(esPendienteDeAjuste).length,
+      definitivos: res.filter((r) => esAjusteDefinitivo(r) && !isCargada(r)).length,
     };
   }
 
-  // v2.0.82: líneas que una tanda de ajustes manuales tocó (con o sin éxito).
-  // Es la hoja "Ajustes manuales": deja constancia de qué se corrigió a mano y
-  // cómo terminó, que es lo que el cliente pidió que figure en el reporte.
-  function resultadosConAjuste(results) {
-    return (results || []).filter((r) => r && r.manualRound);
-  }
-
-  // Excel de cierre (v2.0.82): 5 hojas:
-  // 1) "Reporte General": todas las líneas del pedido, agrupadas por grupo de
-  //    compra, con "Cargó en" y "Cant. cargada".
-  // 2) "Faltantes y Observados": lo que al final NO quedó cargado.
-  // 3) "Requiere revisión manual": lo que sigue pendiente, con la carga sugerida.
-  // 4) "Ajustes manuales": qué se corrigió a mano y cómo terminó.
-  // 5) "Carrito antes de Revisar": la foto del carrito de cada grupo.
+  // v2.0.84: Excel de cierre con 2 hojas, como pidió el cliente:
+  // 1) "Reporte General": todas las líneas del pedido, agrupadas por BLOQUE de
+  //    compra (los lotes 1..N y las tandas de ajuste manual A1..An al final, que
+  //    es el orden real en que se hizo cada compra), con "Cargó en" y
+  //    "Cant. cargada".
+  // 2) "Faltantes y Observados": todo lo que no quedó cargado, ALSO ordenado por
+  //    bloques e incluyendo las líneas corregidas a mano y los sin stock
+  //    confirmados.
+  // Lo que sobra (foto del carrito por bloque) no se pierde: queda anotado en el
+  // separador de cada bloque, así el Excel sigue diciendo si ese momento de
+  // compra quedó verificado.
   async function descargarExcel() {
     // v2.0.76: si el popup perdió la sesión (error / refresh / el offscreen se
     // cerró) el intento usa el último reporte persistido en storage.local; así
@@ -1211,17 +1258,19 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     // carrito real (productos únicos), no las líneas del pedido.
     const headN = (ui.cart && ui.cart.prodAdded != null) ? ui.cart.prodAdded : added;
     const headM = (ui.cart && ui.cart.totalProducts) || results.length;
-    // v2.0.82: el encabezado responde las tres preguntas del cliente: cuánto se
-    // cargó, qué quedó pendiente y cuántas de esas pendientes se resolvieron con
-    // una pasada manual. Las que se resolvieron ya NO cuentan como faltantes.
+    // v2.0.84: el encabezado separa lo que es un HECHO del store de lo que todavía
+    // se puede corregir, que es lo que pidió el cliente: los sin stock confirmados
+    // no son pendientes (no hay nada que ajustar) y las líneas que ya pasaron por
+    // una tanda manual tienen resultado definitivo.
     const resueltas = results.filter((r) => r && r.manualRound && isAdded(r)).length;
     const pendientes = results.filter((r) => r && !isAdded(r)).length;
-    const resumenMan = resultadosConAjuste(results).length;
+    const resumenMan = results.filter((r) => r && r.manualRound).length;
     const summaryStr = `Pedido cargado: ${headN} de ${headM} productos del pedido | Pendientes: ${pendientes} | Resueltas con ajuste manual: ${resueltas}` +
       (resumenMan ? ` (ajustes manuales: ${resumenMan} líneas)` : "") +
-      ` | Sin stock: ${sinStock} | No encontrados: ${notFound}` +
+      ` | Sin stock: ${sinStock} (confirmados: ${counts.sinStockConfirmado}) | No encontrados: ${notFound}` +
+      (counts.definitivos ? " | Definitivos tras ajuste manual: " + counts.definitivos : "") +
       (counts.faltaUnidades ? " | Falta unidades: " + counts.faltaUnidades : "") +
-      (counts.manual ? " | Requiere revisión manual: " + counts.manual : "");
+      (counts.pendienteAjuste ? " | Ajustables a mano: " + counts.pendienteAjuste : " | Ajustables a mano: 0 (no hay segunda ronda)");
     // v2.0.79: el mapeo de lotes se declara acá, ANTES de las hojas. Estaba
     // dentro del primer forEach y se usaba en el segundo → ReferenceError que
     // mataba la generación del Excel sin bajar nada ("no aparece el informe").
@@ -1248,6 +1297,26 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       if (!gr && !checksXls[g]) return "— estado de compra desconocido";
       const conf = gr ? !!gr.confirmado : !!checksXls[g];
       return conf ? "PEDIDO REALIZADO" : "CARGADO EN CARRITO (SIN CONFIRMAR)";
+    };
+    // v2.0.84: la foto del carrito por bloque era una hoja propia y con el Excel
+    // de 2 hojas dejó de serlo, pero la evidencia no se pierde: el separador de
+    // cada bloque dice si ese momento de compra quedó verificado y con cuántas
+    // líneas/productos. Si el store no dejó leer el carrito, se dice explícito.
+    const separadorGrupo = (g) => {
+      const gr = gruposXls[g] || {};
+      const foto = Array.isArray(gr.foto) ? gr.foto : [];
+      let txt = "— " + estadoCompra(g);
+      if (gr.manual) txt += " · tanda de ajustes manuales";
+      if (gr.checkouts > 1) txt += " · " + gr.checkouts + " checkouts";
+      if (gr.fecha) txt += " · " + fechaXls(gr.fecha);
+      if (foto.length) {
+        txt += " · foto del carrito: " + foto.length + " producto" + (foto.length === 1 ? "" : "s") + " verificados";
+      } else if (gr.verificado === false || (gr.verificado != null && !gr.verificado)) {
+        txt += " · carrito NO verificable en ese instante (el store no dejó leerlo)";
+      } else {
+        txt += " · sin foto del carrito";
+      }
+      return txt;
     };
     // "Cantidad cargada" en una sola celda, con su unidad (lo pidió el cliente
     // en vez de "Unidad Usada"). En lo que SÍ entró va la unidad que tomó el
@@ -1329,7 +1398,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       // REALIZADO» solo si el checkout confirmó; si no, «CARGADO EN CARRITO (SIN
       // CONFIRMAR)»; y si no hay dato, se dice que se desconoce.
       if (g !== grupoActual) {
-        generalAoa.push([etiquetaGrupo(g), "", "", "", "", "", "", "", "— " + estadoCompra(g)]);
+        generalAoa.push([etiquetaGrupo(g), "", "", "", "", "", "", "", separadorGrupo(g)]);
         grupoActual = g;
       }
       generalAoa.push([
@@ -1346,206 +1415,73 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       ]);
     }
 
-    // 2. Hoja 2: FALTANTES Y OBSERVADOS — 9 columnas con detalle del store.
-    // Sólo entra lo que al FINAL sigue sin cargar: una línea corregida a mano y
-    // cargada ya no aparece acá (queda en «Reporte General» con su grupo y en
-    // «Ajustes manuales»). Lo que no tiene match de código o falta en el store
-    // sigue apareciendo, que es el reporte que pidió el cliente.
-    const pendHeaders = ["#", "Código SKU", "Producto Solicitado", "Cant. Pedida", "Unidad Pedida", "Estado", "Producto Matcheado (Store)", "Cant. cargada", "Diagnóstico Detallado"];
+    // 2. Hoja 2: FALTANTES Y OBSERVADOS — todo lo que al final NO quedó cargado,
+    // en el MISMO orden por bloques que el Reporte General (los lotes 1..N y al
+    // final las tandas de ajustes manuales A1..An). Se recyclea filasGen, que ya
+    // está ordenado y agrupado, así las dos hojas cuentan exactamente lo mismo.
+    // Entra acá todo lo pendiente, incluidos los sin stock CONFIRMADOS (que son
+    // un hecho del store, no algo que el cliente pueda corregir) y las líneas
+    // corregidas a mano, cuyo resultado ya es definitivo.
+    const pendHeaders = ["#", "Código SKU", "Producto Solicitado", "Cant. Pedida", "Unidad Pedida", "Estado", "Cargó en", "Producto Matcheado (Store)", "Cant. cargada", "Diagnóstico Detallado"];
     const pendingAoa = [];
     pendingAoa.push([summaryStr]);
     pendingAoa.push(pendHeaders);
 
     let pendIdx = 0;
     let pendGrupo = null;
-    (recovered ? results.filter(Boolean) : allItems).forEach((it, i) => {
-      const r = recovered ? it : (results[i] || {});
-      // Hoja de observados: todo lo que NO quedó cargado con la cantidad pedida
-      // (sin stock, no encontrado, revisión manual) y, en sesiones viejas, las
-      // que habrían quedado como carga parcial.
-      if (isAdded(r) && !isPartial(r)) return;
-      if (!(it.producto || it.sku || "").trim()) return;
+    for (let i = 0; i < filasGen.length; i++) {
+      const row = filasGen[i].row;
+      const r = row.r;
+      // Todo lo que NO quedó cargado con la cantidad pedida (sin stock, sin
+      // stock confirmado, no encontrado, revisión manual) y, en sesiones viejas,
+      // las que habrían quedado como carga parcial.
+      if (isAdded(r) && !isPartial(r)) continue;
       pendIdx++;
-      const unidad = recovered ? (r.unidad || r.categoria || r.usedUnit || "") : (it.categoria || it.unidad || "");
-      const estado = estadoDe(r);
+      const g = filasGen[i].grupo;
+      const unidad = row.unidad || r.unidad || r.categoria || r.usedUnit || "";
       const diagExtra =
         (r.convFactor > 0 ? " | factor conv: " + r.convFactor + " (pedido " + r.usedUnit + ")" : "") +
         (r.storeButtons ? " | botones card: " + r.storeButtons : "") +
-        (r.usedUnit ? " | unidad elegida por el store: " + r.usedUnit : "");
-
-      const nroPend = recovered ? (r.nro || pendIdx) : (it.nro || pendIdx);
-      // v2.0.82: separador por grupo (igual que en el reporte general).
-      const g = grupoDe(r, nroPend);
+        (r.usedUnit ? " | unidad elegida por el store: " + r.usedUnit : "") +
+        (r.sugQty > 0 ? " | se puede cargar a mano: " + r.sugQty + " " + (r.sugUnit || "") +
+          (r.sugTotal > 0 ? " (cubre " + r.sugTotal + " " + (r.unidad || "unidad") + ")" : "") : "") +
+        (r.confirmado === true ? " | CONFIRMADO: el store no tiene el stock (producto verificado por código+nombre+gramaje), no requiere ajuste" : "") +
+        (r.manualRound ? " | RESULTADO DEFINITIVO: ya se corrigió a mano en la tanda A" + r.manualRound + " y así terminó; no hay segunda ronda de ajuste" : "");
       if (g !== pendGrupo) {
-        pendingAoa.push([etiquetaGrupo(g), "", "", "", "", "", "", "", "— " + estadoCompra(g)]);
+        pendingAoa.push([etiquetaGrupo(g), "", "", "", "", "", "", "", "", separadorGrupo(g)]);
         pendGrupo = g;
       }
       pendingAoa.push([
-        nroPend,
-        String(recovered ? (r.sku || "") : (it.sku || "—")),
-        String(it.producto || ""),
-        String(recovered ? (r.cantidad != null && r.cantidad !== "" ? r.cantidad : (r.qty || "1")) : (it.cantidad || "1")),
+        row.nro,
+        String(row.sku || "—"),
+        String(row.producto || ""),
+        String(row.cantidad || "1"),
         String(unidad || ""),
-        estado,
+        estadoDe(r),
+        etiquetaGrupo(g),
         String(r.storeName || r.storeText || "—"),
         cantCargadaDe(r, unidad),
         String(r.message || "Sin mensaje de respuesta") + diagExtra
       ]);
-    });
+    }
     if (!pendIdx) {
       pendingAoa.push(["(sin líneas pendientes: todo el pedido quedó cargado)"]);
-    }
-
-    // 3. v2.0.82: Hoja 3: REQUIERE REVISIÓN MANUAL — todo lo que al final NO
-    // quedó cargado y hay que subir a mano. Usa el mismo criterio que la lista
-    // del popup (todo lo que no está cargado), así el Excel y la pantalla
-    // muestran lo mismo: incluye las líneas sin match de código y las sin stock,
-    // con el motivo y, cuando se puede armar, con qué unidad y cantidad lo
-    // cargaría (la sugerencia nunca se aplicó sola: el pedido va tal cual).
-    const manualHeaders = [
-      "#", "Código SKU", "Producto Solicitado", "Cant. Pedida", "Unidad Pedida",
-      "Estado", "Cargó en", "Motivo", "Cargar a mano: unidad", "Cargar a mano: cantidad",
-      "Unidades que cubre", "Producto en el store",
-    ];
-    const manualAoa = [];
-    manualAoa.push([summaryStr]);
-    manualAoa.push(manualHeaders);
-    let manIdx = 0;
-    (recovered ? results.filter(Boolean) : allItems).forEach((it, i) => {
-      const r = recovered ? it : (results[i] || {});
-      // Mismo criterio que renderCartResults: queda acá todo lo que no quedó
-      // cargado (y las parciales de sesiones viejas).
-      if (isAdded(r) && !isPartial(r)) return;
-      if (!(it.producto || it.sku || "").trim()) return;
-      manIdx++;
-      const nroMan = recovered ? (r.nro || manIdx) : (it.nro || manIdx);
-      const cantPed = recovered
-        ? (r.cantidad != null && r.cantidad !== "" ? r.cantidad : (r.qty != null ? r.qty : ""))
-        : (it.cantidad || "1");
-      const uniPed = recovered ? (r.unidad || r.categoria || r.usedUnit || "") : (it.categoria || it.unidad || "");
-      manualAoa.push([
-        nroMan,
-        String(recovered ? (r.sku || "") : (it.sku || "—")),
-        String(it.producto || ""),
-        String(cantPed),
-        String(uniPed),
-        estadoDe(r),
-        etiquetaGrupo(grupoDe(r, nroMan)),
-        String(r.message || "Sin mensaje de respuesta") +
-          (r.manualRound ? " · corregido a mano en la tanda de ajustes A" + r.manualRound : ""),
-        String((r.sugUnit || "").trim()),
-        r.sugQty > 0 ? r.sugQty : "",
-        r.sugTotal > 0 ? r.sugTotal : "",
-        String(r.storeName || r.storeText || "—"),
-      ]);
-    });
-    if (!manIdx) {
-      manualAoa.push(["(sin líneas para revisión manual)"]);
-    }
-
-    // 4. v2.0.82: Hoja AJUSTES MANUALES — lo que el cliente corrigió a mano y
-    // cómo terminó. Es el "entregarlo en reporte" que pidió: la línea corregida
-    // sale de Faltantes y de Revisión manual, pero queda documentada acá con la
-    // cantidad/unidad corregida y su resultado final.
-    const ajHeaders = [
-      "#", "Código SKU", "Producto Solicitado", "Cant. corregida", "Unidad corregida",
-      "Tanda de ajuste", "Cant. cargada", "Estado final", "Diagnóstico",
-    ];
-    const ajAoa = [];
-    ajAoa.push([summaryStr]);
-    ajAoa.push(ajHeaders);
-    let ajIdx = 0;
-    resultadosConAjuste(recovered ? results.filter(Boolean) : (allItems.map((it, i) => results[i] || {}).filter(Boolean)))
-      .forEach((r) => {
-        ajIdx++;
-        ajAoa.push([
-          r.nro || ajIdx,
-          String(r.sku || "—"),
-          String(r.producto || ""),
-          String(r.cantidad != null && r.cantidad !== "" ? r.cantidad : (r.qty || "")),
-          String(r.unidad || r.categoria || r.usedUnit || ""),
-          "AJUSTES MANUALES A" + r.manualRound,
-          cantCargadaDe(r, r.unidad || r.categoria),
-          estadoDe(r),
-          String(r.message || "Sin mensaje de respuesta"),
-        ]);
-      });
-    if (!ajIdx) {
-      ajAoa.push(["(no hubo correcciones manuales en esta carga)"]);
-    }
-
-    // 5. v2.0.82: Hoja CARRITO ANTES DE «REVISAR PEDIDO» — la foto de cada
-    // grupo: qué había efectivamente en el carrito en el instante previo al
-    // checkout. Si el store no dejó leer el drawer, el grupo queda marcado como
-    // "carrito no verificable" en vez de mostrar un estado supuesto.
-    const fotoHeaders = [
-      "Grupo", "Fecha y hora", "Tipo", "Líneas del grupo", "Líneas cargadas",
-      "Productos en el carrito", "Compra confirmada", "Contenido del carrito al momento de «Revisar pedido»",
-    ];
-    const fotoAoa = [];
-    fotoAoa.push([summaryStr]);
-    fotoAoa.push(fotoHeaders);
-    const gKeys = Object.keys(gruposXls).sort((a, b) => ordenGrupo(a) - ordenGrupo(b));
-    gKeys.forEach((g) => {
-      const gr = gruposXls[g] || {};
-      const foto = Array.isArray(gr.foto) ? gr.foto : [];
-      fotoAoa.push([
-        etiquetaGrupo(g),
-        fechaXls(gr.fecha) + (gr.checkouts > 1 ? " (último: " + fechaXls(gr.ultimoCheckout) + ")" : ""),
-        (gr.manual ? "Ajuste manual" : "Lote del pedido") + (gr.checkouts > 1 ? " · " + gr.checkouts + " checkouts" : ""),
-        gr.totalLineas != null ? gr.totalLineas : (Array.isArray(gr.lineas) ? gr.lineas.length : ""),
-        gr.cargadas != null ? gr.cargadas : "",
-        gr.productosEnCarrito != null ? gr.productosEnCarrito : "",
-        gr.confirmado ? "SÍ — pedido realizado" : "NO — cargado en carrito, sin confirmar",
-        foto.length
-          ? foto.map((c) => "• " + [c.code ? "ARC-" + c.code : "s/código", c.nombre || "", (c.qty != null ? c.qty : "") + (c.unidad ? " " + c.unidad : "")].filter(Boolean).join(" · ")).join("\n")
-          : (gr.verificado === false || !gr.verificado ? "Carrito no verificable: el store no dejó leer el carrito en ese instante." : "—"),
-      ]);
-    });
-    if (!gKeys.length) {
-      const ultFoto = ui.cart && Array.isArray(ui.cart.carrito) ? ui.cart.carrito : null;
-      if (ultFoto && ultFoto.length) {
-        fotoAoa.push([
-          "(sin grupo identificado)", "—", "Último bloque reportado", "—", "—", "—", "—",
-          ultFoto.map((c) => "• " + [c.code ? "ARC-" + c.code : "s/código", c.nombre || "", (c.qty != null ? c.qty : "") + (c.unidad ? " " + c.unidad : "")].filter(Boolean).join(" · ")).join("\n"),
-        ]);
-      } else {
-        fotoAoa.push(["(sin foto de carrito disponible)"]);
-      }
     }
 
     try {
       const wb = XLSX.utils.book_new();
       const wsGeneral = XLSX.utils.aoa_to_sheet(generalAoa);
       const wsPending = XLSX.utils.aoa_to_sheet(pendingAoa);
-      const wsManual = XLSX.utils.aoa_to_sheet(manualAoa);
-      const wsAj = XLSX.utils.aoa_to_sheet(ajAoa);
-      const wsFoto = XLSX.utils.aoa_to_sheet(fotoAoa);
 
-      wsGeneral["!cols"] = [{ wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 12 }, { wch: 14 }, { wch: 16 }, { wch: 22 }, { wch: 16 }, { wch: 65 }];
-      wsPending["!cols"] = [{ wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 12 }, { wch: 14 }, { wch: 16 }, { wch: 42 }, { wch: 16 }, { wch: 65 }];
-      wsManual["!cols"] = [
-        { wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 12 }, { wch: 14 }, { wch: 18 },
-        { wch: 22 }, { wch: 70 }, { wch: 20 }, { wch: 20 }, { wch: 18 }, { wch: 42 },
-      ];
-      wsAj["!cols"] = [
-        { wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 16 }, { wch: 16 },
-        { wch: 20 }, { wch: 16 }, { wch: 18 }, { wch: 70 },
-      ];
-      wsFoto["!cols"] = [
-        { wch: 22 }, { wch: 18 }, { wch: 18 }, { wch: 16 }, { wch: 16 },
-        { wch: 20 }, { wch: 32 }, { wch: 80 },
-      ];
+      wsGeneral["!cols"] = [{ wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 12 }, { wch: 14 }, { wch: 18 }, { wch: 22 }, { wch: 16 }, { wch: 65 }];
+      wsPending["!cols"] = [{ wch: 4 }, { wch: 14 }, { wch: 42 }, { wch: 12 }, { wch: 14 }, { wch: 20 }, { wch: 22 }, { wch: 42 }, { wch: 16 }, { wch: 80 }];
 
       XLSX.utils.book_append_sheet(wb, wsGeneral, "Reporte General");
       XLSX.utils.book_append_sheet(wb, wsPending, "Faltantes y Observados");
-      XLSX.utils.book_append_sheet(wb, wsManual, "Requiere revisión manual");
-      XLSX.utils.book_append_sheet(wb, wsAj, "Ajustes manuales");
-      XLSX.utils.book_append_sheet(wb, wsFoto, "Carrito antes de Revisar");
 
       const name = "Reporte_Autotokin_" + String(baseName).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.(xlsx|xls|csv|pdf|docx)$/i, "") || "Reporte_Autotokin_informe";
       XLSX.writeFile(wb, name + ".xlsx");
-      setStatus("Excel detallado descargado: " + name + ".xlsx", "ok");
+      setStatus("Excel descargado: " + name + ".xlsx (2 hojas: Reporte General · Faltantes y Observados)", "ok");
     } catch (e) {
       setStatus("No se pudo generar el Excel: " + String((e && e.message) || e), "err");
     }
