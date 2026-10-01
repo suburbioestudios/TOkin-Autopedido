@@ -535,7 +535,11 @@
       // (8s/350ms) y tapaba el resto del log con repeticiones. Se colapsa: si
       // el mismo motivo ya se registró para la misma línea, solo se cuenta.
       try {
-        const sig = phase + "|" + ((d && d.msg) || "");
+        // v2.0.89: la firma incluye la linea (nro/idx). Antes era phase+msg, asi
+        // que dos lineas DISTINTAS con el mismo texto generico consecutivo se
+        // fusionaban en el log y parecia una sola repetida.
+        const quien = d && d.nro != null ? "n" + d.nro : d && d.idx != null ? "i" + d.idx : "";
+        const sig = phase + "|" + quien + "|" + ((d && d.msg) || "");
         const last = tokDiagLog[tokDiagLog.length - 1];
         if (last && last.sig === sig) {
           last.rep = (last.rep || 1) + 1;

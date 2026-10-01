@@ -3,9 +3,10 @@
 // corren en el documento offscreen, que sigue vivo aunque este popup se cierre
 // al minimizar la pestaña. Al reabrir, se restaura la sesión desde allí.
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
-// v2.0.87: ya no se usa el control de acceso por mail. Queda el import solo por
-// isAllowed, que hoy siempre da true y sirve de guarda si se reintrodujera.
-import { isAllowed } from "../core/access.js";
+// v2.0.89: se borra el control de acceso por mail (access.js). No quedaba como
+// guarda de nada: isAllowed siempre daba true y su unico uso real era el fetch
+// de allowed_users.json, que sin senal trababa el arranque del popup. Ahora el
+// unico requisito es tener la pestana del store abierta con sesion iniciada.
 (function () {
   "use strict";
 
@@ -14,7 +15,6 @@ import { isAllowed } from "../core/access.js";
   const ui = {
     doc: null,
     session: null,
-    allowed: null,
     sessionState: null,
     lineItems: [],
     cart: null,
@@ -837,14 +837,13 @@ import { isAllowed } from "../core/access.js";
     }
     const job = res[JOB_KEY];
     if (!job || !job.phase || job.phase === "done") return false;
-    ui.allowed = { ok: true, emails: (ui.allowed && ui.allowed.emails) || [], cached: true };
     setBadge("ok", "Tarea en curso", "");
     $("#access-screen").classList.add("hidden");
     $("#main-screen").classList.remove("hidden");
     $("#cfg-session").textContent = "Tarea en curso: " + (job.docName || "pedido en el store");
     // v2.0.87: el job vivo es una RUPTURA real del proceso (se perdio al
-    // cerrar el popup, caerse la señal o.reload del store). Si se puede
-    // recuperar, se avisa; si no, se deja el estado de error que yahdiga
+    // cerrar el popup, caerse la señal o un reload del store). Si se puede
+    // recuperar, se avisa; si no, se deja el estado de error que ya diga
     // syncFromJob. La reanudacion silenciosa por senal (solo recargar la
     // extension) no pasa por aca y por eso no dispara cartel.
     const ok = await syncFromJob();
@@ -880,12 +879,8 @@ import { isAllowed } from "../core/access.js";
     const tab = await getStoreTab();
     const tabId = tab && tab.id;
 
-    // v2.0.87: ya no se descarga ni espera la lista de emails. La carga era un
-    // fetch a GitHub que, sin señal, delaysba el arranque del popup y terminaba
-    // en la pantalla de acceso aunque la sesión del store estuviera bien. Ahora
-    // solo importa que haya una pestaña del store con sesión iniciada.
-    ui.allowed = { ok: true, emails: [], cached: true };
-
+    // v2.0.89: ya no hay lista de emails ni fetch. El arranque del popup depende
+    // solo de que haya una pestaña del store con sesión iniciada.
     if (!tabId) {
       showAccess(
         "Abrí https://tokintienda.com.ar/store en una pestaña e iniciá sesión, " +
@@ -954,20 +949,6 @@ import { isAllowed } from "../core/access.js";
     // lista de usuarios: el bloqueo real es la conexión o la sesión del store.
     $("#access-title").textContent = title || "Conectar con el store";
     $("#access-badge").textContent = "—";
-  }
-
-  // v2.0.87: sin lista de emails. Queda solo la sesión del store como requisito;
-  // si no hay sesión, el mensaje es el de login (lo llama init). Se conserva la
-  // función para no romper otros callers.
-  async function checkAccess(email) {
-    if (!email) {
-      showAccess(
-        "Iniciá sesión en el store de Tokin para usar la herramienta. " +
-        "Tu pedido sigue guardado hasta que toques «Reanudar»."
-      );
-      return;
-    }
-    setBadge("ok", "Autorizado");
   }
 
   // ------------------------------------------------------------- archivo

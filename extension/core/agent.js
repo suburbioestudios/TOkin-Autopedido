@@ -385,13 +385,11 @@ async function _detect_one(worker, page, rot) {
     // páginas enteras a escala 4.5 (~70 MB cada una) y se creaban 3-4 para las
     // rotaciones candidatas, todas retenidas a la vez: con los 3 workers de
     // Tesseract ya allocations en WASM, el documento offscreen se queda sin
-    // memoria. OJO: se attributó este trap a la memoria y NO era la causa: el
+    // memoria. OJO: este trap se atribuyó a la memoria y NO era la causa (el
     // trap sigue saliendo con los canvas liberados, porque viene del segmentador
-    // de filas del core (ver la nota de BAND_MIN_PX). Liberar igual está bien:
-    // son ~70 MB por render que no hacen falta después de leerlo.
-    // v2.0.89: se attributó antes a memoria y NO era (sigue saliendo con los
-    // canvas liberados). r.w/r.h ya son números (los copia _ocr_canvas antes),
-    // así que liberar acá no afecta nada.
+    // de filas del core; ver la nota de BAND_MIN_PX). Liberar igual está bien:
+    // son ~70 MB por render que no hacen falta después de leerlo. r.w/r.h ya son
+    // números (los copia _ocr_canvas antes), así que liberar acá no afecta nada.
     canvas.width = 0;
     canvas.height = 0;
   }
@@ -954,14 +952,12 @@ function _band_row_fix(rowWords, sku, cy, width) {
 // Geometría de la banda de una fila, compartida por el re-OCR individual y el
 // por lotes. Todo en coordenadas de la página ya renderizada a refineScale:
 // la banda de la fila es la franja vertical [top, top+bh) de esa imagen.
-// v2.0.87: el mínimo de la banda era 1px (Math.max(1, ...)). Una fila cuya.cy
-// cae en el borde de la página recortaba una franja de 1px de alto, y Tesseract
-// la rechazaba por consola con dos warnings por cada fila:
-//   "Image too small to scale!! (1x36 vs min width of 3)"
-//   "Line cannot be recognized!!"
-// No rompían el pedido (salen a stderr y el core sigue), pero ensuciaban la
-// consola y quemaban OCR en regiones que no podían leerse. Ahora la banda tiene
-// un mínimo útil y, si aun así no hay tinta, no se manda a OCR.
+// Mínimos de la banda. El de alto (BAND_MIN_PX) existe desde v2.0.87 porque una
+// fila cuyo .cy cae en el borde de la página recortaba una franja de 1px de alto,
+// que no se puede leer. OJO: NO es lo que frena los warnings de Tesseract (ver
+// abajo); solo evita mandar a OCR una franja degenerada. BAND_INK_MIN es el
+// umbral de tinta de _band_has_ink: una banda en blanco (fila vacía, línea de
+// tabla, borde de hoja) no se manda a OCR.
 const BAND_MIN_PX = 10;
 const BAND_INK_MIN = 12;
 // v2.0.89: lo que se averiguó de verdad sobre estos warnings, para no volver a
@@ -989,7 +985,7 @@ const BAND_INK_MIN = 12;
 // IMPRIME el aviso, después de los warnings.
 //
 // Como el pedido sale completo y correcto igual, se deja pasar. Si alguna vez hay
-// que silencearlo de verdad, el camino es borrar las reglas verticales de 1-2px de
+// que silenciarlo de verdad, el camino es borrar las reglas verticales de 1-2px de
 // la imagen antes del OCR, no tocar el core (se pierde al actualizarlo).
 
 function _band_geom(full, cy, height) {

@@ -5,10 +5,7 @@
   "description": "Ingesta de pedidos desde Excel/PDF/DOCX y autollenado del formulario de Tokin Store. 100% local en el navegador.",
   "permissions": ["storage", "activeTab", "tabs", "scripting", "clipboardWrite", "offscreen", "alarms"],
   "host_permissions": [
-    "https://tokintienda.com.ar/*",
-    "https://raw.githubusercontent.com/*",
-    "https://api.github.com/*",
-    "https://github.com/*"
+    "https://tokintienda.com.ar/*"
   ],
   "background": {
     "service_worker": "background.js"

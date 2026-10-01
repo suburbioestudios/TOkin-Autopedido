@@ -164,22 +164,25 @@ ok(!/Date\.now\(\) - started > 12 \* 60 \* 1000[\s\S]{0,160}?timeout general"\);
   'el timeout general dice qué paso quedó trabado, no solo "timeout general"');
 ok(/st\.retries = 0/.test(waitUrl), "el contador se olvida cuando el paso sí avanza");
 
-console.log("\n6) Sin factor de autorizacion por mail (access.js / popup.js)");
-const accessSrc = fs.readFileSync(path.join(root, "extension", "core", "access.js"), "utf8");
-ok(/function isAllowed\(email, emails\)[\s\S]*?return true;/.test(accessSrc),
-  "isAllowed no compara contra una lista de emails: cualquier sesion con email entra");
-ok(!/emails\.map\(/.test(accessSrc), "isAllowed ya no mira la lista remota");
-// El arranque del popup no puede depender de un fetch a GitHub: sin senal, el
-// fetch fallaba y caia en la pantalla de acceso aunque la sesion del store
-// estuviera perfecta.
-const popupCode = popSrc;
-ok(!/await getAllowedUsers\(\)/.test(popupCode),
-  "init() no espera getAllowedUsers() (era el fetch que rompia sin senal)");
-ok(!/ui\.allowed = access;\s*\n\s*if \(access\.ok\)/.test(popupCode),
-  "init() no arma el estado de la lista para decidir si abrir");
-ok(!/checkAccess\(pong\.session\.email\);/.test(popupCode),
-  "init() no bloquea con checkAccess() antes de entrar");
-// El unico requisito es la sesion del store.
+console.log("\n6) Sin factor de autorizacion por mail (v2.0.89)");
+// v2.0.89: access.js se borro entero. Ya no queda ningun camino que consulte una
+// lista de emails, ni aunque fuera de uso, y el manifest ya no pide permisos a
+// GitHub: la extension es 100% local de verdad.
+ok(!fs.existsSync(path.join(root, "extension", "core", "access.js")),
+  "access.js no existe mas (no queda codigo muerto con el fetch a GitHub)");
+const popupCode = stripComments(popSrc);
+ok(!/access\.js/.test(popupCode), "popup.js no importa nada de access.js");
+ok(!/isAllowed/.test(popupCode), "popup.js no usa isAllowed");
+ok(!/ui\.allowed/.test(popupCode), "no queda el estado ui.allowed, que nunca se leia");
+ok(!/getAllowedUsers|allowed_users|checkCachedAccess|grantAccess|revokeAccess/.test(popupCode),
+  "ninguna referencia a la lista de usuarios en el popup");
+// Tampoco puede quedar el permiso de host, que era lo unico que hacia falta para
+// el fetch: si vuelve a aparecer, alguien metio el control por lista de nuevo.
+const manifestSrc = stripComments(fs.readFileSync(path.join(root, "extension", "manifest.json"), "utf8"));
+ok(!/githubusercontent|api\.github|github\.com/.test(manifestSrc),
+  "el manifest ya no pide permisos de host a GitHub");
+ok(/tokintienda\.com\.ar/.test(manifestSrc), "el unico host que queda es el store");
+// El unico requisito para abrir es la sesion del store.
 ok(/if \(!pong\.session\.email\)/.test(popupCode),
   "el requisito que queda es la sesion del store");
 
@@ -349,6 +352,10 @@ ok(/Image too small to scale/.test(agentSrc),
 console.log("\n10) El log de rechazos no se repite y la espera bajo (content.js)");
 const diag = extractFunction(contentSrc, "tokDiagPush");
 ok(/last\.sig === sig/.test(stripComments(diag)), "un rechazo identico y consecutivo se colapsa");
+ok(/const quien = d && d\.nro != null \? "n" \+ d\.nro/.test(stripComments(diag)),
+  "la firma incluye la linea (nro/idx): sin eso dos lineas distintas con el mismo mensaje se fusionaban");
+ok(/const sig = phase \+ "\|" \+ quien \+ "\|"/.test(stripComments(diag)),
+  "el nro/idx entra en la firma antes del mensaje");
 ok(/last\.rep = \(last\.rep \|\| 1\) \+ 1/.test(stripComments(diag)), "las repeticiones se cuentan");
 ok(/\(e\.rep \+ 1\)/.test(contentSrc), "el texto del diagnostico muestra cuantas veces se repitio");
 const procItem = extractFunction(contentSrc, "tokProcessCurrentItem");
