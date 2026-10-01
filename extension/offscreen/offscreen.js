@@ -98,11 +98,12 @@ function setStatus(status, progress, step) {
   if (progress !== undefined) state.progress = progress;
   if (step) state.step = step;
   state.error = status === "error" ? state.error : "";
-  // v2.0.60: mientras hay trabajo largo (parseo/OCR y carga al carrito,
-  // que pueden tardar minutos SIN mensajes hacia este documento) se mantiene
-  // un oscilador inaudible sonando: un offscreen con reason AUDIO_PLAYBACK se
-  // mantiene vivo mientras reproduzca audio, aunque Chrome lo cierre por
-  // inactividad. En reposo se detiene para no gastar recursos.
+  // v2.0.86: mientras hay trabajo largo (parseo/OCR y carga al carrito, que
+  // pueden tardar minutos SIN mensajes hacia este documento) se toma un Web
+  // Lock: Chrome no auto-cierra un documento offscreen que tiene un lock
+  // activo, y eso evita el corte a mitad de lote. Reemplaza al oscilador de
+  // 60 Hz de la v2.0.60, que ademas de gastar CPU era audible en algunos
+  // equipos. El beep de aviso de fin de lote se mantiene (playBeep).
   if (status === "parsing" || status === "loading_cart" || status === "paused") startKeepAlive();
   else stopKeepAlive();
   persist();
@@ -416,13 +417,22 @@ async function startManualBatch(msg) {
     aplicados++;
   }
 
-  // 2) Cola = índices originales SIN resultado cargado. Sin código ARC el
-  //    reintento solo puede volver a fallar igual, así que no se encola.
+  // 2) Cola = índices originales PENDIENTES DE AJUSTE. Tiene que replicar el
+  //    filtro del popup (esPendienteDeAjuste, popup.js). Antes acá solo se
+  //    miraba si la línea estaba CARGADA, así que la tanda reencolaba también
+  //    (a) los SIN STOCK CONFIRMADOS, que son un hecho del store y no hay nada
+  //    que el cliente pueda cambiar, y (b) las líneas que ya pasaron por una
+  //    tanda de ajustes, cuyo resultado es DEFINITIVO. Eso era justamente la
+  //    re-búsqueda de un sin stock que ya había pasado, y contradecía el
+  //    "ronda única" que anuncia el popup.
+  const esSinStockConfirmado = (r) => !!(r && r.confirmado === true && !isAdded(r));
+  const esAjusteDefinitivo = (r) => !!(r && r.manualRound);
+  const esPendienteDeAjuste = (r) => !isAdded(r) && !esSinStockConfirmado(r) && !esAjusteDefinitivo(r);
   const cola = [];
   let sinCodigo = 0;
   for (let i = 0; i < api.origItems.length; i++) {
     const r = api.results[i];
-    if (r && isAdded(r)) continue;
+    if (r && !esPendienteDeAjuste(r)) continue;
     if (!(api.origItems[i] && api.origItems[i].sku || "").trim()) sinCodigo++;
     cola.push(i);
   }
@@ -774,36 +784,25 @@ function playBeep(ok) {
 
 
 
-// v2.0.60: Chrome puede cerrar un offscreen por inactividad incluso con
-// heartbeats cada 20s: un documento offscreen con reason AUDIO_PLAYBACK se
-// mantiene vivo mientras REPRODUZCA audio. Durante el procesamiento (parseo y
-// carga al carrito, que pueden tardar MINUTOS) se deja un oscilador inaudible
-// sonando; en reposo se detiene (el popup también es una actividad válida).
-let keepCtx = null;
-let keepOsc = null;
+// v2.0.86: Chrome puede cerrar un offscreen por inactividad. La v2.0.60 lo
+// resolvía con un oscilador de 60 Hz "inaudible" (reason AUDIO_PLAYBACK), que
+// en la práctica se oía como un zumbido grave y quemaba CPU de forma continua.
+// Ahora se usa un Web Lock: el chequeo de autocierre de un offscreen no cierra
+// documentos con un lock tomado, sin emitir un solo sonido.
+let releaseKeep = null;
 function startKeepAlive() {
-  if (keepCtx) return;
+  if (releaseKeep || !navigator.locks) return;
   try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    keepCtx = new Ctx();
-    if (keepCtx.state === "suspended") keepCtx.resume();
-    const osc = keepCtx.createOscillator();
-    const gain = keepCtx.createGain();
-    osc.type = "sine";
-    osc.frequency.value = 60;
-    gain.gain.value = 0.0001;
-    osc.connect(gain);
-    gain.connect(keepCtx.destination);
-    osc.start();
-    keepOsc = osc;
-  } catch (e) {}
+    navigator.locks
+      .request("tokin-offscreen-keepalive", () => new Promise((res) => { releaseKeep = res; }))
+      .catch(() => { releaseKeep = null; });
+  } catch (e) { releaseKeep = null; }
 }
 function stopKeepAlive() {
-  try { if (keepOsc) keepOsc.stop(); } catch (e) {}
-  try { if (keepCtx) keepCtx.close(); } catch (e) {}
-  keepOsc = null;
-  keepCtx = null;
+  // navigator.locks no tiene unlock: el lock se suelta resolviendo la promesa
+  // que se paso al callback.
+  if (releaseKeep) { try { releaseKeep(); } catch (e) {} }
+  releaseKeep = null;
 }
 
 // --------------------------------------------------------- mensajes y vida

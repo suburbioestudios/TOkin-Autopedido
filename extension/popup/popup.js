@@ -3,7 +3,9 @@
 // corren en el documento offscreen, que sigue vivo aunque este popup se cierre
 // al minimizar la pestaña. Al reabrir, se restaura la sesión desde allí.
 import { parseDocument, mapFields, summarize } from "../core/agent.js";
-import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAccess } from "../core/access.js";
+// v2.0.87: ya no se usa el control de acceso por mail. Queda el import solo por
+// isAllowed, que hoy siempre da true y sirve de guarda si se reintrodujera.
+import { isAllowed } from "../core/access.js";
 (function () {
   "use strict";
 
@@ -89,6 +91,49 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       const pong = await pingTab(tabId);
       if (pong && pong.ok) return pong;
       await new Promise((r) => setTimeout(r, 400));
+    }
+    return null;
+  }
+
+  // v2.0.87: el popup se auto-repara en vez de pedirle un F5 al usuario. El
+  // content script falta por dos motivos y ambos se resuelven acá:
+  //
+  //   1) La extensión se recargó (o se instaló) con la pestaña del store YA
+  //      abierta: Chrome no re-inyecta los content scripts de las pestañas
+  //      vivas, así que PING no tiene a quién responderle.
+  //   2) Quedó una instancia huérfana de una versión anterior. El content
+  //      script se autoprotege con el atributo data-tokin-ap en <html> para no
+  //      duplicar el carrito, y esa marca NO se va con la extensión: al
+  //      reinyectar, la nueva instancia ve la marca, avisa por consola y se
+  //      retira. Por eso hay que borrar la marca antes de inyectar, o el popup
+  //      seguiría sin poder conectarse aunque el script se cargara.
+  async function selfHealStore(tabId) {
+    const pong0 = await pingTab(tabId);
+    if (pong0 && pong0.ok) return pong0;
+
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          document.documentElement.removeAttribute("data-tokin-ap");
+        },
+      });
+    } catch (e) {
+      // sin permiso de scripting sobre esa pestaña: seguimos al reintento
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content.js"],
+      });
+    } catch (e) {
+      return null;
+    }
+    // La inyección es asíncrona respecto del listener: hay que darle margen.
+    for (let i = 0; i < 12; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      const pong = await pingTab(tabId);
+      if (pong && pong.ok) return pong;
     }
     return null;
   }
@@ -797,7 +842,13 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     $("#access-screen").classList.add("hidden");
     $("#main-screen").classList.remove("hidden");
     $("#cfg-session").textContent = "Tarea en curso: " + (job.docName || "pedido en el store");
-    syncFromJob();
+    // v2.0.87: el job vivo es una RUPTURA real del proceso (se perdio al
+    // cerrar el popup, caerse la señal o.reload del store). Si se puede
+    // recuperar, se avisa; si no, se deja el estado de error que yahdiga
+    // syncFromJob. La reanudacion silenciosa por senal (solo recargar la
+    // extension) no pasa por aca y por eso no dispara cartel.
+    const ok = await syncFromJob();
+    if (ok) setStatus("Restaurando Información activa.", "ok");
     return true;
   }
 
@@ -819,34 +870,39 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
     // entonces verifica acceso/sesión; así el recuadro de F5 no bloquea un job
     // que ya está corriendo.
     if (await maybeRestoreRunningTask()) return;
+    await boot();
+  }
+
+  // v2.0.87: el arranque como función aparte, para que «Reintentar conexión»
+  // pueda repetir exactamente los mismos pasos (incluida la autorreparación
+  // del content script) sin tener que cerrar y reabrir el popup.
+  async function boot() {
     const tab = await getStoreTab();
     const tabId = tab && tab.id;
 
-    let access = await getAllowedUsers();
-    if (!access.ok) {
-      await new Promise((r) => setTimeout(r, 800));
-      access = await getAllowedUsers(true);
-    }
-    ui.allowed = access;
-    if (access.ok) {
-      setBadge(access.cached ? "ok" : "ok", "Lista OK", access.warning || "Usuarios autorizados cargados");
-    } else {
-      setBadge("err", "Lista no disponible", access.error || "");
-    }
+    // v2.0.87: ya no se descarga ni espera la lista de emails. La carga era un
+    // fetch a GitHub que, sin señal, delaysba el arranque del popup y terminaba
+    // en la pantalla de acceso aunque la sesión del store estuviera bien. Ahora
+    // solo importa que haya una pestaña del store con sesión iniciada.
+    ui.allowed = { ok: true, emails: [], cached: true };
 
     if (!tabId) {
       showAccess(
         "Abrí https://tokintienda.com.ar/store en una pestaña e iniciá sesión, " +
-        "y volvé a abrir el popup."
+        "y volvé a abrir el popup.",
+        "Falta la pestaña del store"
       );
       return;
     }
-    const pong = await pingWithRetry(tabId);
+    // v2.0.87: primero se reintenta el ping y, si no hay respuesta, el popup se
+    // auto-repara inyectando el content script (ya no hace falta el F5 manual).
+    let pong = await pingWithRetry(tabId);
+    if (!pong || !pong.ok) pong = await selfHealStore(tabId);
     if (!pong || !pong.ok) {
       showAccess(
         "No se pudo conectar con la página del store. " +
-        "Refrescá la pestaña de tokintienda.com.ar (F5) para recargar la extensión " +
-        "y volvé a abrir el popup."
+        "Tocá «Reintentar conexión»: la extensión se reinstala sola en esa pestaña.",
+        "No se pudo conectar con el store"
       );
       return;
     }
@@ -858,80 +914,60 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
       // la sesión abierta y no se pierde al cerrar o minimizar el popup).
       showAccess(
         "Iniciá sesión en el store de Tokin para usar la herramienta. " +
-        "Tu pedido sigue guardado hasta que toques «Reanudar»."
+        "Tu pedido sigue guardado hasta que toques «Reanudar».",
+        "Falta iniciar sesión en el store"
       );
       return;
     }
     $("#cfg-session").textContent = "Tu email de sesión: " + pong.session.email;
 
-    const granted = await checkCachedAccess(pong.session.email);
-    if (granted) {
-      // Ya fue autorizado en esta sesión: no volver a bloquear aunque la lista
-      // remota tarde o falle. Mantener el acceso y restaurar el estado.
-      ui.allowed = { ok: true, emails: (ui.allowed && ui.allowed.emails) || [], cached: true };
-      setBadge("ok", "Autorizado", "Acceso ya verificado en esta sesión.");
-      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
-      if (ens && ens.ok) {
-        const st = await toOff({ type: "GET_STATE" });
-        if (st && st.ok) {
-          applyState(st.state);
-          if (!st.state || st.state.status === "idle") {
-            await syncFromJob();
-          }
-        } else {
-          await syncFromJob();
-        }
-      }
+    // v2.0.87: se elimina el factor de autorización por mail. Antes había que
+    // estar en la lista remota (allowed_users.json) y su ausencia bloqueaba con
+    // "Sesión OK pero sin lista de acceso". Ahora cualquier sesión iniciada en
+    // el store entra directo: no hay lista que verificar ni que refrescar.
+    const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+    if (!ens || !ens.ok) {
+      setStatus("No se pudo iniciar el procesador de fondo: " + ((ens && ens.message) || "error"), "err");
       return;
     }
-
-    await checkAccess(pong.session.email);
-    if (ui.allowed && ui.allowed.ok && isAllowed(pong.session.email, ui.allowed.emails)) {
-      await grantAccess(pong.session.email);
-      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
-      if (!ens || !ens.ok) {
-        setStatus("No se pudo iniciar el procesador de fondo: " + ((ens && ens.message) || "error"), "err");
-        return;
-      }
-      const st = await toOff({ type: "GET_STATE" });
-      if (st && st.ok) {
-        // La sesión queda cargada tal como estaba aunque el popup se haya
-        // cerrado o minimizado; solo «Reanudar» o «Terminar» limpian el
-        // formulario.
-        applyState(st.state);
-        // v2.0.27: si la sesión del offscreen está vacía pero hay un lote vivo
-        // en el store (corriendo o pausado), mostrar la tarea restaurada.
-        if (!st.state || st.state.status === "idle") {
-          await syncFromJob();
-        }
-      } else {
+    const st = await toOff({ type: "GET_STATE" });
+    if (st && st.ok) {
+      // La sesión queda cargada tal como estaba aunque el popup se haya
+      // cerrado o minimizado; solo «Reanudar» o «Terminar» limpian el
+      // formulario.
+      applyState(st.state);
+      // v2.0.27: si la sesión del offscreen está vacía pero hay un lote vivo
+      // en el store (corriendo o pausado), mostrar la tarea restaurada.
+      if (!st.state || st.state.status === "idle") {
         await syncFromJob();
       }
+    } else {
+      await syncFromJob();
     }
   }
 
-  function showAccess(msg) {
+  function showAccess(msg, title) {
     $("#main-screen").classList.add("hidden");
     $("#access-screen").classList.remove("hidden");
     $("#access-msg").textContent = msg;
+    // v2.0.87: el título por defecto ya no es "Acceso restringido" porque no hay
+    // lista de usuarios: el bloqueo real es la conexión o la sesión del store.
+    $("#access-title").textContent = title || "Conectar con el store";
+    $("#access-badge").textContent = "—";
   }
 
+  // v2.0.87: sin lista de emails. Queda solo la sesión del store como requisito;
+  // si no hay sesión, el mensaje es el de login (lo llama init). Se conserva la
+  // función para no romper otros callers.
   async function checkAccess(email) {
-    if (!ui.allowed || !ui.allowed.ok) {
+    if (!email) {
       showAccess(
-        "No se pudo verificar la lista de usuarios (sin internet y sin copia guardada). " +
-        "La extensión no se abre por seguridad."
+        "Iniciá sesión en el store de Tokin para usar la herramienta. " +
+        "Tu pedido sigue guardado hasta que toques «Reanudar»."
       );
       return;
     }
-    if (isAllowed(email, ui.allowed.emails)) {
-      setBadge("ok", "Autorizado");
-      return;
-    }
-    showAccess(
-      "Tu usuario (" + email + ") no está en la lista de emails autorizados. " +
-      "Contactá al administrador para habilitar el acceso."
-    );
+    setBadge("ok", "Autorizado");
   }
 
   // ------------------------------------------------------------- archivo
@@ -1570,44 +1606,65 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
 
   // ------------------------------------------------------------- settings
 
+  // v2.0.87: los botones de la pantalla de conexión. Antes el popup dead-endaba
+  // con un mensaje que le pedía al usuario un F5 manual; ahora se reintenta solo
+  // (con reinstalación del content script) y, si no hay pestaña, se abre el store.
+  function initConnect() {
+    $("#btn-access-retry").addEventListener("click", async () => {
+      const btn = $("#btn-access-retry");
+      btn.disabled = true;
+      btn.textContent = "Conectando…";
+      try {
+        const storeTab = await getStoreTab();
+        if (!storeTab || !storeTab.id) {
+          showAccess(
+            "No hay ninguna pestaña de tokintienda.com.ar/store abierta. " +
+            "Abrila con tu sesión iniciada y volvé a tocar «Reintentar conexión».",
+            "Falta la pestaña del store"
+          );
+          return;
+        }
+        let pong = await pingWithRetry(storeTab.id);
+        if (!pong || !pong.ok) pong = await selfHealStore(storeTab.id);
+        if (!pong || !pong.ok) {
+          setAccessMsg(
+            "El store sigue sin responder. Recargá la pestaña del store con F5 y " +
+            "totá el botón otra vez."
+          );
+          return;
+        }
+        await boot();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Reintentar conexión";
+      }
+    });
+    $("#btn-access-store").addEventListener("click", async () => {
+      try {
+        await chrome.tabs.create({ url: "https://tokintienda.com.ar/store" });
+      } catch (e) {}
+    });
+  }
+
+  function setAccessMsg(msg) {
+    $("#access-msg").textContent = msg;
+  }
+
   function initSettings() {
+    // v2.0.87: abrir Ajustes ya no descarga ninguna lista de emails.
     $("#btn-settings").addEventListener("click", async () => {
       $("#settings-overlay").classList.remove("hidden");
-      try {
-        const access = await getAllowedUsers(true);
-        ui.allowed = access;
-        if (access && access.ok) {
-          setBadge("ok", "Lista OK", (access.warning || "").toString());
-        } else {
-          setBadge("err", "Lista no disponible", (access && access.error) || "");
-        }
-      } catch (e) {
-        ui.allowed = { ok: false, error: String((e && e.message) || e) };
-        setBadge("err", "Lista no disponible", String((e && e.message) || e));
-      }
     });
     $("#btn-close-settings").addEventListener("click", () => {
       $("#settings-overlay").classList.add("hidden");
     });
+    // v2.0.87: este botón ya no refresca la lista de emails (se eliminó el factor
+    // de autorización), pero SÍ recarga la pestaña del store, que es lo que
+    // sigue siendo necesario: recargar el content script y reconectar la sesión.
     $("#btn-refresh-list").addEventListener("click", async () => {
-      setStatus("Refrescando pestaña del store y reactivando la herramienta…", "");
-      let access;
-      try {
-        access = await getAllowedUsers(true);
-      } catch (e) {
-        access = { ok: false, error: String((e && e.message) || e) };
-      }
-      ui.allowed = access;
-      if (access && access.ok) {
-        setBadge("ok", "Lista OK", access.warning || "");
-      } else {
-        setBadge("err", "Lista no disponible", (access && access.error) || "");
-      }
-      // v2.0.56: además de refrescar la lista, se recarga la pestaña del store
-      // para que el content script re-aplique la sesión y la lista de acceso.
       const storeTab = await getStoreTab();
       if (!storeTab || !storeTab.id) {
-        setStatus(access && access.ok ? "Lista actualizada. No se encontró la pestaña del store." : "No se pudo actualizar ni encontrar la pestaña del store.", "warn");
+        setStatus("No se encontró la pestaña del store.", "warn");
         return;
       }
       try {
@@ -1623,9 +1680,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         if (pong && pong.ok) break;
       }
       if (!(pong && pong.ok)) {
-        setStatus(access && access.ok
-          ? "Lista actualizada. La pestaña del store se recargó; volvé a abrir el popup."
-          : "No se pudo conectar con la pestaña del store tras el refresco.", "warn");
+        setStatus("La pestaña del store se recargó; volvé a abrir el popup.", "warn");
         return;
       }
       ui.session = pong.session;
@@ -1635,33 +1690,18 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
         setStatus("Sesión del store no detectada tras el refresco. Iniciá sesión en Tokin.", "warn");
         return;
       }
-      if (!(access && access.ok)) {
-        setStatus("Sesión OK pero sin lista de acceso. Intentá de nuevo en unos segundos.", "warn");
-        return;
-      }
-      if (isAllowed(email, access.emails)) {
-        await grantAccess(email);
-        // Reactivar en el MISMO clic: asegurar el offscreen y restaurar la
-        // sesión (o la tarea del store si hay un lote vivo), sin pedir pasos
-        // extras.
-        const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
-        if (ens && ens.ok) {
-          const st = await toOff({ type: "GET_STATE" });
-          if (st && st.ok && st.state && st.state.status !== "idle") {
-            applyState(st.state);
-          } else {
-            await syncFromJob();
-          }
+      const ens = await toSw({ type: "ENSURE_OFFSCREEN" });
+      if (ens && ens.ok) {
+        const st = await toOff({ type: "GET_STATE" });
+        if (st && st.ok && st.state && st.state.status !== "idle") {
+          applyState(st.state);
+        } else {
+          await syncFromJob();
         }
-        $("#access-screen").classList.add("hidden");
-        $("#main-screen").classList.remove("hidden");
-        setBadge("ok", "Autorizado");
-        setStatus("Información refrescada. La herramienta quedó activa.", "ok");
-      } else {
-        await revokeAccess();
-        setBadge("err", "No autorizado");
-        setStatus("Tu usuario aún no está en la lista.", "err");
       }
+      $("#access-screen").classList.add("hidden");
+      $("#main-screen").classList.remove("hidden");
+      setStatus("Información actualizada. La herramienta quedó activa.", "ok");
     });
   }
 
@@ -1708,6 +1748,7 @@ import { getAllowedUsers, isAllowed, grantAccess, checkCachedAccess, revokeAcces
   });
 
   initDropzone();
+  initConnect();
   initSettings();
   bind();
   // Al abrir (o reabrir tras minimizar/cambiar de pestaña o ventana) restaura

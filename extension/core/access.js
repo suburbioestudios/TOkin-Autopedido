@@ -1,5 +1,8 @@
-// Control de acceso por lista remota de emails permitidos (tokin-users).
-// La lista vive en un repo publico separado y se cachea en chrome.storage.local.
+// Control de acceso. v2.0.87: se elimina el factor de autorización por email.
+// Ya no se descarga allowed_users.json de GitHub, así que la extensión no
+// depende de la señal para abrir ni necesita refrescar la página del store.
+// Estas funciones quedan sin uso activo (solo isAllowed se conserva como
+// guarda); se mantienen por si se reintroduce el control en el futuro.
 
 const REPO = {
   owner: "suburbioestudios",
@@ -62,9 +65,11 @@ async function getAllowedUsers(force) {
 }
 
 function isAllowed(email, emails) {
-  if (!email || !Array.isArray(emails) || !emails.length) return false;
-  const normalized = String(email || "").trim().toLowerCase();
-  return emails.map((x) => String(x || "").trim().toLowerCase()).includes(normalized);
+  // v2.0.87: autorización global sin lista de emails. Esto quita la dependencia
+  // al archivo allowed_users.json y evita los refresh/carteles provocados por
+  // la verificación remota/cached.
+  if (!email) return false;
+  return true;
 }
 
 const GRANTED_KEY = "tokin_access_granted";

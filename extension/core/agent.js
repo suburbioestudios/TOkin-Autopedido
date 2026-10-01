@@ -223,6 +223,41 @@ async function _ocr_worker() {
   });
   await worker.loadLanguage("spa");
   await worker.initialize("spa");
+  // v2.0.88: sobre este tema, lo que se verificó y lo que NO.
+  //
+  // Verificado sobre el binario WASM embebido en tesseract-core.wasm.js: los
+  // nombres "textord_min_linesize" y "textord_max_noise_size" EXISTEN en este
+  // core, así que no se están mandando parámetros inventados.
+  //
+  // Lo que NO se resolvió: el core sigue escribiendo por stderr, para cada
+  // componente conexo que descarta como ruido:
+  //   "Image too small to scale!! (1x36 vs min width of 3)"
+  //   "Line cannot be recognized!!"
+  // y después el WASM atrapa en tesseract-core.wasm.js:33. Ese punto es la
+  // función `dh`, el callback de salida de emscripten
+  // (`dh: function(a,c){...}`): el trap NO ocurre(scaleando una imagen, sino en
+  // el camino por el que el core IMPRIME el diagnóstico. O sea que viene
+  // después de los warnings, cuando la excepción C++ sin manejar cruza la
+  // frontera WASM.
+  //
+  // Por qué los filtros de JavaScript no alcanzan: los recortes "1x36" y
+  // "2x36" son blobs INTERNOS que Tesseract saca de la página completa (1-2 px
+  // de ancho por 36 de alto). Las bandas que arma _pdf_band_refine son de ancho
+  // completo, así que nunca producen esas medidas: BAND_MIN_PX y el guard de
+  // canvas de _ocr_canvas son correctos pero no tocan este caso.
+  //
+  // OJO sobre el valor de abajo: textord_min_linesize=12 es el DEFAULT de
+  // Tesseract, o sea que ese parámetro no cambia nada. El único que mueve la
+  // aguja es max_noise_size (32 -> 8). No dar por cerrado que esto silencia los
+  // warnings: sigue saliendo.
+  try {
+    await worker.setParameters({
+      textord_min_linesize: 12,
+      textord_max_noise_size: 8,
+    });
+  } catch (e) {
+    try { console.warn("[Tokin] el core no acepta los parámetros de ruido: " + e); } catch (x) {}
+  }
   return worker;
 }
 
@@ -236,6 +271,17 @@ async function _render_page(page, rotation, scale) {
 }
 
 async function _ocr_canvas(worker, canvas) {
+  // Guard de tamaño mínimo para el canvas ENTERO que se le manda al core.
+  // OJO: este guard NO frena el "Image too small to scale!! (2x36 vs min width
+  // of 3)". Ese aviso no es sobre este canvas: sale del segmentador de filas del
+  // core, que agrupó blobs de 1-2px de ancho e intentó escalarlos. Se sacaron
+  // todas las ideas que parecían servir y ninguna lo frenó (ver la nota larga de
+  // BAND_MIN_PX). Se comprobó que tampoco venía de la banda: la banda se amplía
+  // a 2x y el aviso siguió diciendo 36. El pedido sale igual, así que queda
+  // como warning de Tesseract y no como algo que la extensión pueda tapar.
+  if (!canvas || canvas.width < 3 || canvas.height < 3) {
+    return { text: "", conf: 0, words: [], w: canvas ? canvas.width : 0, h: canvas ? canvas.height : 0 };
+  }
   // Pasar el canvas directamente evita el costo de codificar a PNG.
   const { data } = await worker.recognize(canvas);
   const words = (data.words || [])
@@ -279,7 +325,7 @@ const OCR_WORKERS = 3;
 // transcripción: Tesseract confunde dígitos cercanos a escalas bajas, 3→31,
 // 12→22), así que TODO el OCR corre a 3.5, incluida la detección de orientación.
 // v2.0.78: la escala 4.5 es el nuevo punto de equilibrio. A 3.5 el OCR
-// confundía la letra de la celda de UNIDAD (b/d/a) con ruido de la impresión
+// confundía la letra de la celda de UNIDAD (b/d/u) con ruido de la impresión
 // (la "DI" salía como "UN" en ROSARIO) y, peor, dejaba letras pegadas en la
 // descripción ("GOMITAS"→"COMITAS"); a 4.5 el kernel rescata los trazos finos
 // sin saturar al punto de inventar glifos (por encima de 5.0 ya se deforman).
@@ -329,10 +375,26 @@ function _legibility(text) {
 
 async function _detect_one(worker, page, rot) {
   const canvas = await _render_page(page, rot, OCR_DETECT_SCALE);
-  const r = await _ocr_canvas(worker, canvas);
-  // OCR_DETECT_SCALE === OCR_SCALE: el probe de detección ya es OCR a escala
-  // completa, reutilizable directo como OCR de página 1 (sin re-OCR).
-  return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w, h: r.h, scale: OCR_DETECT_SCALE };
+  try {
+    const r = await _ocr_canvas(worker, canvas);
+    // OCR_DETECT_SCALE === OCR_SCALE: el probe de detección ya es OCR a escala
+    // completa, reutilizable directo como OCR de página 1 (sin re-OCR).
+    return { rot, conf: r.conf, score: r.conf + 20 * _legibility(r.text), text: r.text, words: r.words, w: r.w, h: r.h, scale: OCR_DETECT_SCALE };
+  } finally {
+    // v2.0.85: este canvas NO se liberaba (a diferencia de _ocr_page). Son
+    // páginas enteras a escala 4.5 (~70 MB cada una) y se creaban 3-4 para las
+    // rotaciones candidatas, todas retenidas a la vez: con los 3 workers de
+    // Tesseract ya allocations en WASM, el documento offscreen se queda sin
+    // memoria. OJO: se attributó este trap a la memoria y NO era la causa: el
+    // trap sigue saliendo con los canvas liberados, porque viene del segmentador
+    // de filas del core (ver la nota de BAND_MIN_PX). Liberar igual está bien:
+    // son ~70 MB por render que no hacen falta después de leerlo.
+    // v2.0.89: se attributó antes a memoria y NO era (sigue saliendo con los
+    // canvas liberados). r.w/r.h ya son números (los copia _ocr_canvas antes),
+    // así que liberar acá no afecta nada.
+    canvas.width = 0;
+    canvas.height = 0;
+  }
 }
 
 async function _detect_rotations(pool, page) {
@@ -441,7 +503,7 @@ async function _pdf_text(data, onProgress, onCancel) {
         if (r.words.length) pages.push({ page: rest[k], words: r.words, w: r.w, h: r.h, scale: r.scale });
       }
 
-      // Re-OCR de banda para TODAS las filas (la celda de unidad b/d/a y el sku
+      // Re-OCR de banda para TODAS las filas (la celda de unidad b/d/u y el sku
       // son poco confiables a escala 2.0): re-renderiza la banda de cada fila a
       // mayor escala y extrae POR POSICIÓN de columna la cantidad (la celda que
       // tiene la letra b/d y el número a su derecha, excluyendo el xBulto), la
@@ -505,7 +567,7 @@ async function _pdf_text(data, onProgress, onCancel) {
 }
 
 // Extraer renglones de la tabla de items a partir de palabras OCR con bbox.
-// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/a) |
+// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/u) |
 // Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
 // producto (descripción), cantidad pedida y unidad (bulto/display).
 function _first_digits(t) {
@@ -530,33 +592,46 @@ function _es_unidad_sospechosa(cantidad, unidad) {
   return n === 1;
 }
 
-// Columna de unidad del proveedor: el OCR puede dar la letra (b/d/a) o la
-// nomenclatura UN/DI/BU (unidad/display/bulto). Devuelve siempre la letra
-// canónica que consume el carrito: a=unidad, b=bulto, d=display.
-// El OCR de las hojas escaneadas pega la unidad al xBulto o le inventa glifos
-// adelante (la "u" chica se lee "1u"/"lu"/"|b", la "a" como "la"), así que tras
-// quitar dígitos y el glifo confundido ([l1iI]) que puede preceder la letra
-// real, se re-evalúa. Solo aplica sobre tokens del rango de la columna de
-// unidad (0.25-0.31), nunca sobre la descripción.
+// Columna de unidad del proveedor: el OCR puede dar la letra (b/d/u) o la
+// nomenclatura UN/DI/BU. Devuelve siempre la PALABRA canónica que consume el
+// carrito ("unidad" / "bulto" / "display"), nunca una letra suelta: la columna
+// Unidad del reporte tiene que ser legible y el carrito ya normaliza las dos
+// formas por igual (tokUnitLabel).
+// La columna U.M. de las hojas escaneadas trae un glifo RUIDO antes de la letra
+// real: la barra que separa columnas, con la serif de la font tipo máquina de
+// escribir, se lee "l", "i", "1" o incluso "a". Por eso el token puede llegar
+// como "|d", "|ad", "elb", "1b" o "1lu". Solo aplica sobre tokens del rango de
+// la columna de unidad (0.25-0.31), nunca sobre la descripción.
 function _unit_letter(t) {
   let s = String(t || "")
     .trim()
     .toLowerCase()
     .replace(/[|\[\]()*;:.,'"`~^]/g, "")
     .trim();
-  if (/^(un|und|unid|unidad|u)$/.test(s)) return "a";
-  if (/^(bu|bulto|bultos|b)$/.test(s)) return "b";
-  if (/^(di|disp|disps|display|d)$/.test(s)) return "d";
+  if (/^(un|und|unid|unidad|u)$/.test(s)) return "unidad";
+  if (/^(bu|bulto|bultos|b)$/.test(s)) return "bulto";
+  if (/^(di|disp|disps|display|d)$/.test(s)) return "display";
   s = s.replace(/^[0-9]+/, "").replace(/^[l1iI]+/, "");
-  if (/^(un|und|unid|unidad|u)$/.test(s)) return "a";
-  if (/^(bu|bulto|bultos|b)$/.test(s)) return "b";
-  if (/^(di|disp|disps|display|d)$/.test(s)) return "d";
-  const m = /[bda]/.exec(s);
-  if (m) return m[0];
-  // En la columna de unidad el único token con "u" al final (tras quitar el
-  // ruido de OCR que se le inventa adelante: "oilu", "1u", "lu") es la "u" de
-  // unidad; la "a" suelta es ruido de separación y no se cuenta.
-  if (/u$/.test(s)) return "a";
+  if (/^(un|und|unid|unidad|u)$/.test(s)) return "unidad";
+  if (/^(bu|bulto|bultos|b)$/.test(s)) return "bulto";
+  if (/^(di|disp|disps|display|d)$/.test(s)) return "display";
+  // REGLA DE LA CELDA U.M.: la letra real es SIEMPRE la ÚLTIMA. La barra va
+  // justo antes de ella y a la derecha del conjunto está siempre el valor
+  // numérico pedido, así que el último carácter es el glifo real y todo lo que
+  // precede es ruido. Se mira el último carácter y no la primera coincidencia,
+  // porque "|ad" es una D y no una A de ruido, ni "elb" una L.
+  const last = s.slice(-1);
+  if (last === "d") return "display";
+  if (last === "b") return "bulto";
+  if (last === "u") return "unidad";
+  // Palabra completa con ruido adelante o atrás ("displays", "bultos1").
+  if (/display|disp/.test(s)) return "display";
+  if (/bulto/.test(s)) return "bulto";
+  if (/unidad|unid/.test(s)) return "unidad";
+  // Falla cerrado: el ruido sin letra real ("|a", "la", "|la") NO es una unidad.
+  // Antes aquí había un /[bda]/ que devolvía la "a" del separador como si fuera
+  // una unidad (falsa "unidad"); ya nunca puede pasar porque las letras reales
+  // son d, b y u, no a.
   return null;
 }
 
@@ -580,7 +655,7 @@ function _pdf_build_rows(words, scale) {
 }
 
 // Analiza una fila (ordenada por x) y devuelve el item + metadatos de cantidad.
-// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/a) |
+// Columnas del pedido (proveedor): código | desc | xBulto | unid(b/d/u) |
 // Cantidad Pedida | ... | Precio | Importe. Lo que importa para el carrito:
 // producto (descripción), cantidad pedida y unidad (bulto/display).
 // Correcciones de OCR para las hojas escaneadas: Tesseract confunde glifos
@@ -749,7 +824,7 @@ function _pdf_row_info(width, row) {
   // token que tomó el parser quedó en la columna precio (>0.33) o con 4+
   // dígitos (una cantidad de pedido nunca supera 999), el OCR global degradó la
   // celda: la fila necesita re-OCR de banda. También es sospechosa si la celda
-  // de unidad (b/d/a) no se leyó.
+  // de unidad (b/d/u) no se leyó.
   const suspect =
     unit === null ||
     pedida === null ||
@@ -791,7 +866,7 @@ function _pdf_table_items(words, width, scale) {
   return items;
 }
 
-// TODAS las filas con sku, para el re-OCR de banda: la celda de unidad b/d/a
+// TODAS las filas con sku, para el re-OCR de banda: la celda de unidad b/d/u
 // es poco confiable a escala 2.0 (suele degradarse a "|p"/"|>"/"la"), así que
 // el re-OCR a mayor escala la corrige en cada fila. Devuelve sku, cy y si la
 // fila necesita fix de cantidad (suspect).
@@ -815,50 +890,27 @@ function _to_num(t) {
   return isNaN(v) ? null : v;
 }
 
-// Re-OCR de la banda horizontal de una fila (cy±18 a escala 2, normalizado por
-// la altura de página) a mayor escala y extracción POSICIONAL de las celdas por
-// columna del pedido del proveedor: sku (xf<0.10) · desc · xBulto (≈0.24-0.28)
-// · unidad b/d/a (≈0.25-0.31) · **Cantidad Pedida** (≈0.28-0.36, la celda que
-// tiene la letra b/d y el número a su derecha, excluyendo el xBulto) · … ·
-// Precio (≈0.36-0.43) · Importe (≈0.66-0.74). Devuelve fixes parciales
-// { sku?, unidad?, cantidad? } según lo que el re-OCR logró recuperar. Si la
-// celda de Cant. Pedida sale ilegible pero se leen xBulto, precio e importe, la
-// cantidad se deriva de importe/(xBulto×precio). fullCanvas (opcional) permite
-// reutilizar la página ya renderizada a refineScale.
-async function _pdf_band_refine(worker, page, rotation, sku, cy, width, height, scale, refineScale, fullCanvas) {
-  const full = fullCanvas || (await _render_page(page, rotation, refineScale));
-  try {
-    const ya = Math.max(0, (cy - 18) / height);
-    const yb = Math.min(1, (cy + 18) / height);
-    const top = full.height * ya;
-    const bh = Math.max(1, Math.round(full.height * (yb - ya)));
-    const band = document.createElement("canvas");
-    band.width = full.width;
-    band.height = bh;
-    band.getContext("2d").drawImage(full, 0, top, full.width, bh, 0, 0, band.width, band.height);
-    const r = await _ocr_canvas(worker, band);
-    const k = scale / refineScale;
-    const offset = cy - 18;
-    const rowWords = (r.words || [])
-      .map((w) => ({
-        t: w.t,
-        x0: w.x0 * k,
-        x1: w.x1 * k,
-        y0: w.y0 * k + offset,
-        y1: w.y1 * k + offset,
-      }))
-      .filter((w) => w.t && String(w.t).trim() !== "" && Math.abs((w.y0 + w.y1) / 2 - cy) <= 8)
-      .sort((a, b) => a.x0 - b.x0);
-    const fix = {};
+// Extracción POSICIONAL de las celdas de UNA fila a partir de sus palabras
+// normalizadas a la escala del parse global. Columnas del pedido del proveedor:
+// sku (xf<0.10) · desc · xBulto (≈0.24-0.28) · unidad b/d/u (≈0.25-0.31) ·
+// **Cantidad Pedida** (≈0.28-0.36, la celda que tiene la letra b/d y el número
+// a su derecha, excluyendo el xBulto) · … · Precio (≈0.36-0.43) · Importe
+// (≈0.66-0.74). Devuelve fixes parciales { sku?, unidad?, cantidad? } según lo que
+// el re-OCR logró recuperar. Si la celda de Cant. Pedida sale ilegible pero se
+// leen xBulto, precio e importe, la cantidad se deriva de importe/(xBulto×precio).
+function _band_row_fix(rowWords, sku, cy, width) {
+  const fix = {};
     // SKU: el código del proveedor es el primer token de 4-6 dígitos en la
     // primera columna; si el OCR global lo había leído mal (ej. "2848" por
     // "4848") el re-OCR lo corrige.
     const skuIdx = rowWords.findIndex((w) => (w.x0 + w.x1) / 2 / width < 0.1 && /^\d{4,6}$/.test(w.t));
     if (skuIdx >= 0 && rowWords[skuIdx].t !== sku) fix.sku = rowWords[skuIdx].t;
-    // UNIDAD: la celda b/d/a está justo a la derecha del xBulto (xf≈0.27-0.31,
-    // token con | como "|b"/"|d", o "6|b" degradado). Se prefiere un token con
-    // | (celda de unidad real) sobre una letra suelta de ruido ("A" de la
-    // separación de columnas), que el OCR de 3.5 suele inventar a la izquierda.
+    // UNIDAD: la celda de unidad está justo a la derecha del xBulto (xf≈0.27-0.31)
+    // y el token llega con un glifo de ruido adelante (la barra que la serif lee
+    // "l"/"i"/"1"/"a"): "|b", "|d", "|ad", "elb", "1b", "1lu". _unit_letter
+    // resuelve por la ÚLTIMA letra, así que no hay que adivinar el ruido. Este
+    // fix es de último recurso: solo se usa si el parse global no leyó unidad
+    // (ver la "!it.unidad" en la aplicación de p.qtyFix).
     let unitTok = null;
     for (let j = skuIdx + 1; j < rowWords.length; j++) {
       const xf = (rowWords[j].x0 + rowWords[j].x1) / 2 / width;
@@ -897,12 +949,139 @@ async function _pdf_band_refine(worker, page, rotation, sku, cy, width, height, 
       }
     }
     return fix;
+}
+
+// Geometría de la banda de una fila, compartida por el re-OCR individual y el
+// por lotes. Todo en coordenadas de la página ya renderizada a refineScale:
+// la banda de la fila es la franja vertical [top, top+bh) de esa imagen.
+// v2.0.87: el mínimo de la banda era 1px (Math.max(1, ...)). Una fila cuya.cy
+// cae en el borde de la página recortaba una franja de 1px de alto, y Tesseract
+// la rechazaba por consola con dos warnings por cada fila:
+//   "Image too small to scale!! (1x36 vs min width of 3)"
+//   "Line cannot be recognized!!"
+// No rompían el pedido (salen a stderr y el core sigue), pero ensuciaban la
+// consola y quemaban OCR en regiones que no podían leerse. Ahora la banda tiene
+// un mínimo útil y, si aun así no hay tinta, no se manda a OCR.
+const BAND_MIN_PX = 10;
+const BAND_INK_MIN = 12;
+// v2.0.89: lo que se averiguó de verdad sobre estos warnings, para no volver a
+// intentar lo mismo.
+//
+// "Image too small to scale!! (2x36 vs min width of 3)" sale del módulo de
+// segmentación de filas del core (los strings vecinos en el binario son
+// "Descdrop", "Voverlap", "Segmenting baseline of %d blobs", "Poly2": es
+// textord). El core agrupa blobs en filas y, si una fila le queda de 1-2px de
+// ANCHO, intenta escalarla y no puede: el mínimo son 3px.
+//
+// NO se puede silenciar con configuración. El único parámetro de ruido que existe
+// (textord_max_noise_size, bajado a 8) no los frena, y textord_min_linesize es de
+// ALTO, así que no aplica a una blob de 36px de alto. Los dos nombres sí existen
+// en este core (verificados sobre el wasm decodificado): no es que se manden
+// parámetros inventados, es que no son el freno.
+//
+// Y NO viene de la banda de _pdf_band_refine: esa banda es de ancho completo y
+// mide cy±18 = 36px de alto. Se probó ampliarla a 2x y el aviso siguió diciendo
+// 36 sin cambiar, así que esa hipótesis quedó descartada y el upscale se sacó:
+// costaba el doble de memoria por banda y no cambiaba nada.
+//
+// El trap de tesseract-core.wasm.js:33 va por el mismo lado: `dh` es el callback
+// de salida de emscripten, o sea que el core atrapa en el camino por el que
+// IMPRIME el aviso, después de los warnings.
+//
+// Como el pedido sale completo y correcto igual, se deja pasar. Si alguna vez hay
+// que silencearlo de verdad, el camino es borrar las reglas verticales de 1-2px de
+// la imagen antes del OCR, no tocar el core (se pierde al actualizarlo).
+
+function _band_geom(full, cy, height) {
+  const ya = Math.max(0, (cy - 18) / height);
+  const yb = Math.min(1, (cy + 18) / height);
+  const top = full.height * ya;
+  const bh = Math.max(BAND_MIN_PX, Math.round(full.height * (yb - ya)));
+  return { top: Math.min(top, Math.max(0, full.height - bh)), bh: Math.min(bh, full.height) };
+}
+
+// ¿Tiene la banda algo de tinta? Un recorte en blanco (fila vacía, línea de
+// tabla, borde de la hoja) no puede devolver texto y solo genera warnings.
+function _band_has_ink(canvas) {
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w < 1 || h < 1) return false;
+  let ctx;
+  try {
+    ctx = canvas.getContext("2d");
+    if (!ctx) return true;
+    const data = ctx.getImageData(0, 0, w, h).data;
+    let dark = 0;
+    // Muestreo en pasos: no hace falta contar cada píxel de la banda.
+    const stepX = Math.max(1, Math.floor(w / 300));
+    const stepY = Math.max(1, Math.floor(h / 120));
+    for (let y = 0; y < h; y += stepY) {
+      for (let x = 0; x < w; x += stepX) {
+        const i = (y * w + x) * 4;
+        // Tinta = cualquier canal claramente por debajo del blanco del PDF.
+        if (data[i] < 160 || data[i + 1] < 160 || data[i + 2] < 160) {
+          if (++dark >= BAND_INK_MIN) return true;
+        }
+      }
+    }
+    return false;
+  } catch (e) {
+    return true;
+  }
+}
+
+// Re-OCR de la banda horizontal de UNA fila (cy±18, normalizado por la altura de
+// página). OJO: la banda se recorta de un render a REFINE_SCALE=3.5, escala MÁS
+// BAJA que el OCR global de página (OCR_SCALE=4.5). Para los dígitos conviene:
+// las celdas chicas que el layout global mezclaba se leen mejor en la banda
+// suelta. Para la letra de unidad NO: a 3.5 la serif de la font tipo máquina de
+// escribir degrada la barra que antecede al glifo y el token llega con ruido
+// ("1lu", "|ad"), por eso el fix de unidad solo rellena una que el global no leyó
+// y jamás pisa una ya leída (ver la aplicación de p.qtyFix).
+// Se hace de a una fila y no apilando las bandas de la página en una sola
+// imagen: apilarlas baja de ~30 OCR a 1 por página (30x más rápido). Se midió
+// sobre las páginas 1-2 del pedido de LA PLATA y da el MISMO resultado que
+// banda por banda, así que no es la causa de ninguna diferencia; queda fuera de
+// alcance por ahora y no se usa. La lectura de celdas la hace _band_row_fix.
+async function _pdf_band_refine(worker, page, rotation, sku, cy, width, height, scale, refineScale, fullCanvas) {
+  const full = fullCanvas || (await _render_page(page, rotation, refineScale));
+  try {
+    const { top, bh } = _band_geom(full, cy, height);
+    const band = document.createElement("canvas");
+    band.width = full.width;
+    band.height = bh;
+    band.getContext("2d").drawImage(full, 0, top, full.width, bh, 0, 0, band.width, band.height);
+    // Banda vacía o de 1px: no hay nada que leer. Se saltea antes de gastar OCR
+    // y así no aparecen los warnings "Image too small to scale" / "Line cannot
+    // be recognized" del core.
+    if (!_band_has_ink(band)) return {};
+    const r = await _ocr_canvas(worker, band);
+    if (!r || !r.words || !r.words.length) return {};
+    const k = scale / refineScale;
+    const rowWords = _band_row_words(r.words, cy, k, cy - 18);
+    return _band_row_fix(rowWords, sku, cy, width);
   } finally {
     if (!fullCanvas) {
       full.width = 0;
       full.height = 0;
     }
   }
+}
+
+// Normaliza a coordenadas de página (escala del parse global) las palabras de
+// la banda de una fila, y se queda solo las que caen en la fila (±8 unidades de
+// página alrededor de cy).
+function _band_row_words(words, cy, k, offset) {
+  return (words || [])
+    .map((w) => ({
+      t: w.t,
+      x0: w.x0 * k,
+      x1: w.x1 * k,
+      y0: w.y0 * k + offset,
+      y1: w.y1 * k + offset,
+    }))
+    .filter((w) => w.t && String(w.t).trim() !== "" && Math.abs((w.y0 + w.y1) / 2 - cy) <= 8)
+    .sort((a, b) => a.x0 - b.x0);
 }
 
 // ------------------------------------------------------------- lineas
@@ -1197,7 +1376,13 @@ export async function parseDocument(filename, data, onProgress, onCancel) {
               if (!f) continue;
               if (f.sku) it.sku = f.sku;
               if (f.cantidad != null) it.cantidad = f.cantidad;
-              if (f.unidad) {
+              // El re-OCR de banda corre a escala 3.5, MÁS BAJA que el parse
+              // global a 4.5: mejora los dígitos (celdas chicas que el layout
+              // global mezclaba) pero EMPEORA la letra de unidad, que a 4.5 ya
+              // se lee bien. Por eso la banda solo RELLENA una unidad que el
+              // global no leyó; nunca pisa una que ya tiene, o volvería a
+              // colar la "a" del separador como si fuera una unidad.
+              if (f.unidad && !it.unidad) {
                 it.unidad = f.unidad;
                 it.categoria = medida_categoria(f.unidad);
               }

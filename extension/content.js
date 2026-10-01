@@ -530,6 +530,21 @@
   }
   function tokDiagPush(phase, d) {
     try {
+      // v2.0.87: waitForTokin reevalúa el match cada 350ms mientras espera, así
+      // que un rechazo que no cambia se registraba idéntico ~57 veces por query
+      // (8s/350ms) y tapaba el resto del log con repeticiones. Se colapsa: si
+      // el mismo motivo ya se registró para la misma línea, solo se cuenta.
+      try {
+        const sig = phase + "|" + ((d && d.msg) || "");
+        const last = tokDiagLog[tokDiagLog.length - 1];
+        if (last && last.sig === sig) {
+          last.rep = (last.rep || 1) + 1;
+          tokDiagPersist();
+          try { window.__TOKIN_DIAG__ = tokDiagLog; } catch (e) {}
+          return;
+        }
+        if (d) d.sig = sig;
+      } catch (e) {}
       tokDiagLog.push(Object.assign({ t: Date.now(), phase }, d || {}));
       if (tokDiagLog.length > TOK_DIAG_MAX) tokDiagLog = tokDiagLog.slice(-TOK_DIAG_MAX);
       tokDiagPersist();
@@ -541,7 +556,7 @@
     const lines = ["Tokin AutoPedido — diagnóstico (v" + (chrome.runtime && chrome.runtime.getManifest ? (chrome.runtime.getManifest().version || "") : "") + ")", "url: " + location.href, ""];
     for (const e of tokDiagLog) {
       const tag = e.idx != null ? ("[" + e.idx + "]") : e.nro != null ? ("[n" + e.nro + "]") : "[-]";
-      lines.push(tag + " " + (e.phase || "") + " · " + e.msg);
+      lines.push(tag + " " + (e.phase || "") + " · " + e.msg + (e.rep ? "  (x" + (e.rep + 1) + ")" : ""));
     }
     return lines.join("\n");
   }
@@ -618,13 +633,28 @@
   // Puntaje de articulo: max entre sim. completa y sim. del nombre nucleo, mas bonus
   // por numeros compartidos y sobre todo por el GRAMAJE ("18x40g" vs "x40 GRS."):
   // el peso del producto identifica la unidad exacta aunque difiera el pack.
+  // v2.0.87: dos gramajes son el MISMO peso si difieren menos de 1 g. Es la
+  // regla de "misma parte entera": un pedido de 75 g contra una card que dice
+  // 75.5G (o 75G) es el mismo producto, porque el store redondea el nominal a
+  // decimal. 75 contra 76 sigue siendo otro producto y se rechaza.
+  // Antes la comparación era |a-g| < 0.001, o sea igualdad casi exacta: solo
+  // absorbía error de coma flotante y mandaba cualquier decimal a revisión
+  // manual.
+  function tokGramEq(a, b) {
+    return Math.abs(a - b) < 1;
+  }
+
   function tokGrams(s) {
     const t = String(s || "").toLowerCase();
     const out = [];
     let m;
-    const re = /(\d+(?:[.,]\d+)?)\s*(?:g|gr|grs|gramo|gramos|kg)\b/g;
+    // La unidad se captura para poder convertir los kilos: antes el regex
+    // aceptaba "kg" pero devolvía el número tal cual, así que "1 kg" valía 1 y
+    // nunca se reconciliaba contra un "1000 g" del store.
+    const re = /(\d+(?:[.,]\d+)?)\s*(g|gr|grs|gramo|gramos|kg)\b/g;
     while ((m = re.exec(t))) {
-      const v = parseFloat(m[1].replace(",", "."));
+      let v = parseFloat(m[1].replace(",", "."));
+      if (m[2] === "kg") v = v * 1000;
       if (!isNaN(v) && v > 0 && out.indexOf(v) === -1) out.push(v);
     }
     return out;
@@ -644,8 +674,11 @@
     const tg = tokGrams(target);
     const ag = tokGrams(articleText);
     if (tg.length && ag.length) {
-      // Gramaje comparado con redondeo: "73" == "73,5" (TOFI x73 vs ByN x73,5gr).
-      for (const g of tg) if (ag.some((a) => Math.round(a) === Math.round(g))) {
+      // v2.0.87: se usa la MISMA tolerancia que el gate estricto. El código
+      // anterior hacía Math.round(a) === Math.round(g) y su comentario afirmaba
+      // que eso cubría "73" contra "73,5"; no lo hacía, porque Math.round(73.5)
+      // es 74. Tampoco cubría el caso real de 75 contra 75.5.
+      for (const g of tg) if (ag.some((a) => tokGramEq(a, g))) {
         s += 0.2;
         break;
       }
@@ -1051,16 +1084,17 @@
     const ag = tokGrams(cardText);
     if (!tg.length || !ag.length) return { ok: true, why: "" };
     for (const g of tg) {
-      if (ag.some((a) => Math.abs(a - g) < 0.001)) return { ok: true, why: "" };
+      if (ag.some((a) => tokGramEq(a, g))) return { ok: true, why: "" };
     }
     const m = String(cardText || "")
       .toLowerCase()
-      .match(/(\d{1,3})\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(?:g|gr|grs|kg)\b/);
+      .match(/(\d{1,3})\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(g|gr|grs|kg)\b/);
     if (m) {
       const n = parseInt(m[1], 10);
-      const u = parseFloat(String(m[2]).replace(",", "."));
+      let u = parseFloat(String(m[2]).replace(",", "."));
+      if (m[3] === "kg") u = u * 1000;
       const total = n * u;
-      if (tg.some((g) => Math.abs(g - u) < 0.001 || Math.abs(g - total) < 0.001)) return { ok: true, why: "" };
+      if (tg.some((g) => tokGramEq(g, u) || tokGramEq(g, total))) return { ok: true, why: "" };
     }
     return {
       ok: false,
@@ -1134,6 +1168,29 @@
         if (cardCore.some((c) => tokWordMatch(w, c))) shared++;
       }
       const isNoStock = /sin stock/i.test(t);
+      // v2.0.87: la card declara un código de COMBO ("C123") cuando es un combo.
+      // El store muestra el ARC de cada componente adentro del combo, así que
+      // una card de combo puede "contener" el código de un producto suelto y
+      // empatar con él. El cliente lo dijo claro: un combo SOLO se pide con su
+      // propio código de combo, nunca con el código de uno de sus componentes.
+      //
+      // v2.0.88: el test "tiene un C seguido de dígitos" era demasiado laxo y
+      // marcaba como combo a cards NORMALES cuyo texto traía un C+dígitos
+      // (referencia, código interno, descripción). Esa card quedaba fuera del
+      // pool por completo y el producto desaparecía: la tool no lo veía, sin
+      // llegar a comparar nada. Por eso combo exige las DOS condiciones que
+      // confirmó el cliente: código fijo "C###" Y ningún botón de unidad con
+      // nombre. Un producto real siempre tiene botones de unidad, así que jamás
+      // puede ser tomado por un combo.
+      const comboCode = (String(t).match(/\bC\d{2,}\b/) || [""])[0];
+      const isComboCard = !!comboCode && btns.length === 0;
+      // v2.0.87: si el pedido pide una unidad concreta (bulto/display/caja), la
+      // card que tiene ese botón es la correcta. Los combos no tienen botones de
+      // unidad con nombre, así que esta preferencia también los deja de lado.
+      const offersWant = !!wantType && btns.some((b) => {
+        const lbl = tokNorm(tokUnitLabelFromBtn(String(b.innerText || b.textContent || "")));
+        return lbl === wantType;
+      });
       // v2.0.84: match endurecido para TODOS los caminos, incluido el de código.
       // Antes el match por CÓDIGO se aceptaba sin mirar nombre ni gramaje: una
       // card con el mismo ARC y otro producto pasaba, y era la forma de que se
@@ -1147,6 +1204,9 @@
         shared,
         score: tokArticleScore(target, t),
         isNoStock,
+        isComboCard,
+        comboCode,
+        offersWant,
         strict: strictRes.ok,
         strictWhy: strictRes.why,
         strictName: strictRes.name,
@@ -1154,27 +1214,78 @@
       });
     }
 
-    const byCode = parsed.filter((p) => p.codeMatch);
-    // Prioridad 1: cards con match de código SKU, que además pasan el gate
-    //             estricto (nombre íntegro + gramaje reconciliado).
+    // v2.0.87: el pedido NO es un combo (SKU normal). Entonces una card de combo
+    // queda fuera aunque su texto contenga el código del pedido: el store lista
+    // el ARC de cada componente adentro del combo, y sin este filtro una búsqueda
+    // por código podía devolver el combo y ganarle a la card del producto suelto
+    // (el 9919 es el caso reportado: same código, se elegía el combo y la card
+    // correcta era la que tenía el botón de la unidad que pide el pedido).
+    const skuIsCombo = !!tokComboSku(sku);
+    const byCode = parsed.filter((p) => p.codeMatch && (skuIsCombo || !p.isComboCard));
+    // Prioridad 1: cards con match de código SKU.
     // Prioridad 2 (fallback): cards que comparten nombre/términos/gramos o que
-    // indican sin stock, también bajo el gate estricto.
+    // indican sin stock.
     // v2.0.58: cuando el pedido tiene nombre (tokens reales), la card elegida
     // tiene que compartir AL MENOS un término con ese nombre. Las cards que solo
     // entran por score>0.1 sin compartir NINGÚN término son sugerencias /
     // "términos relacionados" de la búsqueda y NO se eligen (el título de la
     // card se empata contra el producto del pedido antes de admitirla).
-    // v2.0.82: además tienen que pasar el criterio estricto (nombre íntegro +
-    // gramaje). Un "shared > 0" con otro producto es exactamente el match
-    // equivocado que se quiere evitar.
-    // v2.0.84: el gate estricto también filtra las cards con match de CÓDIGO.
-    const codePool = byCode.filter((p) => p.strict);
+    // v2.0.82: el criterio estricto (nombre íntegro + gramaje) se le aplicó
+    // también a las cards con match de código, y con eso productos que el store
+    // sí tenía dejaron de cargarse. El ARC que publica el store ES la identidad
+    // del producto: si coincide con el código del pedido, la card ES el
+    // producto, la búsqueda la encontró por código y no hay ambigüedad posible.
+    // El caso reportado: el SKU 13331 es la ÚNICA card que devuelve la búsqueda
+    // por código y quedaba afuera porque la card no publica el nombre del
+    // producto ("card sin nombre") o le sobra una palabra al nombre del pedido.
+    // Por eso el gate estricto se conserva SOLO para el fallback por nombre
+    // (abajo), donde sí hace falta para no colar productos distintos, y la
+    // card por código vuelve a mandar como en v2.0.70.
+    // Si el código y el nombre/gramaje no coinciden, NO se descarta: se avisa en
+    // el diagnóstico, así la contradicción queda a la vista sin bloquear la
+    // carga que el store sí permite.
+    const codePool0 = byCode;
+    // v2.0.87: si el pedido pide una unidad concreta y ALGUNA de las cards con
+    // match de código ofrece ese botón, se quedan solo esas. La que no lo tiene
+    // no se puede comprar en la unidad pedida y por lo tanto no sirve, aunque
+    // comparta el código. Los combos, al no tener botones de unidad con nombre,
+    // se descartan acá también.
+    const codePoolConUnidad = wantType ? codePool0.filter((p) => p.offersWant) : [];
+    const codePool = codePoolConUnidad.length ? codePoolConUnidad : codePool0;
+    if (codePoolConUnidad.length && codePoolConUnidad.length < codePool0.length) {
+      tokDiagPush("pick", {
+        msg:
+          "código " + String(sku || "") + ": se eligen las " + codePoolConUnidad.length +
+          " cards que ofrecen «" + wantType + "» sobre " + codePool0.length +
+          " candidatas (las otras no tienen ese botón de unidad)",
+      });
+    }
     const codePoolLen = codePool.length;
+    // v2.0.88: el combo quedaba FUERA del pool por código pero se colaba por el
+    // fallback de nombre. Ahí se elegía la card del combo, que no tiene ARC propio
+    // (muestra los de sus componentes), y la verificación del carrito fallaba con
+    // el mensaje falso "la card del store no muestra código ARC" sobre un producto
+    // que sí lo tenía. Si el pedido no es un combo, ninguna card de combo es
+    // candidato en ninguno de los dos caminos.
+    const comboOk = (p) => skuIsCombo || !p.isComboCard;
     const pool = codePoolLen
       ? codePool
       : targetCore.length
-        ? parsed.filter((p) => p.strict && (p.shared > 0 || (p.isNoStock && p.score > 0.1)))
-        : parsed.filter((p) => p.strict && (p.shared > 0 || p.score > 0.1 || p.isNoStock));
+        ? parsed.filter((p) => comboOk(p) && p.strict && (p.shared > 0 || (p.isNoStock && p.score > 0.1)))
+        : parsed.filter((p) => comboOk(p) && p.strict && (p.shared > 0 || p.score > 0.1 || p.isNoStock));
+    // Aviso (no veto) cuando el código coincide pero el nombre o el gramaje no:
+    // es el caso "el store tiene el código con otro texto", que hay que poder
+    // ver en el diagnóstico para decidir si es un problema de datos.
+    for (const p of codePool) {
+      if (p.strict) continue;
+      tokDiagPush("warn", {
+        msg:
+          "código ARC coincide pero el texto no: se carga igual · «" +
+          String(target).replace(/\s+/g, " ").slice(0, 60) + "» · " +
+          (p.strictWhy || "el nombre o el gramaje publicados no coinciden") +
+          " · card=«" + String(p.el.innerText || "").replace(/\s+/g, " ").slice(0, 90) + "»",
+      });
+    }
     if (!pool.length) {
       if (byCode.length) {
         // Había una card con el código del pedido pero el nombre o el gramaje no
@@ -1211,7 +1322,12 @@
         !best ||
         (p.codeMatch && !best.codeMatch) ||
         (p.codeMatch === best.codeMatch &&
-          (p.shared > best.shared || (p.shared === best.shared && p.score > best.score)));
+          // v2.0.87: entre cards con el mismo código gana la que tiene el botón
+          // de la unidad que pide el pedido (wantType). Es el criterio que usó el
+          // cliente para distinguir el producto real de su combo.
+          ((p.offersWant && !best.offersWant) ||
+            (p.offersWant === best.offersWant &&
+              (p.shared > best.shared || (p.shared === best.shared && p.score > best.score)))));
       if (better) {
         best = {
           el: p.el,
@@ -1228,6 +1344,7 @@
           matchName: p.strictName,
           matchGrams: p.strictGrams,
           matchByCode: !!p.codeMatch,
+          offersWant: !!p.offersWant,
         };
       }
     }
@@ -1502,6 +1619,17 @@
     return location.origin + "/store/search?q=" + encodeURIComponent(query);
   }
 
+  // v2.0.87: expande la abreviación antes de mandar el nombre al buscador. El
+  // store escribe "Alfajor" completo y el PDF del cliente la trae abreviada como
+  // "alf." / "alf" / "alfaj", así que el AND del buscador del store no encontraba
+  // el producto. Solo se expande cuando el token ENTERO es la abreviación, para
+  // no romper palabras que arrancan con "alf" (alfajora, alfajitos, alfa...). Se
+  // respeta lo que el cliente ya pidió para el resto: "b" bulto, "d" display,
+  // "u" unidad.
+  function tokExpandAbrev(s) {
+    return String(s || "").replace(/\balf\.?a?j?(?=\s|$)/gi, " alfajor ");
+  }
+
   // Solo las palabras alfabéticas del nombre limpio (sin packs/gramajes/dígitos
   // y sin stopwords), para las queries "solo nombre" del fallback.
   function wordsOnly(clean) {
@@ -1516,9 +1644,11 @@
   // huérfanas que el OCR deja sueltas (ej. "GOMITAS T" → "gomitas"; la única
   // letra suelta permitida es "g" de gramos), y dedupé palabras repetidas.
   function tokCleanName(raw) {
-    const pre = String(raw || "")
-      .replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g")
-      .replace(/\b[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)\b/gi, "$1g");
+    const pre = tokExpandAbrev(
+      String(raw || "")
+        .replace(/\b(\d+)\s*[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)?\b/gi, "$2g")
+        .replace(/\b[x×]\s*(\d+)\s*(?:g|gr|grs|gramos?)\b/gi, "$1g")
+    );
     const tokens = pre.split(/\s+/).filter(Boolean);
     const seen = new Set();
     const out = [];
@@ -1596,11 +1726,26 @@
     }
     const clean = (items || [])
       .map((it) => ({
+        // v2.0.85: este whitelist BORRABA tres campos que el offscreen manda a
+        // propósito (cartItems, offscreen.js): nro, unidadSospechosa y
+        // pack_factors. Con ellos perdidos acá el content script veía
+        // undefined y:
+        //   - nro: los resultados quedaban sin número de línea, así que el
+        //     popup caía al índice de la lista COMPACTADA (manualNro) y una
+        //     corrección manual "-linea 7-" se aplicaba sobre la línea 3.
+        //   - unidadSospechosa: el bloqueo de "1 unidad" NUNCA se activaba.
+        //   - pack_factors: el headed del pedido ("1 Bulto = 24 Unidad(s)")
+        //     era invisible, tokConversionResuelta caía al factor del título y
+        //     los sin stock NO se confirmaban, con lo cual la línea entraba en
+        //     cada tanda de ajustes.
+        nro: it.nro,
         producto: it.producto || it.sku || "",
         cantidad: it.cantidad || "",
         unidad: it.unidad || "",
         categoria: it.categoria || "",
         sku: it.sku || "",
+        unidadSospechosa: it.unidadSospechosa === true,
+        pack_factors: it.pack_factors || null,
       }))
       .filter((it) => (it.producto || it.sku || "").trim());
     if (!clean.length) {
@@ -1933,7 +2078,11 @@
       tokStrictReject = "";
       const cand = await waitForTokin(
         () => tokBestArticle(target, wantType, wantedGrams, it.sku, byName),
-        20000,
+        // v2.0.87: 20s -> 8s. waitForTokin devuelve en el acto cuando la card
+        // sirve, así que este techo solo corre cuando NO hay match: bajarlo no
+        // cuesta nada en el camino bueno y recorta de ~140s a ~56s el tiempo que
+        // una línea imposible parece colgada (6 queries x 23s observadas).
+        8000,
         350
       );
       if (!cand || !tokAccept(cand)) {
@@ -2657,13 +2806,28 @@
           out.added = 0;
           out.usedUnit = usedUnit;
           const conv = convertedQty > 0 ? convertedQty / qty : 0;
-          const alcanza = conv > 0 ? Math.floor(took / conv) : 0;
+          // v2.0.88: este cálculo dividía SIEMPRE por conv, incluso cuando la
+          // unidad en que el store tomó la cantidad es la MISMA que la pedida. En
+          // ese caso `took` ya venía en la unidad pedida y dividirlo por
+          // conv (unidades por Display, p.ej. 80) daba 0, el paréntesis con el
+          // puente de unidades desaparecía y quedaba un número suelto sin
+          // explicación: "tope 800 < pedido 10 Display" seguido de
+          // "Cargala a mano: 6 Display", donde el 6 no se podía reconstruir.
+          // El factor de conversión solo tiene sentido cuando las unidades son
+          // DISTINTAS; si son la misma, el factor es 1 por definición.
+          const mismaUnidad = tokNorm(usedUnit) === tokNorm(wantUnit);
+          const factor = mismaUnidad ? 1 : conv;
+          const alcanza = factor > 0 ? Math.floor(took / factor) : 0;
           // Sugerencia para el cliente: cargar lo que el store SÍ tomó, que
           // cubre "alcanza" de la unidad pedida. Si acepta menos de lo pedido,
           // lo ajusta a mano desde el bloque de revisión manual.
-          out.sugUnit = usedUnit;
-          out.sugQty = took;
-          out.sugTotal = conv > 0 ? alcanza : 0;
+          // v2.0.88: si la unidad del store y la pedida son la misma, la
+          // sugerencia se expresa en ESA unidad (que es la que el cliente va a
+          // tipear) y no hace falta puente entre unidades. Solo cuando son
+          // distintas se da el par (cuántas de la pedida, cuántas tomó el store).
+          out.sugUnit = mismaUnidad ? wantUnit : usedUnit;
+          out.sugQty = mismaUnidad ? took : alcanza;
+          out.sugTotal = mismaUnidad ? 0 : (conv > 0 ? took : 0);
           // wantQty solo se anula DESPUES de armar el mensaje: más abajo evita
           // el re-seteo de la card del carrito, que ya no debe tocar nada.
           const pedidoEnStore = wantQty;
@@ -2706,8 +2870,18 @@
         tokDiagPush("cap", { nro: it.nro, msg: "store capó la qty: pedido=" + origWantQty + " quedó=" + actualQty + " · limit=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "sin mensaje de tope") });
       }
     } else {
-      out.ok = true;
-      out.message = "agregado sin cantidad" + unitNote;
+      // v2.0.85: wantQty === 0 significa que no se pudo resolver la cantidad
+      // pedida (normalmente la clave sku|unidad no coincidió con el total del
+      // pedido). Antes esto marcaba la línea como CARGADA con el mensaje
+      // "agregado sin cantidad", y como el bloque de verificación de abajo
+      // (2736) solo corre con wantQty > 0, era el ÚNICO camino que reportaba un
+      // alta sin haberla verificado nunca: el popup la contaba como cargada y
+      // el Excel informaba un alta inexistente. Sin cantidad a setear no se
+      // puede afirmar nada, así que va a revisión manual.
+      out.ok = false;
+      out.message =
+        "revisión manual: no se pudo resolver la cantidad pedida (sku|unidad " +
+        String(it.sku || "?") + "|" + tokNorm(tokUnitLabel(it)) + "), no se cargó sin verificar";
     }
     // v2.0.13: el set en la card del STORE puede enviar updateCart con la
     // variante de la unidad que la card muestra (para un producto YA en el
@@ -3035,7 +3209,14 @@
           // (qty 0, que es lo que persiste en el servidor) y la línea queda
           // como faltante. Antes esta pasada la "confirmaba" con la qty
           // parcial que el store había aceptado y el reporte mentía.
-          if (String(r.message || "").indexOf("sin stock") === 0) {
+          // v2.0.85: el test era indexOf("sin stock") === 0, que NO matchea los
+          // mensajes que la extensión genera de verdad: "revisión manual: sin
+          // stock, pero…" y "encontrado pero sin stock (ARC-…)". Con esos no
+          // entraba acá, la línea caía al bloque de abajo, r.added valía 0 así
+          // que el chequeo de cantidad parcial se saltaba, y terminaba marcada
+          // como CARGADA ("agregado…") sin que nadie lo verificara. Ahora se
+          // busca "sin stock" en todo el mensaje.
+          if (/sin stock/i.test(String(r.message || ""))) {
             for (const cartEl of document.querySelectorAll("article[data-id=cart-product-card]")) {
               const sizeEl = cartEl.querySelector("[data-id^=unit-size-ARC-]");
               const sc = sizeEl ? tokArcCode(sizeEl.getAttribute("data-id") || "") : null;
@@ -3725,7 +3906,7 @@
     if (!st || !st.step) return false;
     const started = st.started || Date.now();
     if (Date.now() - started > 12 * 60 * 1000) {
-      await tokCheckoutDone(false, "checkout abandonado: timeout general");
+      await tokCheckoutDone(false, "checkout abandonado: timeout general (12 min) sin avanzar de «" + st.step + "»");
       return false;
     }
     try { tokToastSet("Checkout lote " + st.lote + " · paso " + st.step, ""); } catch (e) {}
@@ -3890,10 +4071,32 @@
   // dentro del timeout, reintentar el flujo desde el paso anterior (un segundo
   // click al botón del paso actual). Devuelve null cuando reintentó (el frame
   // externo debe cortar acá: la recursión continúa el flujo).
+  // v2.0.85: los reintentos se cuentan y se cortan al tercero; antes el rebote
+  // entre dos pasos era infinito y el lote quedaba clavado hasta el timeout
+  // general de 12 minutos, sin decir por qué.
   async function tokWaitCheckUrl(stepNow, st, urlRe) {
     const nav = await waitForTokin(() => urlRe.test(location.pathname), 10000, 300);
-    if (nav) return st;
-    // No navegó: un intento más de click por si el primero no quedó.
+    if (nav) {
+      // v2.0.85: el paso avanzados, se olvida el contador de reintentos.
+      if (st.retries) {
+        st.retries = 0;
+        await tokStoreSet(CHECKOUT_KEY, st);
+      }
+      return st;
+    }
+    // v2.0.85: NO navegó. Antes volvía al paso anterior y recursaba SIN CONTAR
+    // los intentos: si el store no avanzaba de /checkout/cart a /checkout/payment
+    // (o de vuelta), «revisar» y «siguiente» se pisaban en bucle y el checkout
+    // daba vueltas los mismos dos pasos hasta el timeout general de 12 minutos.
+    // El lote se quedaba clavado sin avanzar y sin un error que dijera por qué.
+    // Ahora se cuentan los intentos y al tercero se corta con un mensaje claro.
+    st.retries = (st.retries || 0) + 1;
+    if (st.retries >= 3) {
+      return tokFail(
+        "el checkout no avanzó de «" + stepNow + "» tras " + st.retries +
+        " intentos (la url no cambió a " + urlRe + "); revisar el checkout del store"
+      );
+    }
     st.step = stepNow === "siguiente" ? "revisar" : "siguiente";
     await tokStoreSet(CHECKOUT_KEY, st);
     await tokCheckoutStep();

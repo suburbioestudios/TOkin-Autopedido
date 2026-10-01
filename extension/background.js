@@ -167,7 +167,10 @@ async function ensureOffscreen() {
   if (contexts.length) return { ok: true };
   await chrome.offscreen.createDocument({
     url: OFFLINE_URL,
-    reasons: [chrome.offscreen.Reason.WORKERS, chrome.offscreen.Reason.AUDIO_PLAYBACK],
+    // v2.0.86: se saca AUDIO_PLAYBACK. El keep-alive ya no usa audio (pasa a
+    // un Web Lock) y el unico sonido que queda es el beep puntual de fin de
+    // lote, que no necesita un reason de audio para sonar.
+    reasons: [chrome.offscreen.Reason.WORKERS],
     justification:
       "Procesa el pedido (OCR del PDF) en segundo plano mientras el popup está cerrado y avisa con un sonido al finalizar.",
   });

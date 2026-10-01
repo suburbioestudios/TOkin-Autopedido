@@ -41,7 +41,10 @@ function extractFunction(from, name) {
           else if (from[i] === "/" && !inClass) break;
           i++;
         }
-      } else { while (i < from.length && from[i] !== "\n") i++; }
+      }
+      // Si no introduce una regex es division (ej. "w.x0 / width"): avanzar un
+      // caracter. Tratarla como comentario se comia el cierre de llaves de la
+      // fila y cortaba la extraccion de _pdf_row_info.
       prev = "/"; continue;
     }
     if (ch === "{") depth++;
@@ -148,6 +151,46 @@ ok(/_es_unidad_sospechosa/.test(agentSrc), "agent.js define el detector _es_unid
 ok(/unidadSospechosa/.test(agentSrc), "agent.js propaga el flag unidadSospechosa");
 const filas = agentSrc.match(/unidadSospechosa/g) || [];
 ok(filas.length >= 3, "el flag aparece en el ítem, en las filas del PDF y en la salida (usos: " + filas.length + ")");
+
+console.log("\n5) La columna U.M. se lee por su ULTIMA letra (PEDIDO ARCOR LA PLATA, _unit_letter)");
+const umCode = [extractFunction(agentSrc, "_unit_letter")].join("\n");
+const um = new Function(umCode + "\nreturn _unit_letter;")();
+// Tokens REALES leidos por Tesseract en esa columna del pedido, con la verdad de
+// campo verificada por OCR dirigido de la celda (escala 14) y comparacion de
+// pixeles contra las celdas "b" y "d" limpias del mismo pedido. La barra de la
+// tabla antecede siempre a la letra real, y a la derecha esta el valor numerico
+// pedido, asi que el ULTIMO caracter es el glifo y todo lo anterior es ruido de
+// la serif (la barra se lee "l"/"i"/"1"/"a").
+ok(um("|b") === "bulto" && um("b") === "bulto", 'la celda "b" (bulto) se lee como bulto');
+ok(um("|d") === "display" && um("d") === "display", 'la celda "d" (display) se lee como display, no como unidad');
+ok(um("|ad") === "display" && um("ad") === "display",
+  '"|ad" (pipe leido como "a" + d) es display, NO unidad: manda la ultima letra');
+ok(um("elb") === "bulto" && um("1b") === "bulto", 'xBul pegado al bulto ("elb", "1b") sigue siendo bulto');
+ok(um("lb") === "bulto" && um("Ib") === "bulto" && um("Xb") === "bulto",
+  'el pipe como "l"/"I"/"X" no rompe el bulto');
+ok(um("1lu") === "unidad" && um("lu") === "unidad" && um("u") === "unidad" && um("|u") === "unidad",
+  'la U.M. real "u" (CABSHA 2190, "1lu") es unidad, con el xBul o el pipe pegados');
+ok(um("display") === "display" && um("bulto") === "bulto" && um("unidad") === "unidad",
+  "los nombres completos siguen funcionando");
+ok(um("displays") === "display" && um("bultos1") === "bulto",
+  "una palabra completa con ruido pegado todavia se reconoce");
+// Falla cerrado: el separador de columna que la serif leyo como "a" NO es una
+// unidad. Antes un /[bda]/ devolvia esa "a" como si fuera una U (falsa unidad).
+ok(um("a") === null && um("la") === null && um("|a") === null && um("|la") === null,
+  'el ruido "a"/"la" de la barra NO se convierte mas en unidad');
+ok(!/\/\[bda\]\/\.(exec|test|match)/.test(umCode),
+  "el fallback /[bda]/ (que solo podia devolver la 'a' del separador) ya no se ejecuta");
+ok(um("") === null && um(null) === null && um("0") === null && um("36|") === null,
+  "una celda sin letra no inventa unidad");
+
+console.log("\n6) El re-OCR de banda no pisa la unidad que ya leyo el global (agent.js)");
+ok(/if \(f\.unidad && !it\.unidad\)/.test(agentSrc),
+  "el fix de banda solo RELLENA una unidad ausente, no sobreescribe la del parse global");
+ok(/const last = s\.slice\(-1\)/.test(umCode), "el fix se decide por el ultimo caracter");
+ok(!/unit: "[abd]"|categoria: medida_categoria\("[abd]"\)/.test(agentSrc),
+  "nadie mas consume la unidad como letra suelta: se emite la palabra entera");
+ok(/unidad: unit \|\| ""/.test(agentSrc) && /categoria: medida_categoria\(unit\)/.test(agentSrc),
+  "el item del parser sigue categorizando con medida_categoria(unidad)");
 
 console.log(bad ? "\nFALLAS: " + bad : "\nOK: reglas de unidad, conversión y sin stock correctas");
 process.exit(bad ? 1 : 0);
