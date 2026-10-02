@@ -3287,7 +3287,11 @@
   }
 
   async function tokFinishCart(job) {
-    await tokStoreRemove(CART_JOB_KEY);
+    // v2.0.91: el job NO se borra acá. Se borra recién DESPUÉS de enviar el
+    // CART_DONE (al final de esta función). Antes se borraba primero y, si el F5
+    // caía entre el borrado y el envío, nadie reenviaba el bloque: el último lote
+    // quedaba cargado en el carrito SIN «Realizar pedido». Mientras el job exista
+    // con phase="done", resumeCart lo detecta y vuelve a cerrar el bloque.
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
     const results = job.results || [];
@@ -3384,6 +3388,17 @@
     // (Chrome cierra documentos offscreen por inactividad), el reporte
     // parcial/final deja de depender de él: el popup (o el offscreen al
     // recrearse) lo recupera del storage y lo muestra / exporta igual.
+    const idxs = Array.isArray(job.batchIdx) ? job.batchIdx.slice() : [];
+    const tokOrderTotal = Number(job.orderTotal || job.total || 0) || (job.items || []).length;
+    // v2.0.91: el reporte persistido es ACUMULADO por pedido. `results`/`batchIdx`
+    // siguen siendo los del BLOQUE recién cerrado (los usa tryRecoverReport para
+    // matchear el CART_DONE perdido), pero `allResults`/`allLineItems` son
+    // indexados por la LÍNEA ORIGINAL y se fusionan bloque a bloque. Antes el
+    // reporte se PISABA por bloque y además borraba los `grupos`/`lotChecks` que el
+    // offscreen ya había confirmado: si el offscreen moría o se recreaba, el Excel
+    // final solo tenía el último lote (incidente CUENCA 29 SEP: 6 lotes perdidos).
+    const esAgregado = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
+    const SIN_STOCK_RE = /sin stock|por falta de stock|no alcanza para|solo tiene\s+\d+\s+(unidad|unidades|un|uds|display|displays|bulto|bultos)|stock max/i;
     const report = {
       savedAt: Date.now(),
       token: job.token,
@@ -3399,14 +3414,50 @@
       total: job.total,
       batchTotal: (job.items || []).length,
       orderTotal: job.orderTotal || job.total,
-      batchIdx: Array.isArray(job.batchIdx) ? job.batchIdx.slice() : [],
+      batchIdx: idxs,
       lastBatch: !!job.lastBatch,
       batch: { ok: added, total: job.total, sinStock, notFound, notConfirmed },
       // v2.0.82: foto del carrito antes del checkout (vacía = no verificable).
       carrito: fotoCarrito,
     };
     try {
-      chrome.storage.local.set({ tokinCartReport: report }, () => { void chrome.runtime.lastError; });
+      chrome.storage.local.get(["tokinCartReport"], function (d) {
+        try {
+          const prev = d && d.tokinCartReport;
+          const sameOrder = prev && Array.isArray(prev.results) &&
+            Number(prev.orderTotal) === Number(tokOrderTotal) &&
+            String(prev.docName || "") === String(docName || "");
+          const allRes = (sameOrder && Array.isArray(prev.allResults)) ? prev.allResults.slice() : new Array(tokOrderTotal).fill(null);
+          const allItems = (sameOrder && Array.isArray(prev.allLineItems)) ? prev.allLineItems.slice() : new Array(tokOrderTotal).fill(null);
+          while (allRes.length < tokOrderTotal) allRes.push(null);
+          while (allItems.length < tokOrderTotal) allItems.push(null);
+          const srcItems = job.items || [];
+          for (let k = 0; k < srcItems.length; k++) {
+            const oi = idxs.length ? idxs[k] : k;
+            if (oi == null || oi < 0 || oi >= tokOrderTotal) continue;
+            if (results[k]) allRes[oi] = results[k];
+            allItems[oi] = Object.assign({}, srcItems[k], { nro: oi + 1 });
+          }
+          const done = allRes.filter(Boolean);
+          const merged = Object.assign({}, report, {
+            allResults: allRes,
+            allLineItems: allItems,
+            added: done.filter(esAgregado).length,
+            prodAdded: done.filter(esAgregado).length,
+            totalProducts: tokOrderTotal,
+            total: tokOrderTotal,
+            orderTotal: tokOrderTotal,
+            sinStock: done.filter((r) => !esAgregado(r) && SIN_STOCK_RE.test(r.message || "")).length,
+            notFound: done.filter((r) => !esAgregado(r) && /no se encontró/i.test(r.message || "")).length,
+            notConfirmed: done.filter((r) => !esAgregado(r) && String(r.message || "").indexOf("no se confirmó") === 0).length,
+          });
+          if (sameOrder && prev.grupos) merged.grupos = prev.grupos;
+          if (sameOrder && prev.lotChecks) merged.lotChecks = prev.lotChecks;
+          chrome.storage.local.set({ tokinCartReport: merged }, () => { void chrome.runtime.lastError; });
+        } catch (e2) {
+          try { chrome.storage.local.set({ tokinCartReport: report }, () => { void chrome.runtime.lastError; }); } catch (e3) {}
+        }
+      });
     } catch (e) {}
     try {
       window.__TOKIN_RES__ = summary;
@@ -3429,6 +3480,10 @@
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
+    // v2.0.91: recién AHORA que el bloque quedó persistido y el CART_DONE salió
+    // se libera el job. Si el envío se pierde y la página se recarga, el job
+    // sigue en "done" y resumeCart re-cierra el bloque (idempotente).
+    try { await tokStoreRemove(CART_JOB_KEY); } catch (e) {}
     try {
       const cartBtn = document.querySelector("[data-id=navbar-minicart-button]");
       if (cartBtn) cartBtn.click();
@@ -3621,6 +3676,14 @@
       if (job.tabId) {
         const me = await tokGetTabId();
         if (!me || me !== job.tabId) return tokAbortCart(job, true);
+      }
+      // v2.0.91: el bloque terminó (phase="done") pero el CART_DONE pudo perderse
+      // (F5/recarga durante la verificación final, cuando el job ya está en "done"
+      // pero todavía no se liberó). Re-cerrar el bloque reenvía el CART_DONE y, si
+      // faltaba, dispara el «Realizar pedido» del lote. Del lado del offscreen es
+      // idempotente (checkoutLote y lotChecks evitan recomprar/repetir pasos).
+      if (job.phase === "done") {
+        return tokFinishCart(job);
       }
       // v2.0.27: cualquier fase activa se reanuda al cargar la página. Antes
       // solo se continuaba si phase="searching" Y ya estábamos en la página de

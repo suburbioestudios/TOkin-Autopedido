@@ -113,7 +113,12 @@ function tokStoreGetAsync(key) {
 async function tokJobRecoverable() {
   const d = await tokStoreGetAsync(CART_JOB_KEY);
   const job = d[CART_JOB_KEY];
-  if (!job || job.phase === "done") return false;
+  // v2.0.91: phase="done" NO significa "tarea terminada": el content marca
+  // "done" al cerrar el bloque pero recién libera el job después de mandar el
+  // CART_DONE. Si la pestaña se congela en esa ventana, el watchdog tiene que
+  // poder recargarla y reanudar (resumeCart recierra el bloque). Antes "done"
+  // cortaba la recuperación automática y el lote quedaba sin «Realizar pedido».
+  if (!job) return false;
   if (job.started && Date.now() - job.started > TOK_JOB_MAX_MS) return false;
   if (job.phase === "paused" && job.pausedAt && Date.now() - job.pausedAt > TOK_PAUSE_MAX_MS) return false;
   return true;

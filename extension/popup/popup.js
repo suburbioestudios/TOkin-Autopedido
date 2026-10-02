@@ -1240,34 +1240,49 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
   // separador de cada bloque, así el Excel sigue diciendo si ese momento de
   // compra quedó verificado.
   async function descargarExcel() {
-    // v2.0.76: si el popup perdió la sesión (error / refresh / el offscreen se
-    // cerró) el intento usa el último reporte persistido en storage.local; así
-    // NUNCA se va a "hay que descargar pero no hay datos".
-    if (!(ui.cart && ui.cart.results && ui.cart.results.length)) {
-      try {
-        const saved = await new Promise((r) => chrome.storage.local.get("tokinCartReport", (x) => r(x && x.tokinCartReport)));
-        if (saved && (saved.results && saved.results.length || saved.allLineItems && saved.allLineItems.length || saved.done)) {
-          ui.cart = ui.cart || {};
-          ui.cart.results = saved.results || [];
-          if (!ui.cart.allLineItems && saved.allLineItems) ui.cart.allLineItems = saved.allLineItems;
-          if (!ui.cart.docName && saved.docName) ui.cart.docName = saved.docName;
-          if (ui.cart.prodAdded == null && saved.prodAdded != null) ui.cart.prodAdded = saved.prodAdded;
-          if (ui.cart.totalProducts == null && saved.totalProducts != null) ui.cart.totalProducts = saved.totalProducts;
-          if (saved.lotChecks) {
-            if (!ui.sessionState) ui.sessionState = { lotChecks: saved.lotChecks };
-            else ui.sessionState.lotChecks = saved.lotChecks;
-          }
-          // v2.0.82: la memoria de grupos (con la foto del carrito previa a cada
-          // checkout) y la foto del último bloque permiten armar el Excel final
-          // aunque el offscreen ya haya muerto.
-          if (saved.grupos) {
-            if (!ui.sessionState) ui.sessionState = { lotChecks: {} };
-            if (!ui.sessionState.grupos) ui.sessionState.grupos = saved.grupos;
-          }
-          if (saved.carrito && !ui.cart.carrito) ui.cart.carrito = saved.carrito;
+    // v2.0.76/v2.0.91: si el popup perdió la sesión (error / refresh / el
+    // offscreen se cerró) el intento usa el último reporte persistido en
+    // storage.local. Desde v2.0.91 se lee SIEMPRE y se prefiere la fuente con
+    // MÁS líneas resueltas: el respaldo acumulado (`allResults`/`allLineItems`)
+    // puede tener los lotes previos que el estado vivo perdió tras un F5. Antes
+    // solo se leía si el estado vivo no tenía NADA y el respaldo por bloque dejaba
+    // el Excel con un único lote.
+    try {
+      const saved = await new Promise((r) => chrome.storage.local.get("tokinCartReport", (x) => r(x && x.tokinCartReport)));
+      if (saved) {
+        ui.cart = ui.cart || {};
+        const resolvedCount = (arr) => (Array.isArray(arr) ? arr.filter(Boolean).length : 0);
+        const savedFull = Array.isArray(saved.allResults) && saved.allResults.length ? saved.allResults : (saved.results || []);
+        const liveResults = Array.isArray(ui.cart.results) ? ui.cart.results : [];
+        const useSaved = resolvedCount(savedFull) > resolvedCount(liveResults) ||
+          (!liveResults.length && ((saved.results && saved.results.length) || saved.done));
+        if (useSaved) {
+          ui.cart.results = savedFull;
+          if (saved.docName) ui.cart.docName = saved.docName;
+          if (saved.prodAdded != null) ui.cart.prodAdded = saved.prodAdded;
+          if (saved.totalProducts != null) ui.cart.totalProducts = saved.totalProducts;
         }
-      } catch (e) {}
-    }
+        // v2.0.91: `allLineItems` completo (pedido entero) para que las filas se
+        // armen con TODAS las líneas, no solo las del último bloque.
+        const savedItems = Array.isArray(saved.allLineItems) ? saved.allLineItems : [];
+        if (savedItems.filter(Boolean).length > (((ui.cart && ui.cart.allLineItems) || []).filter(Boolean).length)) {
+          ui.cart.allLineItems = savedItems;
+        }
+        // v2.0.82: la memoria de grupos (con la foto del carrito previa a cada
+        // checkout) y la foto del último bloque permiten armar el Excel final
+        // aunque el offscreen ya haya muerto.
+        if (saved.lotChecks) {
+          if (!ui.sessionState) ui.sessionState = { lotChecks: {} };
+          if (!ui.sessionState.lotChecks) ui.sessionState.lotChecks = {};
+          ui.sessionState.lotChecks = Object.assign({}, saved.lotChecks, ui.sessionState.lotChecks);
+        }
+        if (saved.grupos) {
+          if (!ui.sessionState) ui.sessionState = { lotChecks: {} };
+          ui.sessionState.grupos = Object.assign({}, saved.grupos, ui.sessionState.grupos || {});
+        }
+        if (saved.carrito && !ui.cart.carrito) ui.cart.carrito = saved.carrito;
+      }
+    } catch (e) {}
     const allItems = (ui.cart && ui.cart.allLineItems) || ui.lineItems || [];
     const results = ((ui.cart && ui.cart.results) || []).slice();
     const baseName = (ui.cart && ui.cart.docName) || "informe";

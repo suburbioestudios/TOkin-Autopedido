@@ -993,11 +993,22 @@ function restoreSession() {
       const s = (res && res.ok && res.state) || null;
       if (!s) return;
       if (s.status === "loading_cart" || s.status === "paused") {
-        chrome.storage.local.get(["tokinCartJob"], function(d) {
+        chrome.storage.local.get(["tokinCartJob", "tokinCartReport"], function(d) {
           var job = d && d.tokinCartJob;
+          var rep = d && d.tokinCartReport;
           var liveJob = job && job.phase && job.phase !== "done";
-          if (liveJob) {
-            var paused = job.phase === "paused";
+          var contentDone = !!(job && job.phase === "done");
+          // v2.0.91: el job pudo liberarse (el content lo borra recién tras
+          // mandar el CART_DONE), pero si el reporte persistido del bloque tiene
+          // el MISMO batchIdx que la sesión restaurada, ese bloque todavía puede
+          // tener el checkout sin disparar. En ese caso NO se borra la sesión:
+          // tryRecoverReport() reprocesa el CART_DONE perdido (idempotente).
+          var repMatches = !!(rep && Array.isArray(rep.results) && rep.results.length &&
+            Array.isArray(rep.batchIdx) && s.cartApi && Array.isArray(s.cartApi.batchIdx) &&
+            rep.batchIdx.length === s.cartApi.batchIdx.length &&
+            rep.batchIdx.every(function(x, i) { return Number(x) === Number(s.cartApi.batchIdx[i]); }));
+          if (liveJob || contentDone || repMatches) {
+            var paused = !!(job && job.phase === "paused");
             state.status = paused ? "paused" : "loading_cart";
             state.step = 3;
             state.progress = paused
@@ -1008,9 +1019,16 @@ function restoreSession() {
             state.cartProgress = s.cartProgress || null;
             state.cartApi = s.cartApi || null;
             state.lotChecks = (s && s.lotChecks) || state.lotChecks || {};
-            // v2.0.60: si este offscreen murió a mitad del bloque y el content
-            // script ya terminó, recuperar el reporte persistido del bloque.
-            if (liveJob) tryRecoverReport();
+            if (rep && rep.lotChecks) state.lotChecks = Object.assign({}, state.lotChecks, rep.lotChecks);
+            try {
+              if (state.cartApi) {
+                state.cartApi.grupos = state.cartApi.grupos || {};
+                if (rep && rep.grupos) state.cartApi.grupos = Object.assign({}, state.cartApi.grupos, rep.grupos);
+              }
+            } catch (eG) {}
+            // v2.0.60/91: si este offscreen murió a mitad del bloque (o se recreó
+            // antes de procesar el CART_DONE), recuperar el reporte persistido.
+            tryRecoverReport();
           } else {
             state.status = "idle";
             state.step = 1;
