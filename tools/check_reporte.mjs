@@ -63,7 +63,7 @@ const GROUP = Number((src.match(/const\s+GROUP\s*=\s*(\d+)/) || [])[1] || 19);
 // Ahora el Excel es de 2 hojas y el estado de cada línea sale de los tres
 // predicados nuevos: sin stock confirmado, ajuste definitivo y pendiente de
 // ajuste.
-const code = ["isCargada", "esSinStockConfirmado", "esAjusteDefinitivo", "esPendienteDeAjuste",
+const code = ["isCargada", "esSinStockConfirmado", "esSinStock", "esAjusteDefinitivo", "esPendienteDeAjuste",
   "estadoBase", "estadoDe", "estadoCounts", "descargarExcel"]
   .map(extractFunction).join("\n\n");
 

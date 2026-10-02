@@ -3,10 +3,11 @@
 //
 //   1) "reintentaba buscar un sin stock cuando ya pasó". La cola de la tanda de
 //      ajustes manuales se armaba mirando SOLO si la línea estaba cargada, así
-//      que reencolaba los sin stock CONFIRMADOS (un hecho del store: no hay
-//      nada que el cliente pueda cambiar) y las líneas que ya habían pasado por
-//      una tanda, cuyo resultado es definitivo. El popup sí las filtraba
-//      (esPendienteDeAjuste) pero el offscreen ignoraba ese filtro.
+//      que reencolaba los sin stock (un hecho del store: no hay nada que el
+//      cliente pueda cambiar) y las líneas que ya habían pasado por una tanda,
+//      cuyo resultado es definitivo. El popup sí las filtraba
+//      (esPendienteDeAjuste) pero el offscreen ignoraba ese filtro. Desde
+//      v2.0.90 el filtro de sin stock es por MENSAJE, no por `confirmado`.
 //   2) "alguno que no le acertaba agregarlo". El whitelist de tokCartStart
 //      borraba nro, unidadSospechosa y pack_factors, que el offscreen manda a
 //      propósito. Con nro perdido, el popup caía al índice de la lista
@@ -112,7 +113,10 @@ const procCode = stripComments(extractFunction(contentSrc, "tokProcessCard"));
 console.log("\n1) La tanda manual solo reencola lo PENDIENTE DE AJUSTE (offscreen.js)");
 const batch = extractFunction(offSrc, "startManualBatch");
 ok(/esPendienteDeAjuste/.test(batch), "la cola usa el filtro de pendientes de ajuste");
-ok(/confirmado === true/.test(batch), "excluye los SIN STOCK CONFIRMADOS (hecho del store, no hay nada que corregir)");
+ok(/const esSinStock = \(r\) =>[\s\S]*?sin stock/.test(batch),
+  "excluye TODOS los sin stock por MENSAJE (hecho del store, no hay nada que corregir)");
+ok(!/esSinStockConfirmado/.test(batch),
+  "ya no depende de `confirmado`: el sin stock sin verificar entero también queda afuera");
 ok(/manualRound/.test(batch), "excluye las líneas que ya pasaron por una tanda (resultado definitivo)");
 ok(!/if \(r && isAdded\(r\)\) continue;/.test(batch),
   "ya NO basta con mirar si la línea está cargada (esa era la causa del reintento)");
@@ -120,7 +124,7 @@ ok(!/if \(r && isAdded\(r\)\) continue;/.test(batch),
 // Réplica exacta de la regla del popup, para comprobar que no se drifts.
 const popPendiente = extractFunction(popSrc, "esPendienteDeAjuste");
 ok(
-  /!isCargada/.test(popPendiente) && /esSinStockConfirmado/.test(popPendiente) && /esAjusteDefinitivo/.test(popPendiente),
+  /!isCargada/.test(popPendiente) && /esSinStock\(/.test(popPendiente) && /esAjusteDefinitivo/.test(popPendiente),
   "el popup mantiene las tres condiciones (el offscreen las replica)"
 );
 
@@ -142,6 +146,18 @@ ok(!/indexOf\("sin stock"\) === 0/.test(contentCode),
   'ya no se exige que el mensaje EMPIECE con "sin stock" (nunca era así)');
 ok(/if \(\/sin stock\/i\.test\(String\(r\.message/.test(contentCode),
   "se busca 'sin stock' en todo el mensaje, para que entre 'revisión manual: sin stock…' y 'encontrado pero sin stock…'");
+ok(!/revisión manual: sin stock/.test(procCode),
+  'ya no existe el desvío "revisión manual: sin stock": el sin stock nunca va a la tanda manual');
+ok(!/out\.ok = true;[\s\S]{0,120}encontrado pero sin stock/.test(procCode),
+  "el bug de v2.0.84 quedó cerrado: no se marca out.ok=true antes de confirmar el sin stock");
+ok((procCode.match(/tokSinStockConfirmado\(out, cand, wantQty, it, wantType, cardText\)/g) || []).length >= 2,
+  "los dos caminos de 'encontrado pero sin stock' igual llaman a confirmar (para el sello del reporte)");
+ok(!/revisión manual: el carrito quedó/.test(contentCode),
+  "el store tomó menos en el cierre ya no manda a revisión manual: queda como sin stock");
+ok((contentCode.match(/"sin stock: el carrito quedó con "/g) || []).length === 2,
+  "los dos pases de verificación del cierre rotulan el faltante como 'sin stock:'");
+ok(!/r\.manual = true/.test(contentCode),
+  "ningún sin stock marca r.manual: el filtro de la tanda ya no depende de eso");
 
 console.log("\n4) Ningún alta se reporta sin verificar (content.js)");
 ok(!/out\.message = "agregado sin cantidad"/.test(contentCode),

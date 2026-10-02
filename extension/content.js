@@ -2288,14 +2288,15 @@
     return f > 0;
   }
 
-  // v2.0.84: SIN STOCK es un HECHO DEL STORE, no una falla de la extensión: si el
-  // producto se verificó con código flexible + nombre + gramaje Y la conversión
-  // está resuelta, el faltante es real y definitivo. Se marca `confirmado` para
-  // que entre al reporte como observación confirmada y NO se reabra para ajuste
-  // manual.
+  // v2.0.90: SIN STOCK es un HECHO DEL STORE y NUNCA va a la tanda de ajustes
+  // manuales (el cliente no puede inventar stock). Si el producto se verificó con
+  // código flexible + nombre + gramaje Y la conversión está resuelta, se marca
+  // `confirmado` para que el reporte lo muestre como observación firme
+  // ("SIN STOCK CONFIRMADO").
   // Un "sin stock" encontrado SOLO por nombre (sin código coincidente) NO se
   // confirma: sin el código del store no se puede asegurar que sea el mismo
-  // producto, y va a revisión manual.
+  // producto. Igual queda como faltante sin stock, pero sin el sello de
+  // confirmado (el reporte dirá que no se pudo verificar la identidad).
   function tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText) {
     if (!out || out.ok) return false;
     if (!/sin stock/i.test(String(out.message || ""))) return false;
@@ -2380,18 +2381,21 @@
       );
       if (!late) {
         const arc = tokArcCode(cardText);
-        out.ok = true;
+        // v2.0.90: SIN STOCK es un hecho del store y NUNCA va a la tanda de
+        // ajustes manuales: el cliente no puede inventar stock, solo verlo en el
+        // reporte. Antes, si el match no se verificaba entero, la línea se
+        // degradaba a "revisión manual" y volvía a la cola en cada tanda.
+        // out.ok=false es obligatorio ANTES de confirmar: tokSinStockConfirmado
+        // arranca con `if (!out || out.ok) return false`, así que con el
+        // out.ok=true que había acá la verificación daba false SIEMPRE y todo
+        // "encontrado pero sin stock" caía a revisión manual (bug de v2.0.84).
+        out.ok = false;
+        out.added = 0;
         out.message = "encontrado pero sin stock" + (arc ? " (" + arc + ")" : "");
-        // v2.0.84: el producto se verificó (código + nombre + gramaje + conversión
-        // resuelta) y el store no lo tiene: es un faltante real y definitivo, no
-        // una falla de la extensión, así que NO se reabre para ajuste manual. Si
-        // el match no se verificó entero, la línea queda a revisión manual.
-        if (!tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) {
-          out.ok = false;
-          out.message =
-            "revisión manual: sin stock, pero el store no lo confirma por código+nombre+gramaje+conversión — " +
-            "revisá si es el mismo producto: " + out.message;
-        }
+        // Marca `confirmado` cuando código+nombre+gramaje+conversión quedaron
+        // verificados: así el reporte lo distingue como observación firme. Si no
+        // se pudo verificar, igual es un faltante sin stock, no algo para ajustar.
+        tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
         return out;
       }
       // La card quedó cargada: refrescar sus datos y seguir el flujo normal.
@@ -2580,19 +2584,17 @@
         return c || null;
       }, 6000, 250);
       if (!addBtn) {
+        // v2.0.90: mismo criterio que las otras salidas de sin stock: nunca va a
+        // la tanda manual (hecho del store). Se marca `confirmado` si el match se
+        // verificó entero; si no, igual queda como faltante sin stock.
+        // out.ok=false es obligatorio antes de llamar: con out.ok=true
+        // tokSinStockConfirmado devolvía false siempre y la línea caía a manual.
+        out.ok = false;
+        out.added = 0;
         out.message = isNoStock
           ? "encontrado pero sin stock"
           : "sin botón Agregar habilitado";
-        out.ok = !!isNoStock;
-        // v2.0.84: mismo criterio que las otras salidas de sin stock: si el
-        // producto quedó verificado por código+nombre+gramaje+conversión resuelta,
-        // el faltante es un hecho del store y la línea no se reabre para ajuste
-        // manual.
-        if (isNoStock && !tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) {
-          out.ok = false;
-          out.message =
-            "revisión manual: sin stock sin verificación de código+nombre+gramaje+conversión — " + out.message;
-        }
+        if (isNoStock) tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
         return out;
       }
       addBtn.click();
@@ -2843,18 +2845,16 @@
             : "sin stock: no alcanza para completar " + qty + " " + wantUnit +
               " (" + pedidoEnStore + " " + usedUnit + "), el store solo tomó " + took + " " + usedUnit +
               (alcanza > 0 ? " (alcanza solo para " + alcanza + " " + wantUnit + ")" : "");
-          // v2.0.84: el store tomó menos de lo pedido sobre un producto
-          // verificado por código+nombre+gramaje+conversión: el faltante es un
-          // hecho del store, así que la línea entra CONFIRMADA al reporte y NO se
-          // reabre para ajuste manual (la sugerencia queda a la vista en el
-          // Excel). Sin el match entero, o sin poder verificar la cantidad,
-          // sigue siendo revisión manual.
-          if (!tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText)) out.manual = true;
+          // v2.0.90: el store tomó menos de lo pedido. Es un hecho del store, así
+          // que tampoco va a la tanda manual (el cliente no puede inventar
+          // stock). tokSinStockConfirmado marca `confirmado` si el match se
+          // verificó entero, lo que distingue la observación firme en el reporte.
+          tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
           tokDiagPush("cap", {
             nro: it.nro,
             msg: "store capó la qty → NO CARGADO: pedido=" + origWantQty + " tomó=" + took +
               " · tope=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "sin mensaje de tope") +
-              " · se quitó del carrito (qty 0) · " + (out.confirmado ? "CONFIRMADO" : "revisión manual"),
+              " · se quitó del carrito (qty 0) · " + (out.confirmado ? "CONFIRMADO" : "identidad sin verificar (igual no va a la tanda manual)"),
           });
         }
       } else {
@@ -3145,8 +3145,9 @@
             // se daba por confirmada ("agregado ... (confirmado en el cierre)")
             // y el pedido quedaba corto sin que nadie lo viera: es el mismo
             // "error de 1 qty" del 11777 filtrado por el cierre. Con el criterio
-            // estricto la línea NO se confirma: se saca del carrito y pasa a
-            // revisión manual para que la cargue el cliente.
+            // estricto la línea NO se confirma.
+            // v2.0.90: el store tomó menos de lo pedido es un faltante suyo: se
+            // saca del carrito y queda como sin stock, no como pendiente de ajuste.
             if (present.qty < wantQty) {
               try {
                 const sc2 = present.code;
@@ -3162,11 +3163,10 @@
               } catch (e) {}
               r.ok = false;
               r.added = 0;
-              r.manual = true;
               r.message =
-                "revisión manual: el carrito quedó con " + present.qty + " de " + wantQty + " " +
-                (r.usedUnit || "").trim() + " — cargala a mano";
-              tokDiagPush("verify", { nro: r.nro, msg: "cierre: qty parcial " + present.qty + "/" + wantQty + " → NO confirmada, a revisión manual" });
+                "sin stock: el carrito quedó con " + present.qty + " de " + wantQty + " " +
+                (r.usedUnit || "").trim() + " (el store no completó el pedido)";
+              tokDiagPush("verify", { nro: r.nro, msg: "cierre: qty parcial " + present.qty + "/" + wantQty + " → faltante sin stock, NO va a la tanda manual" });
             } else {
               r.message = "agregado: " + present.qty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
               changed++;
@@ -3239,8 +3239,9 @@
           // v2.0.82: la card del carrito tiene MENOS de lo pedido → la línea no
           // se confirma. Antes se anotaba "agregado: N (falta de unidades...)"
           // con ok=true, y como "agregado" cuenta como cargado, el pedido
-          // quedaba corto y el informe lo daba por bien cargado. Se saca del
-          // carrito y va a revisión manual.
+          // quedaba corto y el informe lo daba por bien cargado. Se saca del carrito.
+          // v2.0.90: es un faltante del store, no algo para ajustar a mano: queda
+          // como sin stock (fuera de la tanda manual).
           if (want3 && card.qty < want3) {
             for (const cartEl of document.querySelectorAll("article[data-id=cart-product-card]")) {
               const sizeEl = cartEl.querySelector("[data-id^=unit-size-ARC-]");
@@ -3253,11 +3254,10 @@
             await toksleep(400);
             r.ok = false;
             r.added = 0;
-            r.manual = true;
             r.message =
-              "revisión manual: el carrito quedó con " + card.qty + " de " + want3 + " " +
-              (r.usedUnit || "").trim() + " — cargala a mano";
-            tokDiagPush("verify", { nro: r.nro, msg: code3 + " · qty parcial " + card.qty + "/" + want3 + " → quitada del carrito, a revisión manual" });
+              "sin stock: el carrito quedó con " + card.qty + " de " + want3 + " " +
+              (r.usedUnit || "").trim() + " (el store no completó el pedido)";
+            tokDiagPush("verify", { nro: r.nro, msg: code3 + " · qty parcial " + card.qty + "/" + want3 + " → quitada del carrito, faltante sin stock" });
             changed++;
             convertedHere++;
             continue;

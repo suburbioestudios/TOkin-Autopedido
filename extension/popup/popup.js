@@ -446,6 +446,15 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     return !!(r && r.confirmado === true && !isCargada(r));
   }
 
+  // v2.0.90: SIN STOCK (confirmado o no) es un hecho del store y NUNCA entra a
+  // la tanda de ajustes manuales: el cliente no puede inventar stock. Antes,
+  // cuando el match no se podía verificar entero, la línea caía acá aunque su
+  // estado fuera "SIN STOCK", y volvía a la cola en cada tanda. Se detecta por
+  // mensaje porque el content puede no haber podido sellar `confirmado`.
+  function esSinStock(r) {
+    return !!(r && !isCargada(r) && /sin stock|por falta de stock/i.test(String(r.message || "")));
+  }
+
   // v2.0.84: RONDA MANUAL DEFINITIVA. Una línea que ya pasó por la tanda de
   // ajustes manuales tiene su resultado FINAL: si después de corregirla a mano
   // cae en sin stock o no encontrado, eso es lo que queda. No se abre una
@@ -454,10 +463,11 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     return !!(r && r.manualRound);
   }
 
-  // v2.0.84: lo que efectivamente se puede corregir a mano. Fuera de la lista
-  // quedan (a) los sin stock confirmados, que son un hecho del store, y (b) las  // líneas que ya pasaron por una tanda de ajuste, cuyo resultado es definitivo.
+  // v2.0.90: lo que efectivamente se puede corregir a mano. Fuera de la lista
+  // quedan (a) TODOS los sin stock, que son un hecho del store, y (b) las líneas
+  // que ya pasaron por una tanda de ajuste, cuyo resultado es definitivo.
   function esPendienteDeAjuste(r) {
-    return !isCargada(r) && !esSinStockConfirmado(r) && !esAjusteDefinitivo(r);
+    return !isCargada(r) && !esSinStock(r) && !esAjusteDefinitivo(r);
   }
 
   // v2.0.82: nro de línea del pedido de un resultado (el que se usa para

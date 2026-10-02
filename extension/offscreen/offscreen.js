@@ -420,14 +420,15 @@ async function startManualBatch(msg) {
   // 2) Cola = índices originales PENDIENTES DE AJUSTE. Tiene que replicar el
   //    filtro del popup (esPendienteDeAjuste, popup.js). Antes acá solo se
   //    miraba si la línea estaba CARGADA, así que la tanda reencolaba también
-  //    (a) los SIN STOCK CONFIRMADOS, que son un hecho del store y no hay nada
-  //    que el cliente pueda cambiar, y (b) las líneas que ya pasaron por una
-  //    tanda de ajustes, cuyo resultado es DEFINITIVO. Eso era justamente la
-  //    re-búsqueda de un sin stock que ya había pasado, y contradecía el
-  //    "ronda única" que anuncia el popup.
-  const esSinStockConfirmado = (r) => !!(r && r.confirmado === true && !isAdded(r));
+  //    los SIN STOCK (un hecho del store: no hay stock que el cliente pueda
+  //    corregir) y las líneas que ya pasaron por una tanda de ajustes, cuyo
+  //    resultado es DEFINITIVO. Eso era justamente la re-búsqueda de un sin
+  //    stock que ya había pasado, y contradecía la "ronda única" del popup.
+  //    v2.0.90: el filtro de sin stock es por MENSAJE, para que quede afuera
+  //    también el "encontrado pero sin stock" que no se pudo verificar entero.
+  const esSinStock = (r) => !!(r && !isAdded(r) && /sin stock|por falta de stock/i.test(String(r.message || "")));
   const esAjusteDefinitivo = (r) => !!(r && r.manualRound);
-  const esPendienteDeAjuste = (r) => !isAdded(r) && !esSinStockConfirmado(r) && !esAjusteDefinitivo(r);
+  const esPendienteDeAjuste = (r) => !isAdded(r) && !esSinStock(r) && !esAjusteDefinitivo(r);
   const cola = [];
   let sinCodigo = 0;
   for (let i = 0; i < api.origItems.length; i++) {
