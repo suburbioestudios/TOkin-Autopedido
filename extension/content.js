@@ -2367,20 +2367,28 @@
       // v2.0.37: la SPA del store a veces renderiza primero la card como "sin
       // stock" mientras carga la disponibilidad de forma asíncrona (reporte
       // falso-sin-stock de códigos que SÍ tienen stock, ej. 11860 / 1782).
-      // Esperar a que la card se estabilice: si en ~2,5 s aparecen un input,
-      // el botón Agregar o botones de unidad, la card TIENE stock y hay que
-      // procesarla con el flujo normal; si no cambia, es sin stock real.
+      // Esperar a que la card se estabilice: si aparecen un input, el botón
+      // Agregar o botones de unidad, la card TIENE stock y hay que procesarla
+      // con el flujo normal; si no cambia, es sin stock real.
+      // v2.0.92: la ventana era 2,5 s y con el store lento (caché fría, carrito
+      // grande o pestaña en segundo plano con timers throttled) alcanzaba para
+      // reportar como "sin stock" códigos que SÍ tenían stock. Se amplía a 6 s:
+      // sigue siendo más rápido que los ~11 s de los timeouts de input/Agregar.
       const late = await waitForTokin(
         () =>
           card.querySelector("input[type=number]") ||
           card.querySelector("[data-id=add-to-cart-button]") ||
           card.querySelector("[data-id=sku-selector-button]") ||
           null,
-        2500,
+        6000,
         250
       );
       if (!late) {
         const arc = tokArcCode(cardText);
+        tokDiagPush("nofix", {
+          nro: it.nro,
+          msg: "encontrado pero sin stock · card sin controles tras 6s · " + cardText.slice(0, 160),
+        });
         // v2.0.90: SIN STOCK es un hecho del store y NUNCA va a la tanda de
         // ajustes manuales: el cliente no puede inventar stock, solo verlo en el
         // reporte. Antes, si el match no se verificaba entero, la línea se

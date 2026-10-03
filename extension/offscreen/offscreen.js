@@ -643,8 +643,15 @@ function applyCartDone(msg) {
     // los lotes numéricos del pedido ya están comprados y su guardia los saltaría
     // — sin clave nueva, el checkout de lo corregido a mano NUNCA se dispara y
     // esas líneas quedarían en el carrito sin comprar.
+    // v2.0.92: la clave del checkout manual es por BLOQUE, no por tanda. Una
+    // tanda se parte en bloques de 19: con la clave "A1" para todos, el segundo
+    // bloque encontraba lotChecks["A1"]=true (ya confirmado por el primero) y se
+    // saltaba el checkout, dejando sus líneas en el carrito sin comprar y
+    // reportando la tanda como completa. El primer índice original del bloque es
+    // único y creciente dentro de la tanda, así que distingue cada checkout y
+    // sobrevive a un reinicio del offscreen (batchIdx se persiste).
     const lote = state.cartIsManual
-      ? "A" + Math.max(1, state.manualRun || 1)
+      ? "A" + Math.max(1, state.manualRun || 1) + "." + ((api.batchIdx && api.batchIdx[0]) || 0)
       : Math.floor(((api.batchIdx || [])[0] || 0) / CART_BLOCK) + 1;
     // v2.0.79: guardia contra el CHECKOUT duplicado. Si ya hay un checkout en
     // vuelo para mismo lote (un CART_DONE rejugado por tryRecoverReport o un
@@ -689,13 +696,16 @@ function continueAfterCheckout(lote, _note, degraded) {
   clearTimeout(state.checkoutTimer || 0);
   state.checkoutTimer = 0;
   if (!api || !api.started) return;
+  // v2.0.92: la clave interna del checkout manual es por bloque ("A1.20"); para
+  // los mensajes se muestra la tanda ("A1"), que es lo que el usuario reconoce.
+  const loteLabel = state.cartIsManual ? "A" + Math.max(1, state.manualRun || 1) : String(lote);
   // v2.0.71: si el checkout del lote NO confirmó (el carrito sigue cargado en
   // el store), NO lanzar el siguiente lote: cargaría líneas encima del lote
   // sin comprar y arruinaría la compra siguiente. Frenar con error claro.
   if (degraded) {
     setStatus(
       "error",
-      "No se pudo confirmar la compra del lote " + lote + " en el store (el carrito sigue cargado). " +
+      "No se pudo confirmar la compra del lote " + loteLabel + " en el store (el carrito sigue cargado). " +
         "Revisá la pestaña de tokintienda y confirmá el pedido a mano; después tocá «Terminar».",
       3
     );
@@ -733,7 +743,7 @@ function continueAfterCheckout(lote, _note, degraded) {
     setStatus(
       "loading_cart",
       (state.cartIsManual
-        ? "Ajustes manuales tanda " + lote + " pedido realizado. Quedan " + quedan + " líneas por confirmar…"
+        ? "Ajustes manuales tanda " + loteLabel + " pedido realizado. Quedan " + quedan + " líneas por confirmar…"
         : "lote " + lote + " pedido realizado" + ". Continuando con el lote " + (lote + 1) + "…"),
       3
     );
@@ -906,14 +916,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // v2.0.75: registrar si la compra de ESTE lote quedó confirmada de verdad
       state.lotChecks = state.lotChecks || {};
       state.lotChecks[lote] = !!(msg && msg.ok);
+      // v2.0.92: la clave del checkout manual es por bloque ("A1.20"), pero los
+      // GRUPOS del informe se agrupan por tanda ("A1"). Se mapea de vuelta para
+      // que el separador del Excel siga diciendo PEDIDO REALIZADO.
+      const grupoLote = (state.cartIsManual && /^A\d+\./.test(String(lote)))
+        ? String(lote).split(".")[0]
+        : String(lote);
       // v2.0.82: mismo dato en la memoria de grupos (que además tiene la foto del
       // carrito previa al checkout). Si el grupo no existe —carrito ya
       // confirmado por otra vía— se ignora en vez de inventarlo.
       try {
         const api = state.cartApi;
-        if (api && api.grupos && api.grupos[lote]) {
-          api.grupos[lote].confirmado = !!(msg && msg.ok);
-          api.grupos[lote].confirmadoFecha = new Date().toISOString();
+        if (api && api.grupos && api.grupos[grupoLote]) {
+          api.grupos[grupoLote].confirmado = !!(msg && msg.ok);
+          api.grupos[grupoLote].confirmadoFecha = new Date().toISOString();
         }
       } catch (e) {}
       // Anotar adentro del reporte persistido (storage.local) para que un
@@ -1018,6 +1034,11 @@ function restoreSession() {
             state.cart = s.cart || null;
             state.cartProgress = s.cartProgress || null;
             state.cartApi = s.cartApi || null;
+            // v2.0.92: sin esto, un reinicio del offscreen a mitad de una tanda
+            // manual perdía la identidad ("A1"/"A2") y el bloque se recalculaba
+            // con clave numérica de lote (ya confirmada) → checkout salteado.
+            state.cartIsManual = !!s.cartIsManual;
+            state.manualRun = Number(s.manualRun) || 0;
             state.lotChecks = (s && s.lotChecks) || state.lotChecks || {};
             if (rep && rep.lotChecks) state.lotChecks = Object.assign({}, state.lotChecks, rep.lotChecks);
             try {
@@ -1052,6 +1073,8 @@ function restoreSession() {
       state.cart = s.cart || null;
       state.cartProgress = s.cartProgress || null;
       state.cartApi = s.cartApi || null;
+      state.cartIsManual = !!s.cartIsManual;
+      state.manualRun = Number(s.manualRun) || 0;
       state.lotChecks = s.lotChecks || {};
       persist();
       emitState();

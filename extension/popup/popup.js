@@ -135,6 +135,21 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
       const pong = await pingTab(tabId);
       if (pong && pong.ok) return pong;
     }
+    // v2.0.92: si ni reinyectando responde, el renderer de la pestaña está
+    // CONGELADO (pestaña en segundo plano/descartada por Chrome). La inyección
+    // no puede correr sobre un hilo bloqueado: recargar la pestaña es la única
+    // recuperación real. El job persiste en storage.local y resumeCart lo
+    // retoma; así el lote sigue solo, sin F5 manual.
+    try {
+      chrome.tabs.reload(tabId, {}, () => { void chrome.runtime.lastError; });
+    } catch (e) {
+      return null;
+    }
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      const pong = await pingTab(tabId);
+      if (pong && pong.ok) return pong;
+    }
     return null;
   }
 
@@ -846,7 +861,11 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
       return false;
     }
     const job = res[JOB_KEY];
-    if (!job || !job.phase || job.phase === "done") return false;
+    // v2.0.92: phase="done" NO significa "tarea terminada": el content lo marca
+    // al cerrar el bloque y recién libera el job después de mandar el CART_DONE.
+    // Si el popup se abre en esa ventana (o la pestaña quedó congelada), hay que
+    // tratarla como tarea en curso y no caer al cartel de F5.
+    if (!job || !job.phase) return false;
     setBadge("ok", "Tarea en curso", "");
     $("#access-screen").classList.add("hidden");
     $("#main-screen").classList.remove("hidden");
