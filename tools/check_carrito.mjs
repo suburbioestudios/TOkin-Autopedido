@@ -152,12 +152,28 @@ ok(!/out\.ok = true;[\s\S]{0,120}encontrado pero sin stock/.test(procCode),
   "el bug de v2.0.84 quedó cerrado: no se marca out.ok=true antes de confirmar el sin stock");
 ok((procCode.match(/tokSinStockConfirmado\(out, cand, wantQty, it, wantType, cardText\)/g) || []).length >= 2,
   "los dos caminos de 'encontrado pero sin stock' igual llaman a confirmar (para el sello del reporte)");
-ok(!/revisión manual: el carrito quedó/.test(contentCode),
-  "el store tomó menos en el cierre ya no manda a revisión manual: queda como sin stock");
+ok(/revisión manual: el carrito quedó/.test(contentCode),
+  "v2.0.93: cantidad parcial SIN evidencia del store va a revisión manual (no es sin stock)");
+ok((contentCode.match(/evCierre|ev3/g) || []).length >= 2,
+  "v2.0.93: el cierre exige evidencia del store (tope o card sin disponibilidad) antes de rotular sin stock");
 ok((contentCode.match(/"sin stock: el carrito quedó con "/g) || []).length === 2,
-  "los dos pases de verificación del cierre rotulan el faltante como 'sin stock:'");
+  "los dos pases de verificación conservan el rótulo 'sin stock:' solo con evidencia");
 ok(!/r\.manual = true/.test(contentCode),
   "ningún sin stock marca r.manual: el filtro de la tanda ya no depende de eso");
+
+console.log("\n3b) v2.0.93: 'sin stock' solo con evidencia del store (content.js)");
+ok(/const cardDiceSinStock = \(\) =>/.test(procCode),
+  "hay un helper que lee si la card declara falta de disponibilidad");
+ok(/for \(let intento = 0; intento < 2/.test(procCode),
+  "sin evidencia, reintenta 2 veces antes de decidir (buscando empatar con el PDF)");
+ok(/revisión manual: el store quedó en 0/.test(procCode),
+  "cantidad 0 sin evidencia → revisión manual (no sin stock)");
+ok(/revisión manual: el store solo tomó/.test(procCode),
+  "parcial sin evidencia → revisión manual (no sin stock)");
+ok(/if \(limitInfo \|\| cardDiceSinStock\(\)\)/.test(procCode),
+  "el rótulo 'sin stock' del parcial queda detrás de la evidencia del store");
+ok(!/revisión manual:[^"]*sin stock/.test(procCode),
+  "ningún mensaje de revisión manual contiene la frase 'sin stock' (si no, el filtro lo descarta)");
 
 console.log("\n4) Ningún alta se reporta sin verificar (content.js)");
 ok(!/out\.message = "agregado sin cantidad"/.test(contentCode),

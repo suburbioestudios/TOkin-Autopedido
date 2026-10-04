@@ -2739,54 +2739,57 @@
       let actualQty = tokReadQty();
       if (actualQty == null) actualQty = wantQty;
       const origWantQty = wantQty;
-      if (actualQty < wantQty) {
-        // no hay cartel de cap: alternativa fiable (fallback del SPA).
-        let capPeek = null;
-        try { capPeek = tokLimitInfo(tokCapScan(cardText, out.storeName)); } catch (e) {}
-        if (!capPeek) {
-          await toksleep(400);
+      // v2.0.93: SIN STOCK solo se declara con EVIDENCIA del store: un mensaje
+      // de tope/stock (tokLimitInfo) o la propia card diciendo que no hay
+      // disponibilidad. Sin esa evidencia, una cantidad corta es una falla de
+      // fijado/lectura de la extensión: se reintenta 2 veces buscando que la
+      // cantidad EMPATE con la del PDF y, si no empata, la línea va a REVISIÓN
+      // MANUAL. Antes TODO parcial sin mensaje se marcaba "sin stock" y se
+      // borraba del carrito: eso reportaba sin-stock códigos que sí tienen stock.
+      const cardDiceSinStock = () => /sin stock|por falta de stock|sin disponibilidad/i.test(String(cardText || ""));
+      let capInfo = null;
+      try { capInfo = tokLimitInfo(tokCapScan(cardText, out.storeName)); } catch (e) {}
+      if (actualQty < wantQty && !capInfo && !cardDiceSinStock()) {
+        for (let intento = 0; intento < 2 && actualQty < wantQty; intento++) {
+          try {
+            for (const el of findNums() || nums) {
+              if (el.offsetParent === null) continue;
+              await tokTypeInto(el, wantQty);
+            }
+          } catch (e) {}
+          await toksleep(650);
           actualQty = tokReadQty();
           if (actualQty == null) actualQty = origWantQty;
-          if (actualQty < wantQty) {
-            await toksleep(400);
-            actualQty = tokReadQty();
-            if (actualQty == null) actualQty = origWantQty;
-          }
-          if (actualQty < wantQty) {
-            // Segundo intento: setear el valor de nuevo sobre el estado fresco,
-            // con tipeo robusto (v2.0.82) y no con la asignación por JS que React
-            // ignora: era lo que dejaba al store con la cantidad mínima (1).
-            try {
-              for (const el of findNums() || nums) {
-                if (el.offsetParent === null) continue;
-                await tokTypeInto(el, wantQty);
-              }
-            } catch (e) {}
-            await toksleep(600);
-            actualQty = tokReadQty();
-            if (actualQty == null) actualQty = origWantQty;
-          }
+          if (!capInfo) { try { capInfo = tokLimitInfo(tokCapScan(cardText, out.storeName)); } catch (e) {} }
         }
       }
       if (actualQty === 0) {
         out.ok = false;
         out.added = 0;
         out.usedUnit = usedUnit;
-        const capReject = tokLimitInfo(tokCapScan(cardText, out.storeName));
-        out.message =
-          "sin stock: faltante para completar el pedido — el store rechazó la cantidad " + origWantQty + " " + usedUnit +
-          (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
-          (capReject ? " (" + capReject.text.slice(0, 60) + ")" : "") +
-          " (máximo de unidades alcanzado / sin disponibilidad)";
-        // v2.0.84: el store rechazó la cantidad sobre un producto verificado
-        // (código+nombre+gramaje+conversión): es un faltante real y definitivo,
-        // no se reabre para ajuste manual.
-        tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
-        tokDiagPush("cap", { nro: it.nro, msg: "rechazo total: pedido=" + origWantQty + " quedó=0" + (capReject ? " · " + capReject.text.slice(0, 120) : "") + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
+        const capReject = capInfo || tokLimitInfo(tokCapScan(cardText, out.storeName));
+        if (capReject || cardDiceSinStock()) {
+          out.message =
+            "sin stock: faltante para completar el pedido — el store rechazó la cantidad " + origWantQty + " " + usedUnit +
+            (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+            (capReject ? " (" + capReject.text.slice(0, 60) + ")" : "") +
+            " (máximo de unidades alcanzado / sin disponibilidad)";
+          // v2.0.84: el store rechazó la cantidad sobre un producto verificado
+          // (código+nombre+gramaje+conversión): es un faltante real y definitivo,
+          // no se reabre para ajuste manual.
+          tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
+          tokDiagPush("cap", { nro: it.nro, msg: "rechazo total CON evidencia: pedido=" + origWantQty + " quedó=0" + (capReject ? " · " + capReject.text.slice(0, 120) : " · card sin disponibilidad") + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
+        } else {
+          out.message =
+            "revisión manual: el store quedó en 0 al cargar " + origWantQty + " " + usedUnit +
+            (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+            " y no dio mensaje de tope; se reintentó 2 veces sin empatar el pedido del PDF (el código sí existe)";
+          tokDiagPush("cap", { nro: it.nro, msg: "quedó 0 SIN evidencia del store → REVISIÓN MANUAL (no es sin stock): pedido=" + origWantQty + " · " + (usedUnit === wantUnit ? "" : "(" + qty + " " + wantUnit + ")") });
+        }
         return out;
       }
       const capped = actualQty > 0 && actualQty < wantQty;
-      const limitInfo = capped ? tokLimitInfo(tokCapScan(cardText, out.storeName)) : null;
+      const limitInfo = capped ? (capInfo || tokLimitInfo(tokCapScan(cardText, out.storeName))) : null;
       if (capped) {
         // v2.0.82: el store tomó MENOS cantidad de la pedida. Antes esta línea se
         // reportaba como "agregado parcial" y contaba como cargada, dejando a
@@ -2846,24 +2849,39 @@
           // el re-seteo de la card del carrito, que ya no debe tocar nada.
           const pedidoEnStore = wantQty;
           wantQty = 0;
-          out.message = limitInfo
-            ? "sin stock: faltante para completar el pedido (máximo de unidades alcanzado" +
-              (limitInfo.max ? ": tope " + limitInfo.max + " < pedido " + origWantQty : "") +
-              " " + usedUnit + (usedUnit === wantUnit ? "" : " = " + qty + " " + wantUnit) + ")"
-            : "sin stock: no alcanza para completar " + qty + " " + wantUnit +
-              " (" + pedidoEnStore + " " + usedUnit + "), el store solo tomó " + took + " " + usedUnit +
-              (alcanza > 0 ? " (alcanza solo para " + alcanza + " " + wantUnit + ")" : "");
-          // v2.0.90: el store tomó menos de lo pedido. Es un hecho del store, así
-          // que tampoco va a la tanda manual (el cliente no puede inventar
-          // stock). tokSinStockConfirmado marca `confirmado` si el match se
-          // verificó entero, lo que distingue la observación firme en el reporte.
-          tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
-          tokDiagPush("cap", {
-            nro: it.nro,
-            msg: "store capó la qty → NO CARGADO: pedido=" + origWantQty + " tomó=" + took +
-              " · tope=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "sin mensaje de tope") +
-              " · se quitó del carrito (qty 0) · " + (out.confirmado ? "CONFIRMADO" : "identidad sin verificar (igual no va a la tanda manual)"),
-          });
+          // v2.0.93: solo es SIN STOCK con evidencia del store (tope explícito o
+          // la card sin disponibilidad). Si el store no dio mensaje y la cantidad
+          // no empató con el PDF aun tras reintentar, es REVISIÓN MANUAL: el
+          // código existe y el cliente lo puede recargar, no es un hecho de stock.
+          if (limitInfo || cardDiceSinStock()) {
+            out.message = limitInfo
+              ? "sin stock: faltante para completar el pedido (máximo de unidades alcanzado" +
+                (limitInfo.max ? ": tope " + limitInfo.max + " < pedido " + origWantQty : "") +
+                " " + usedUnit + (usedUnit === wantUnit ? "" : " = " + qty + " " + wantUnit) + ")"
+              : "sin stock: no alcanza para completar " + qty + " " + wantUnit +
+                " (" + pedidoEnStore + " " + usedUnit + "), el store solo tomó " + took + " " + usedUnit +
+                (alcanza > 0 ? " (alcanza solo para " + alcanza + " " + wantUnit + ")" : "");
+            // tokSinStockConfirmado marca `confirmado` si el match se verificó
+            // entero, lo que distingue la observación firme en el reporte.
+            tokSinStockConfirmado(out, cand, wantQty, it, wantType, cardText);
+            tokDiagPush("cap", {
+              nro: it.nro,
+              msg: "store capó la qty CON evidencia → NO CARGADO: pedido=" + origWantQty + " tomó=" + took +
+                " · tope=" + (limitInfo ? (limitInfo.max || "?") + " («" + limitInfo.text + "»)" : "card sin disponibilidad") +
+                " · se quitó del carrito (qty 0) · " + (out.confirmado ? "CONFIRMADO" : "identidad sin verificar"),
+            });
+          } else {
+            out.message =
+              "revisión manual: el store solo tomó " + took + " " + usedUnit + " de " + origWantQty +
+              (usedUnit === wantUnit ? "" : " (" + qty + " " + wantUnit + ")") +
+              " y no dio mensaje de tope; se reintentó 2 veces sin empatar el pedido del PDF (se quitó del carrito)" +
+              (alcanza > 0 ? " — alcanza para " + alcanza + " " + wantUnit : "");
+            tokDiagPush("cap", {
+              nro: it.nro,
+              msg: "parcial SIN evidencia del store → REVISIÓN MANUAL (no es sin stock): pedido=" + origWantQty + " tomó=" + took +
+                " · se quitó del carrito (qty 0)",
+            });
+          }
         }
       } else {
         out.ok = true;
@@ -3171,10 +3189,22 @@
               } catch (e) {}
               r.ok = false;
               r.added = 0;
-              r.message =
-                "sin stock: el carrito quedó con " + present.qty + " de " + wantQty + " " +
-                (r.usedUnit || "").trim() + " (el store no completó el pedido)";
-              tokDiagPush("verify", { nro: r.nro, msg: "cierre: qty parcial " + present.qty + "/" + wantQty + " → faltante sin stock, NO va a la tanda manual" });
+              // v2.0.93: la cantidad parcial del carrito solo es SIN STOCK si el
+              // store lo declara (tope o card sin disponibilidad). Si no, es una
+              // falla de fijado/lectura → REVISIÓN MANUAL (el código existe).
+              let evCierre = false;
+              try { evCierre = /sin stock|por falta de stock|sin disponibilidad/i.test(String(present.name || "")) || !!tokLimitInfo(tokCapScan(present.name, r.storeName)); } catch (e) {}
+              if (evCierre) {
+                r.message =
+                  "sin stock: el carrito quedó con " + present.qty + " de " + wantQty + " " +
+                  (r.usedUnit || "").trim() + " (el store no completó el pedido)";
+                tokDiagPush("verify", { nro: r.nro, msg: "cierre: qty parcial " + present.qty + "/" + wantQty + " CON evidencia → faltante sin stock" });
+              } else {
+                r.message =
+                  "revisión manual: el carrito quedó con " + present.qty + " de " + wantQty + " " +
+                  (r.usedUnit || "").trim() + " y no dio mensaje de tope (no empata con el pedido del PDF)";
+                tokDiagPush("verify", { nro: r.nro, msg: "cierre: qty parcial " + present.qty + "/" + wantQty + " SIN evidencia → REVISIÓN MANUAL (no es sin stock)" });
+              }
             } else {
               r.message = "agregado: " + present.qty + " " + (r.usedUnit || "").trim() + " (confirmado en el cierre)";
               changed++;
@@ -3262,10 +3292,21 @@
             await toksleep(400);
             r.ok = false;
             r.added = 0;
-            r.message =
-              "sin stock: el carrito quedó con " + card.qty + " de " + want3 + " " +
-              (r.usedUnit || "").trim() + " (el store no completó el pedido)";
-            tokDiagPush("verify", { nro: r.nro, msg: code3 + " · qty parcial " + card.qty + "/" + want3 + " → quitada del carrito, faltante sin stock" });
+            // v2.0.93: mismo criterio: sin evidencia del store no es sin stock,
+            // es revisión manual (el código existe y se puede recargar).
+            let ev3 = false;
+            try { ev3 = /sin stock|por falta de stock|sin disponibilidad/i.test(String(card.name || "")) || !!tokLimitInfo(tokCapScan(card.name, r.storeName)); } catch (e) {}
+            if (ev3) {
+              r.message =
+                "sin stock: el carrito quedó con " + card.qty + " de " + want3 + " " +
+                (r.usedUnit || "").trim() + " (el store no completó el pedido)";
+              tokDiagPush("verify", { nro: r.nro, msg: code3 + " · qty parcial " + card.qty + "/" + want3 + " CON evidencia → quitada, faltante sin stock" });
+            } else {
+              r.message =
+                "revisión manual: el carrito quedó con " + card.qty + " de " + want3 + " " +
+                (r.usedUnit || "").trim() + " y no dio mensaje de tope (no empata con el pedido del PDF)";
+              tokDiagPush("verify", { nro: r.nro, msg: code3 + " · qty parcial " + card.qty + "/" + want3 + " SIN evidencia → quitada, REVISIÓN MANUAL (no es sin stock)" });
+            }
             changed++;
             convertedHere++;
             continue;
