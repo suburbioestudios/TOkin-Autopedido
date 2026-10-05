@@ -278,5 +278,38 @@ ok(tokRowUnitTok("COFLER x 2 Bultos (48 Uds)") === "bulto" && tokRowUnitTok("COF
 ok(tokUnitTok("Unidad") === "unidad" && tokUnitTok("Bulto") === "bulto" && tokUnitTok("Uds") === "unidad" && tokUnitTok("Caja") === "caja",
   "la unidad del pedido se canonicaliza igual que la del carrito");
 
+// v2.0.95: el flujo del checkout tiene que ser exactamente el de siempre. La
+// comparación del carrito es un control, no un paso: si algo sale mal adentro,
+// el checkout sigue como antes. Y cada paso solo busca SU botón: el de
+// «Revisar pedido», el de «Siguiente», el de «Realizar pedido». El error que se
+// vio en vivo («no se encontró “Realizar pedido” en /checkout/payment») no era
+// el problema: era la consecuencia de que el estado quedara en un paso que ya no
+// correspondía.
+console.log("\n7) El flujo sigue siendo el de siempre: cada paso busca su botón y un fallo interno no descuadra el checkout");
+const pasoReal = contentSrc.slice(contentSrc.indexOf('if (st.step === "realizar")'));
+ok(/try \{\s*problemaSig = await tokVerifyPreCheckout/.test(pasoSig) && /catch \(err\)/.test(pasoSig),
+  "paso «siguiente»: la comparación va dentro de un try/catch");
+ok(/try \{\s*problemaRev = await tokVerifyPreCheckout/.test(pasoRev) && /catch \(err\)/.test(pasoRev),
+  "paso «revisar»: la comparación va dentro de un try/catch");
+ok(pasoSig.indexOf("tokVerifyPreCheckout(st") < pasoSig.indexOf('next-step-button'),
+  "la comparación va antes de BUSCAR «Siguiente»: el botón se resuelve recién al clickearlo, nunca un nodo viejo");
+ok(pasoRev.indexOf("tokVerifyPreCheckout(st") < pasoRev.indexOf('\'[data-id="go-to-checkout-buton"]\''),
+  "lo mismo en «Revisar pedido»: la fila se compara antes de abrir la revisión");
+ok(!/location\.href = location\.origin \+ "\/store\/checkout\/payment"/.test(pasoSig),
+  "el paso «siguiente» ya no se inventa el paso siguiente saltando a /checkout/payment");
+ok(/st\.step = "revisar"/.test(pasoSig) && /no se encontró el botón «Siguiente»/.test(pasoSig),
+  "si no aparece «Siguiente» vuelve al paso anterior (que es el que sabe qué botón va)");
+ok(/location\.pathname\.indexOf\("\/checkout\/payment"\) !== 0/.test(pasoReal),
+  "el paso «realizar» primero se assure de estar en /checkout/payment");
+ok(/st\.step = "siguiente"/.test(pasoReal) && /no llegó a \/checkout\/payment/.test(pasoReal),
+  "si la url no es la del pago, vuelve al paso que busca «Siguiente» en vez de decir que no encuentra «Realizar pedido»");
+const stepSrc = extractFunction(contentSrc, "tokCheckoutStep");
+ok(/tokCheckoutStepReal/.test(stepSrc) && /catch \(err\)/.test(stepSrc) && /tokCheckoutDone\(false, msg\)/.test(stepSrc),
+  "tokCheckoutStep es un envoltorio: cualquier excepción interna corta el checkout con un mensaje útil");
+ok(/async function tokCheckoutStepReal\(\)/.test(contentSrc),
+  "la lógica del checkout quedó en tokCheckoutStepReal, sin cambios de comportamiento");
+ok(/NO se toca .Siguiente.|\. No se tocó «Siguiente»/.test(extractFunction(contentSrc, "tokVerifyPreCheckout")),
+  "el bloqueo sigue siendo el mismo de v2.0.94: no se toca «Siguiente»");
+
 console.log(bad ? "\nFALLAS: " + bad : "\nOK: checkout manual por bloque y recuperación correctos");
 process.exit(bad ? 1 : 0);

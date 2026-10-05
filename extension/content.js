@@ -4266,7 +4266,28 @@
     );
   }
 
+  // v2.0.95: envoltorio de seguridad. Antes, si un paso del checkout lanzaba una
+  // excepción, la cadena de promesas moría y el estado quedaba guardado con un
+  // step que ya no correspondía: la tarea se clavaba en silencio y el error que
+  // se veía después era de otro paso («no se encontró “Realizar pedido” en
+  // /checkout/payment»), sin ninguna relación con la causa real. Acá cualquier
+  // excepción se traduce en un corte limpio que dice qué pasó.
   async function tokCheckoutStep() {
+    try {
+      return await tokCheckoutStepReal();
+    } catch (err) {
+      const msg = "el checkout se cortó por un error interno: " + String((err && err.message) || err);
+      try {
+        const stErr = await tokStoreGet(CHECKOUT_KEY);
+        if (stErr && stErr.step) msg += " (el paso que quedó pendiente era «" + stErr.step + "» en " + location.pathname + ")";
+      } catch (e) {}
+      try { tokDiagPush("checkout", { msg: msg }); } catch (e) {}
+      try { await tokStoreRemove(CHECKOUT_KEY); } catch (e) {}
+      try { return tokCheckoutDone(false, msg); } catch (e) { return false; }
+    }
+  }
+
+  async function tokCheckoutStepReal() {
     let st = await tokStoreGet(CHECKOUT_KEY);
     if (!st || !st.step) return false;
     const started = st.started || Date.now();
@@ -4303,6 +4324,22 @@
         st.hadItems = Array.isArray(cards0) ? cards0.filter((c) => c.qty > 0).length > 0 : true;
         await tokStoreSet(CHECKOUT_KEY, st);
       } catch (e) {}
+      // v2.0.94: PRIMERO se compara el carrito contra el pedido y DESPUÉS se
+      // busca el botón. La comparación tarda (relee el carrito y puede corregir
+      // una cantidad) y React re-renderiza la fila: si el nodo del botón se
+      // guardara antes, el click caería en un nodo viejo, el paso no avanzaría y
+      // el error que aparecería después sería de otro paso, sin relación con la
+      // causa. Acá la fila es editable, así que una cantidad reseteada a 1 se
+      // puede corregir en el momento.
+      let problemaRev = null;
+      try { problemaRev = await tokVerifyPreCheckout(st, "antes de «Revisar pedido»"); }
+      catch (err) {
+        // La comparación NUNCA puede romper el checkout: si algo falla adentro,
+        // se avisa en el diagnóstico y el flujo sigue exactamente igual que
+        // antes de v2.0.94.
+        try { tokDiagPush("checkout", { msg: "la comparación del carrito falló (" + String((err && err.message) || err) + "): se sigue con el checkout" }); } catch (e) {}
+      }
+      if (problemaRev) return tokFail(problemaRev);
       const el = await waitForTokin(() => {
         return document.querySelector('[data-id="go-to-checkout-buton"]:not([disabled]):not([aria-disabled="true"])')
           || document.querySelector('[data-id="go-to-checkout-buton"]')
@@ -4315,11 +4352,6 @@
       try {
         await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
-      // v2.0.94: el carrito se compara contra el pedido ANTES de abrir la
-      // revisión. Acá la fila es editable, así que una cantidad reseteada a 1 se
-      // puede corregir en el momento.
-      const problemaRev = await tokVerifyPreCheckout(st, "antes de «Revisar pedido»");
-      if (problemaRev) return tokFail(problemaRev);
       st.step = "siguiente";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(el);
@@ -4328,6 +4360,17 @@
     }
 
     if (st.step === "siguiente") {
+      // v2.0.94: ÚLTIMA puerta antes de confirmar. Entre «Revisar pedido» y
+      // «Siguiente» la página carga los totales y el store puede re-renderizar
+      // el carrito desde el server: si eso resetea una cantidad a 1, el pedido
+      // salía corto sin aviso. La comparación va PRIMERO y el botón se busca
+      // DESPUÉS, para no clickear un nodo que React ya reemplazó.
+      let problemaSig = null;
+      try { problemaSig = await tokVerifyPreCheckout(st, "antes de «Siguiente»"); }
+      catch (err) {
+        try { tokDiagPush("checkout", { msg: "la comparación del carrito falló (" + String((err && err.message) || err) + "): se sigue con el checkout" }); } catch (e) {}
+      }
+      if (problemaSig) return tokFail(problemaSig);
       // Página /store/checkout/cart: botón «Siguiente». El selector EXACTO del
       // store es [data-id="next-step-button"] (botón React con texto
       // «Siguiente», clase disabled:* cuando aún no está habilitado). Se busca
@@ -4340,13 +4383,18 @@
           || document.querySelector("[data-id*=next], [data-id*=siguiente], [class*=next-step], a[href*=\"/checkout/payment\"]");
       }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
       if (!el) {
-        try { console.log("[Tokin] checkout siguiente: botón no hallado, ir directo a payment"); } catch (e) {}
-        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
-        st.step = "realizar";
+        // v2.0.95: este paso solo tiene que buscar «Siguiente». Si no aparece,
+        // el store puede estar mostrando otra pantalla del checkout: en vez de
+        // inventar el paso siguiente (ir directo a payment), se vuelve al paso
+        // anterior, que es el que sabe qué botón tiene que haber.
+        try { console.log("[Tokin] checkout siguiente: no hay botón «Siguiente» en " + location.pathname); } catch (e) {}
+        const antes = st.retries || 0;
+        st.retries = antes + 1;
+        if (st.retries >= 3) {
+          return tokFail("no se encontró el botón «Siguiente» en " + location.pathname + " tras " + st.retries + " intentos");
+        }
+        st.step = "revisar";
         await tokStoreSet(CHECKOUT_KEY, st);
-        await toksleep(1000);
-        st = await tokStoreGet(CHECKOUT_KEY);
-        if (!st || !st.step) return false;
         return tokCheckoutStep();
       }
       // Si el botón está disabled, esperar a que se habilite (el checkout lo
@@ -4355,13 +4403,6 @@
         await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
       try { console.log("[Tokin] checkout siguiente: click en «" + String((el.innerText || el.getAttribute("data-id") || "")).slice(0, 40) + "» (" + el.tagName + ") disabled=" + !!el.disabled); } catch (e) {}
-      // v2.0.94: ÚLTIMA puerta antes de confirmar. Entre «Revisar pedido» y «Siguiente»
-      // la página carga los totales y el store puede re-renderizar el carrito
-      // desde el server: si eso resetea una cantidad a 1, el pedido salía corto
-      // sin aviso. Se compara cada fila contra lo que pide el PDF y, si algo no
-      // empata, NO se toca «Siguiente».
-      const problemaSig = await tokVerifyPreCheckout(st, "antes de «Siguiente»");
-      if (problemaSig) return tokFail(problemaSig);
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(el);
@@ -4370,6 +4411,20 @@
     }
 
     if (st.step === "realizar") {
+      // v2.0.95: este paso solo se ocupa de «Realizar pedido» en
+      // /checkout/payment. Si la URL no es esa, el flujo quedó desfasado (una
+      // recarga, un paso saltado): no se falla acá diciendo que no se encontró
+      // el botón —que era un error que no decía nada del problema real— sino
+      // que se vuelve al paso que tiene que buscar «Siguiente».
+      if (location.pathname.indexOf("/checkout/payment") !== 0) {
+        st.retries = (st.retries || 0) + 1;
+        if (st.retries >= 3) {
+          return tokFail("el checkout no llegó a /checkout/payment tras " + st.retries + " intentos (la url quedó en " + location.pathname + ")");
+        }
+        st.step = "siguiente";
+        await tokStoreSet(CHECKOUT_KEY, st);
+        return tokCheckoutStep();
+      }
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
       // "place-order-button" (botón React, disabled hasta que terminan los
       // cálculos de envío/pago).
@@ -4379,7 +4434,7 @@
         if (direct) return direct;
         return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido|place.?order/i);
       }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
-      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment");
+      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (la url es " + location.pathname + "): puede que el store esté pidiendo completar los datos de envío o de pago antes de habilitarla");
       // Esperar a que quede habilitado antes de clickear (el toggle es por
       // clase/atributo disabled mientras el store calcula envío).
       try {
