@@ -3903,7 +3903,7 @@
         // «Siguiente» → «Realizar pedido». El flujo es un LOTE ENTERO por el
         // usuario: pulsa «Enviar a carrito» una sola vez y todo el pedido se
         // procesa como compras reales lote a lote.
-        tokCheckoutStart(msg.lote || 1);
+        tokCheckoutStart(msg.lote || 1, msg.expect);
         sendResponse({ ok: true });
         break;
       case "SHOW_PICKER":
@@ -4017,6 +4017,255 @@
     try { await tokStoreRemove(CHECKOUT_KEY); } catch (e) {}
   }
 
+  // v2.0.94: nombre canónico de la UNIDAD de una fila. El texto del carrito dice
+  // "x Bultos" y el pedido dice "Bulto", y "x 24 Unidad(s)" vs "Unidad": sin
+  // canonicalizar, dos filas del mismo producto con distinta escritura de la
+  // unidad se tomarían por productos distintos.
+  function tokUnitTok(s) {
+    const t = tokNorm(String(s || "")).replace(/[^a-z]/g, "");
+    if (!t) return "";
+    if (/unidad|un|ud/.test(t)) return "unidad";
+    if (/caja/.test(t)) return "caja";
+    if (/bulto/.test(t)) return "bulto";
+    if (/display/.test(t)) return "display";
+    if (/paquete|pack/.test(t)) return "pack";
+    return t.replace(/s+$/, "");
+  }
+
+  // v2.0.94: UNIDAD de una fila del carrito. Se saca del patrón "x [N] <unidad>"
+  // del texto de la fila. Importante: hay que mirar SOLO la palabra de la
+  // unidad, no la fila entera: "x 2 Bultos (48 Uds)" contiene "uds" y una fila
+  // leída completa se tomaría por una fila de UNIDADES.
+  function tokRowUnitTok(txt) {
+    const m = String(txt || "").match(
+      /\bx(?:\s+\d+)?\s*(unidad(?:es|\(s\))?|un|uds|u\.?s\.?|caja|cajas|bulto|bultos|display|displays|paquete|paquetes|pack|packs)(?![a-z0-9])/i
+    );
+    return tokUnitTok(m ? m[1] : "");
+  }
+
+  // v2.0.94: CANTIDAD QUE MUESTRA UNA FILA DEL CARRITO. En el drawer del store
+  // la cantidad vive en un input[type=number]; en la ventana de «Revisar
+  // pedido» (/checkout/cart) NO hay input y la cantidad va en el texto de la
+  // fila ("x 24 Unidad(s)"). Con `unitPref` se busca primero "x N <esa unidad>"
+  // porque una fila puede traer dos números (x 2 Bultos · 48 Uds) y el que
+  // importa es el de la unidad que se cargó.
+  function tokQtyFromText(txt, unitPref) {
+    const t = String(txt || "");
+    const UN = "unidad(?:es|\\(s\\))?|un|uds|u\\.?s\\.?|caja|cajas|bulto|bultos|display|displays|paquete|paquetes|pack|packs";
+    if (unitPref) {
+      const u = String(unitPref).trim().toLowerCase().replace(/[^a-z]/g, "");
+      if (u) {
+        const esc = u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const m = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + esc + "s?)(?![a-z0-9])", "i"));
+        if (m) return parseInt(m[1], 10);
+      }
+    }
+    const m2 = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + UN + ")(?![a-z0-9])", "i"));
+    if (m2) return parseInt(m2[1], 10);
+    const m3 = t.match(/cantidad\s*[:\-]?\s*(\d+)/i);
+    if (m3) return parseInt(m3[1], 10);
+    return null;
+  }
+
+  // v2.0.94: LEE las filas del carrito con su cantidad, en el drawer del store o
+  // en la ventana de «Revisar pedido». El layout del drawer está PROBADO en
+  // vivo (article[data-id=cart-product-card] + [data-id^=unit-size-ARC-] +
+  // input[type=number]). En /checkout/cart no hay input: se buscan los bloques
+  // que muestran una cantidad y se queda con los MÁS INTERNOS (los que no
+  // contienen otro bloque con cantidad) para no leer tres veces la misma fila.
+  // Devuelve [] cuando no hay nada que comparar: eso NO es un fallo.
+  function tokCartReadCheckout() {
+    const out = [];
+    const push = (el, qty, hasInput) => {
+      const txt = (el.innerText || "").replace(/\s+/g, " ").trim();
+      if (!txt) return;
+      const sizeEl = el.querySelector ? el.querySelector("[data-id^=unit-size-ARC-]") : null;
+      const code = tokArcCode(
+        (sizeEl && sizeEl.getAttribute("data-id")) ||
+        (el.getAttribute && (el.getAttribute("data-id") || el.getAttribute("data-product-id"))) ||
+        txt
+      );
+      out.push({ el, code, name: txt, qty, hasInput: !!hasInput, unitTok: tokRowUnitTok(txt) });
+    };
+    for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+      const inp = el.querySelector("input[type=number]");
+      let qty = inp ? parseInt(String(inp.value || "").replace(/\D+/g, ""), 10) : NaN;
+      if (isNaN(qty)) qty = tokQtyFromText(el.innerText || "");
+      if (isNaN(qty)) continue;
+      push(el, qty, !!inp);
+    }
+    if (out.length) return out;
+    const cands = [];
+    for (const el of document.querySelectorAll("article, li, tr, section, div")) {
+      if (el.children.length > 14) continue;
+      const txt = (el.innerText || "").replace(/\s+/g, " ").trim();
+      if (!txt || txt.length > 400) continue;
+      const qty = tokQtyFromText(txt);
+      if (qty == null) continue;
+      cands.push({ el, txt, qty });
+    }
+    const deep = cands.filter((h) => !cands.some((o) => o !== h && h.el.contains(o.el)));
+    const usados = [];
+    for (const h of deep) {
+      // Si el bloque más interno es solo el texto de la cantidad ("x 24
+      // Unidad"), subir hasta el ancestro que ya trae el nombre del producto.
+      let row = h.el;
+      let up = 0;
+      while (row && (row.innerText || "").replace(/\s+/g, " ").trim().length < 20 && up < 6) { row = row.parentElement; up++; }
+      if (!row) row = h.el;
+      if (usados.indexOf(row) !== -1) continue;
+      usados.push(row);
+      const inp = row.querySelector ? row.querySelector("input[type=number]") : null;
+      const qIn = inp ? parseInt(String(inp.value || "").replace(/\D+/g, ""), 10) : NaN;
+      push(row, isNaN(qIn) ? h.qty : qIn, !!inp);
+    }
+    return out;
+  }
+
+  // v2.0.94: VERIFICA QUE EL CARRITO SIGA IGUAL QUE EL PEDIDO antes de tocar
+  // «Siguiente» (y antes de «Revisar pedido»). El store puede resetear una
+  // cantidad a 1 con un refresh de fondo —el SPA re-renderiza la fila desde el
+  // server— y el pedido se confirmaría corto sin que nadie lo viera. Por eso
+  // "no hay pedidos de 1 unidad" es la señal: una fila que quedó en 1 cuando el
+  // pedido pedía más es una línea reseteada, no una línea correcta.
+  // Criterio:
+  //   - sin lista de cantidades (lote sin referencia) → se sigue;
+  //   - si la ventana no muestra cantidades → se sigue (no se frena el pedido
+  //     por una lectura que no se pudo hacer);
+  //   - si no se reconoce NINGUNA línea del lote → se sigue (lectura dudosa);
+  //   - si algo no empata se intenta corregir y se relee; si sigue mal, NO se
+  //     toca «Siguiente»: se frena con el detalle de las líneas.
+  // Devuelve null cuando todo está bien, o el motivo por el que hay que frenar.
+  async function tokVerifyPreCheckout(st, etapa) {
+    const expect = Array.isArray(st && st.expect) ? st.expect : [];
+    if (!expect.length) {
+      tokDiagPush("checkout", { msg: etapa + ": el lote no trajo lista de cantidades; se sigue sin verificar" });
+      return null;
+    }
+    let filas = tokCartReadCheckout();
+    // Un re-render puede tardar: antes de aceptar que no hay nada que comparar
+    // se relee un par de veces.
+    for (let i = 0; i < 3 && !filas.length; i++) { await toksleep(700); filas = tokCartReadCheckout(); }
+    if (!filas.length) {
+      tokDiagPush("checkout", { msg: etapa + ": la ventana no muestra cantidades por producto; se sigue sin verificar" });
+      try { tokToastSet("No se pudo leer el detalle del carrito — se sigue sin verificar", ""); } catch (e) {}
+      return null;
+    }
+    // Comparación POR TOTAL de cada producto: el store puede fusionar dos
+    // líneas del pedido en una sola fila (mismo producto, misma unidad) o dejar
+    // dos filas del mismo producto. Lo que tiene que empatar es la cantidad
+    // PEDIDA contra la que muestra el carrito, no fila por fila.
+    const filasDe = (exp) => {
+      const code = tokArcCode(String(exp.storeText || ""));
+      if (code) {
+        const porCode = filas.filter((c) => c.code && (c.code === code || c.code.endsWith(code) || code.endsWith(c.code)));
+        if (porCode.length) {
+          const u = tokUnitTok(exp.unit);
+          if (u) {
+            const mismaUnidad = porCode.filter((c) => (c.unitTok || tokRowUnitTok(c.name)) === u);
+            if (mismaUnidad.length) return mismaUnidad;
+          }
+          return porCode;
+        }
+      }
+      // Sin ARC: por nombre, como tokCartFindProduct (con el bonus de la fila
+      // sin nombre de producto: "x Bulto (216 Uds)").
+      const un = tokUnitTok(exp.unit);
+      let best = 0;
+      const elegidas = [];
+      for (const c of filas) {
+        const t = String(c.name || "");
+        const n = tokNorm(t);
+        const sinNombre = un.length > 0 && n.indexOf("x " + un) === 0;
+        const s = tokSim(String(exp.storeText || exp.producto || ""), t) + (sinNombre ? 0.5 : 0);
+        if (s <= 0) continue;
+        if (s > best) { best = s; elegidas.length = 0; elegidas.push(c); }
+        else if (s === best) elegidas.push(c);
+      }
+      return elegidas;
+    };
+    const qtyDe = (c, exp) => {
+      if (c.hasInput) return c.qty;
+      const porUnidad = tokQtyFromText(c.name, exp.unit);
+      return porUnidad != null ? porUnidad : c.qty;
+    };
+    const evalua = () => {
+      const grupos = new Map();
+      const sinFila = [];
+      for (const exp of expect) {
+        const rows = filasDe(exp);
+        if (!rows.length) { sinFila.push(exp); continue; }
+        const sig = rows.map((r) => filas.indexOf(r)).join(",");
+        if (!grupos.has(sig)) grupos.set(sig, { rows, sum: 0, lineas: [] });
+        const g = grupos.get(sig);
+        g.sum += Number(exp.want) || 0;
+        g.lineas.push(exp);
+      }
+      const malos = [];
+      for (const g of grupos.values()) {
+        const e0 = g.lineas[0] || {};
+        let hay = 0;
+        for (const c of g.rows) hay += qtyDe(c, e0);
+        if (hay !== g.sum) malos.push({ rows: g.rows, qty: hay, sum: g.sum, lineas: g.lineas });
+      }
+      return { matched: grupos.size, malos, sinFila };
+    };
+    let ev = evalua();
+    if (!ev.malos.length && !ev.sinFila.length) {
+      tokDiagPush("checkout", { msg: etapa + ": los " + ev.matched + " productos del lote coinciden con el pedido" });
+      return null;
+    }
+    if (!ev.matched) {
+      tokDiagPush("checkout", { msg: etapa + ": se leyeron " + filas.length + " filas pero no se reconoce ninguna del lote; se sigue sin verificar (lectura dudosa)" });
+      return null;
+    }
+    // Corrección: solo cuando el producto está en UNA sola fila. Con varias filas
+    // del mismo producto, repartirlas es criterio del store y no conviene tocarlo
+    // a ciegas: se frena y lo corrige el usuario.
+    for (const m of ev.malos) {
+      if (m.rows.length !== 1) continue;
+      const card = m.rows[0];
+      const inp = card.el.querySelector ? card.el.querySelector("input[type=number]") : null;
+      const sel = card.el.querySelector ? card.el.querySelector("select") : null;
+      if (inp) await tokCartSetQty(inp, m.sum);
+      else if (sel) {
+        try { sel.value = String(m.sum); sel.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
+        await toksleep(500);
+      }
+      const nom = String((m.lineas[0] || {}).producto || "").slice(0, 40);
+      tokDiagPush("checkout", { msg: etapa + ": se intentó corregir " + nom + " a " + m.sum + " (el carrito mostraba " + m.qty + ")" });
+    }
+    if (ev.malos.length) {
+      await toksleep(900);
+      filas = tokCartReadCheckout();
+      ev = evalua();
+      if (!ev.malos.length && !ev.sinFila.length) {
+        tokDiagPush("checkout", { msg: etapa + ": se corrigieron las cantidades y el carrito quedó igual que el pedido" });
+        return null;
+      }
+    }
+    const partes = [];
+    for (const m of ev.malos) {
+      const e0 = m.lineas[0] || {};
+      partes.push(
+        (e0.nro != null ? "#" + e0.nro + " " : "") +
+        String(e0.producto || e0.storeText || "").slice(0, 42) +
+        ": el pedido pide " + m.sum + " " + String(e0.unit || "").trim() +
+        " y el carrito muestra " + m.qty + " en " + m.rows.length + (m.rows.length === 1 ? " fila" : " filas")
+      );
+    }
+    for (const exp of ev.sinFila) {
+      partes.push((exp.nro != null ? "#" + exp.nro + " " : "") + String(exp.producto || exp.storeText || "").slice(0, 42) + ": no aparece en el carrito");
+    }
+    const reseteo = ev.malos.some((m) => m.qty === 1 && m.sum > 1);
+    tokDiagPush("checkout", { msg: etapa + ": BLOQUEADO, el carrito no está igual que el pedido → " + partes.join(" · ") });
+    return (
+      "el carrito NO quedó igual que el pedido (" + etapa + "): " + partes.join(" · ") +
+      (reseteo ? " — hay líneas en 1 unidad que el pedido no pedía (el store las reseteó)" : "") +
+      ". No se tocó «Siguiente»: revisá el carrito y corregí esas líneas"
+    );
+  }
+
   async function tokCheckoutStep() {
     let st = await tokStoreGet(CHECKOUT_KEY);
     if (!st || !st.step) return false;
@@ -4066,6 +4315,11 @@
       try {
         await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
+      // v2.0.94: el carrito se compara contra el pedido ANTES de abrir la
+      // revisión. Acá la fila es editable, así que una cantidad reseteada a 1 se
+      // puede corregir en el momento.
+      const problemaRev = await tokVerifyPreCheckout(st, "antes de «Revisar pedido»");
+      if (problemaRev) return tokFail(problemaRev);
       st.step = "siguiente";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(el);
@@ -4101,6 +4355,13 @@
         await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
       try { console.log("[Tokin] checkout siguiente: click en «" + String((el.innerText || el.getAttribute("data-id") || "")).slice(0, 40) + "» (" + el.tagName + ") disabled=" + !!el.disabled); } catch (e) {}
+      // v2.0.94: ÚLTIMA puerta antes de confirmar. Entre «Revisar pedido» y «Siguiente»
+      // la página carga los totales y el store puede re-renderizar el carrito
+      // desde el server: si eso resetea una cantidad a 1, el pedido salía corto
+      // sin aviso. Se compara cada fila contra lo que pide el PDF y, si algo no
+      // empata, NO se toca «Siguiente».
+      const problemaSig = await tokVerifyPreCheckout(st, "antes de «Siguiente»");
+      if (problemaSig) return tokFail(problemaSig);
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(el);
@@ -4219,7 +4480,7 @@
     return null;
   }
 
-  function tokCheckoutStart(lote) {
+  function tokCheckoutStart(lote, expect) {
     // v2.0.79: GUARDIA CONTRA CHECKOUT DOBLE. Si ya hay un checkout EN CURSO
     // para este mismo lote (p. ej. porque el offscreen se recreó y re-envió el
     // CHECKOUT_BATCH por el tryRecoverReport), NO se inicia uno nuevo: el
@@ -4238,7 +4499,11 @@
           return;
         }
       } catch (e) {}
-      tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now() })
+      // v2.0.94: `expect` son las cantidades que el lote espera encontrar en el
+      // carrito (las manda el offscreen con los resultados del bloque). Viaja en
+      // el estado del checkout porque cada click navega y destruye este script:
+      // al cargar la página siguiente se reanuda con la lista a verificar.
+      tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now(), expect: Array.isArray(expect) ? expect : [] })
         .then(() => tokCheckoutStep());
     });
   }

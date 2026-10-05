@@ -155,5 +155,128 @@ ok(/waitForTokin\([\s\S]*?6000,\s*250\s*\)/.test(procCard) && !/waitForTokin\([\
 ok(/tokDiagPush\("nofix"[\s\S]*?encontrado pero sin stock/.test(procCard),
   "deja diagnóstico del código declarado sin stock (para poder auditarlo)");
 
+// --- 6) v2.0.94: el carrito se verifica contra el pedido antes de «Siguiente» -
+// Un refresh de fondo del store puede dejar una cantidad en 1 (el SPA re-renderiza
+// la fila desde el server) y el pedido se confirmaba corto sin aviso. Ahora, antes
+// de tocar «Siguiente», se compara cada fila del carrito contra lo que pide el PDF
+// y si algo no empata se frena sin confirmar nada.
+console.log("\n6) Antes de «Siguiente»: el carrito tiene que estar igual que el pedido");
+const cartDoneSrc = extractFunction(offSrc, "applyCartDone");
+ok(/type: "CHECKOUT_BATCH", lote, expect: checkoutExpect/.test(cartDoneSrc),
+  "el CHECKOUT_BATCH viaja con las cantidades que el lote espera encontrar");
+ok(/filter\(\(r\) => isAdded\(r\) && Number\(r\.added\) > 0\)/.test(cartDoneSrc),
+  "solo viajan las líneas cargadas: las que DEBEN estar en el carrito");
+ok(/want: Number\(r\.added\) \|\| 0/.test(cartDoneSrc) && /unit: String\(r\.usedUnit \|\| ""\)\.trim\(\)/.test(cartDoneSrc),
+  "cada línea viaja con su cantidad y su unidad");
+ok(/tokCheckoutStart\(msg\.lote \|\| 1, msg\.expect\)/.test(contentSrc),
+  "el content script recibe la lista del lote");
+ok(/expect: Array\.isArray\(expect\) \? expect : \[\]/.test(contentSrc),
+  "la lista viaja en el estado del checkout (sobrevive a cada navegación)");
+
+const verifySrc = extractFunction(contentSrc, "tokVerifyPreCheckout");
+ok(/st && st\.expect/.test(verifySrc) && /tokCartReadCheckout\(\)/.test(verifySrc),
+  "la verificación lee las cantidades que muestra el carrito");
+ok(/hay !== g\.sum/.test(verifySrc) && /g\.sum \+= Number\(exp\.want\)/.test(verifySrc) && /for \(const c of g\.rows\) hay \+= qtyDe\(c, e0\)/.test(verifySrc),
+  "compara el TOTAL de cada producto contra lo pedido (el store puede fusionar dos líneas en una fila, o dejar dos filas)");
+ok(/tokCartSetQty\(inp, m\.sum\)/.test(verifySrc),
+  "intenta corregir la cantidad con el tipeo robusto antes de frenar");
+ok(/m\.qty === 1 && m\.sum > 1/.test(verifySrc) && /el store las reseteó/.test(verifySrc),
+  "la señal de 'no existe un pedido de 1u': avisa que el store reseteó la línea");
+
+// Orden: la verificación va ANTES del click en los dos pasos.
+const pasoRev = contentSrc.slice(contentSrc.indexOf('if (st.step === "revisar")'), contentSrc.indexOf('if (st.step === "siguiente")'));
+const pasoSig = contentSrc.slice(contentSrc.indexOf('if (st.step === "siguiente")'), contentSrc.indexOf('if (st.step === "realizar")'));
+ok(pasoRev.indexOf("tokVerifyPreCheckout(st") > -1 && pasoRev.indexOf("tokVerifyPreCheckout(st") < pasoRev.indexOf("tokRealClick(el)"),
+  "paso «revisar»: se verifica antes de abrir «Revisar pedido»");
+ok(pasoSig.indexOf("tokVerifyPreCheckout(st") > -1 && pasoSig.indexOf("tokVerifyPreCheckout(st") < pasoSig.indexOf("tokRealClick(el)"),
+  "paso «siguiente»: se verifica ANTES de tocar «Siguiente»");
+ok(/if \(problemaSig\) return tokFail\(problemaSig\);/.test(pasoSig),
+  "si el carrito no está igual que el pedido, NO se toca «Siguiente»: se frena el checkout");
+ok(/if \(problemaRev\) return tokFail\(problemaRev\);/.test(pasoRev),
+  "lo mismo en la apertura de la revisión");
+
+// Comportamiento real de la verificación (con el carrito simulado). Se usan las
+// funciones REALES de content.js (lectura de cantidad y canonicalización de
+// unidad) y stubs mínimos para el DOM y para los helpers de texto.
+const realQtyFromText = eval("(" + extractFunction(contentSrc, "tokQtyFromText") + ")");
+const tokUnitTok = eval("(" + extractFunction(contentSrc, "tokUnitTok") + ")");
+const tokRowUnitTok = eval("(" + extractFunction(contentSrc, "tokRowUnitTok") + ")");
+function tokNorm(s) {
+  return String(s == null ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function tokArcCode(x) {
+  const s = String(x == null ? "" : (x && x.getAttribute ? x.getAttribute("data-id") : x));
+  const m = s.match(/(?:ARC-?|codigo-)(\d{3,})/i);
+  return m ? m[1] : "";
+}
+function tokSim(a, b) {
+  const x = tokNorm(a), y = tokNorm(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (y.indexOf(x) === 0 || x.indexOf(y) === 0) return 0.9;
+  return x.indexOf(y) > -1 || y.indexOf(x) > -1 ? 0.6 : 0;
+}
+let FILAS = [];
+function toksleep() { return Promise.resolve(); }
+function tokCartReadCheckout() { return FILAS; }
+let corregidas = [];
+async function tokCartSetQty(inp, want) { corregidas.push(want); return want; }
+function tokDiagPush() {}
+function tokToastSet() {}
+const tokVerifyPreCheckout = eval("(" + verifySrc + ")");
+const linea = (nro, want, code) => ({ nro, producto: "PROD " + nro, storeText: "ARC-" + code, want, unit: "Unidad" });
+const fila = (code, qty, conInput) => ({ el: { querySelector: conInput ? () => ({}) : () => null }, code, name: "PROD ARC-" + code + " x " + qty + " Unidad(s)", qty, hasInput: !!conInput });
+
+FILAS = [fila("1510", 24, true)];
+ok(await tokVerifyPreCheckout({ expect: [linea(5, 24, "1510")] }, "antes de «Siguiente»") === null,
+  "carrito igual que el pedido → sigue (no frena)");
+ok(corregidas.length === 0, "no toca nada cuando todo está bien");
+
+FILAS = [fila("1510", 1, true)];
+const r1 = await tokVerifyPreCheckout({ expect: [linea(5, 24, "1510")] }, "antes de «Siguiente»");
+ok(r1 && /el carrito muestra 1/.test(r1) && /pedido pide 24/.test(r1) && /#5/.test(r1),
+  "cantidad reseteada a 1 → frena y dice qué línea y cuánto se pidió");
+ok(/store las reseteó/.test(r1 || ""), "el motivo es el reseteo a 1 del store");
+ok(corregidas.length === 1 && corregidas[0] === 24, "antes de frenar intentó corregir la cantidad");
+
+FILAS = [];
+ok(await tokVerifyPreCheckout({ expect: [linea(5, 24, "1510")] }, "antes de «Siguiente»") === null,
+  "carrito ilegible → NO frena (no se bloquea una compra por una lectura que no se pudo hacer)");
+
+FILAS = [fila("999", 24, true)];
+ok(await tokVerifyPreCheckout({ expect: [linea(5, 24, "1510")] }, "antes de «Siguiente»") === null,
+  "no se reconoce ninguna línea del lote → NO frena (lectura dudosa)");
+
+ok(await tokVerifyPreCheckout({}, "antes de «Siguiente»") === null,
+  "lote sin lista de cantidades → se sigue (no hay contra qué comparar)");
+
+FILAS = [fila("777", 24, true)];
+ok(await tokVerifyPreCheckout({ expect: [linea(1, 12, "777"), linea(2, 12, "777")] }, "antes de «Siguiente»") === null,
+  "dos líneas del pedido fusionadas en una fila: se compara la SUMA (12+12=24) y no se frena");
+FILAS = [fila("777", 24, true)];
+const r2 = await tokVerifyPreCheckout({ expect: [linea(1, 12, "777"), linea(2, 24, "777")] }, "antes de «Siguiente»");
+ok(r2 && /pedido pide 36/.test(r2), "si la fila fusionada quedó corta (24 de 36) también frena");
+
+FILAS = [fila("888", 12, true), fila("888", 12, true)];
+ok(await tokVerifyPreCheckout({ expect: [linea(3, 24, "888")] }, "antes de «Siguiente»") === null,
+  "el store dejó DOS filas del mismo producto (12+12) contra una línea de 24: compara el total y NO frena");
+FILAS = [fila("888", 12, true), fila("888", 6, true)];
+const antesDeRepartir = corregidas.length;
+const r3 = await tokVerifyPreCheckout({ expect: [linea(3, 24, "888")] }, "antes de «Siguiente»");
+ok(r3 && /carrito muestra 18/.test(r3) && /en 2 filas/.test(r3),
+  "dos filas que suman menos de lo pedido (18 de 24) → frena diciendo cuántas filas hay");
+ok(corregidas.length === antesDeRepartir,
+  "con varias filas del mismo producto NO reparte a ciegas: frena y lo corrige el usuario");
+ok(realQtyFromText("PROD x 24 Unidad(s)", "Unidad") === 24 && realQtyFromText("PROD x 2 Bultos (48 Uds)", "Bulto") === 2 &&
+   realQtyFromText("PROD x 24 Unidad(s)", "Caja") === 24 && realQtyFromText("Cantidad: 6", "") === 6 &&
+   realQtyFromText("sin cantidad", "") === null,
+  "la cantidad se lee del texto de la fila de /checkout/cart (no hay input ahí)");
+ok(tokRowUnitTok("COFLER x 2 Bultos (48 Uds)") === "bulto" && tokRowUnitTok("COFLER x Bulto (216 Uds)") === "bulto" &&
+   tokRowUnitTok("COFLER x 24 Unidad(s)") === "unidad" && tokRowUnitTok("COFLER x 3 Cajas") === "caja" &&
+   tokRowUnitTok("COFLER x 1 Display") === "display" && tokRowUnitTok("COFLER 12 unidades") === "",
+  "la unidad sale de 'x [N] <unidad>' y no de la fila entera: 'x 2 Bultos (48 Uds)' es BULTO, no unidad");
+ok(tokUnitTok("Unidad") === "unidad" && tokUnitTok("Bulto") === "bulto" && tokUnitTok("Uds") === "unidad" && tokUnitTok("Caja") === "caja",
+  "la unidad del pedido se canonicaliza igual que la del carrito");
+
 console.log(bad ? "\nFALLAS: " + bad : "\nOK: checkout manual por bloque y recuperación correctos");
 process.exit(bad ? 1 : 0);

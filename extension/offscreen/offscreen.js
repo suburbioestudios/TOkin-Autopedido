@@ -672,7 +672,23 @@ function applyCartDone(msg) {
     setStatus("loading_cart", "Lote " + lote + " cargado al carrito — confirmando el pedido en el store (Revisar pedido → Siguiente → Realizar pedido)…", 3);
     persist();
     emitState();
-    sendSw({ type: "CHECKOUT_BATCH", lote }).catch(() => {});
+    // v2.0.94: las CANTIDADES que este lote espera encontrar en el carrito
+    // viajan con el checkout. El content script las usa para comparar, en la
+    // ventana de «Revisar pedido» y antes de tocar «Siguiente», cada fila del
+    // carrito contra la del PDF: un refresh de fondo del store puede dejar una
+    // línea en 1 y el pedido se confirmaría corto sin que nadie lo viera.
+    // Solo van las líneas que quedaron cargadas (ok con cantidad > 0): las
+    // demás no están en el carrito y no hay nada que comparar.
+    const checkoutExpect = batchResults
+      .filter((r) => isAdded(r) && Number(r.added) > 0)
+      .map((r) => ({
+        nro: r.nro,
+        producto: String(r.producto || "").slice(0, 80),
+        storeText: String(r.storeText || "").slice(0, 140),
+        want: Number(r.added) || 0,
+        unit: String(r.usedUnit || "").trim(),
+      }));
+    sendSw({ type: "CHECKOUT_BATCH", lote, expect: checkoutExpect }).catch(() => {});
     // Red de seguridad: si el content script no confirma en ~3 min (página de
     // checkout caída o botones distintos), continuar igual y no clavar el flujo.
     clearTimeout(state.checkoutTimer || 0);
