@@ -982,7 +982,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         });
       } catch (e) {}
-      continueAfterCheckout(lote, msg && msg.message ? String(msg.message) : "", !(msg && msg.ok));
+      // v2.0.97: los avisos del checkout (desajustes de cantidades) se anexan
+      // al mensaje que muestra el popup; no cambian el hecho de que el pedido
+      // de ese lote quedó realizado.
+      const avisos = Array.isArray(msg && msg.avisosCheckout) ? msg.avisosCheckout : [];
+      let noteFinal = msg && msg.message ? String(msg.message) : "";
+      if (avisos.length) {
+        noteFinal = (noteFinal ? noteFinal + " · " : "") + avisos.join(" · ");
+        try {
+          const api = state.cartApi;
+          if (api) {
+            api._avisosCheckout = (api._avisosCheckout || []).concat(avisos);
+            if (state.cart) state.cart._avisosCheckout = (state.cart._avisosCheckout || []).concat(avisos);
+          }
+        } catch (e) {}
+      }
+      continueAfterCheckout(lote, noteFinal, !(msg && msg.ok));
       sendResponse({ ok: true });
       break;
     }

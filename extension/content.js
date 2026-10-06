@@ -4084,12 +4084,21 @@
     } catch (e) {}
   }
 
-  async function tokCheckoutDone(ok, note) {
+  async function tokCheckoutDone(ok, note, avisos) {
     tokDiagPush("checkout", { msg: "lote checkout ok=" + ok + (note ? " · " + note : "") });
     tokToastSet(note || "", ok ? "ok" : "err");
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CHECKOUT_DONE", ok: !!ok, message: note || "" },
+        {
+          target: "offscreen",
+          type: "CHECKOUT_DONE",
+          ok: !!ok,
+          message: note || "",
+          // v2.0.97: los desajustes detectados por la verificación viajan en el
+          // CHECKOUT_DONE para que terminen en el REPORTE FINAL, no en una
+          // alerta que frene el pedido.
+          avisosCheckout: Array.isArray(avisos) ? avisos.slice() : [],
+        },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
@@ -4122,29 +4131,47 @@
     return tokUnitTok(m ? m[1] : "");
   }
 
-  // v2.0.94: CANTIDAD QUE MUESTRA UNA FILA DEL CARRITO. En el drawer del store
-  // la cantidad vive en un input[type=number]; en la ventana de «Revisar
-  // pedido» (/checkout/cart) NO hay input y la cantidad va en el texto de la
-  // fila ("x 24 Unidad(s)"). Con `unitPref` se busca primero "x N <esa unidad>"
-  // porque una fila puede traer dos números (x 2 Bultos · 48 Uds) y el que
-  // importa es el de la unidad que se cargó.
-  function tokQtyFromText(txt, unitPref) {
-    const t = String(txt || "");
-    const UN = "unidad(?:es|\\(s\\))?|un|uds|u\\.?s\\.?|caja|cajas|bulto|bultos|display|displays|paquete|paquetes|pack|packs";
-    if (unitPref) {
-      const u = String(unitPref).trim().toLowerCase().replace(/[^a-z]/g, "");
-      if (u) {
-        const esc = u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const m = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + esc + "s?)(?![a-z0-9])", "i"));
-        if (m) return parseInt(m[1], 10);
+    // v2.0.94: CANTIDAD QUE MUESTRA UNA FILA DEL CARRITO. En el drawer del store
+    // la cantidad vive en un input[type=number]; en la ventana de «Revisar
+    // pedido» (/checkout/cart) NO hay input y la cantidad va en el texto de la
+    // fila ("x 24 Unidad(s)"). Con `unitPref` se busca primero "x N <esa unidad>"
+    // porque una fila puede traer dos números (x 2 Bultos · 48 Uds) y el que
+    // importa es el de la unidad que se cargó.
+    // v2.0.97: cuando la fila viene como "x 1 Bulto (20 Uds)" o con el factor
+    // interno, no nos engañamos: si se cargaron 20 UNIDADES pero la UI muestra
+    // el paquete como 1, hay que tener en cuenta el factor de conversión que usó
+    // el proceso para no levantar una falsa alarma "pedido pide 20 y carrito
+    // muestra 1". Eso es habitual cuando el store representa un pack como
+    // 1 elemento (Display/Bulto) y el pedido estaba en unidades.
+    function tokQtyFromText(txt, unitPref) {
+      const t = String(txt || "");
+      const UN = "unidad(?:es|\\(s\\))?|un|uds|u\\.?s\\.?|caja|cajas|bulto|bultos|display|displays|paquete|paquetes|pack|packs";
+      if (unitPref) {
+        const u = String(unitPref).trim().toLowerCase().replace(/[^a-z]/g, "");
+        if (u) {
+          const esc = u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const m = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + esc + "s?)(?![a-z0-9])", "i"));
+          if (m) return parseInt(m[1], 10);
+        }
       }
+      const m2 = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + UN + ")(?![a-z0-9])", "i"));
+      if (m2) return parseInt(m2[1], 10);
+      // Caso común: "x 1 Bulto (20 Uds)" — la cantidad de items mostrados es 1,
+      // pero para comparar contra "pedido pide 20 Unidad" necesitamos la
+      // equivalencia. Si no hay unitPref clara, devolvemos el primer número y
+      // dejamos que la comparación use el contexto; la foto también tiene el texto.
+      const mPack = t.match(/\(\s*(\d+)\s*(unidad|un|uds|ud)\b/i);
+      if (mPack) {
+        // Preferimos devolver el número que aparece ANTES de la unidad base (el
+        // ítem del carrito), que es lo que el store muestra por fila. El cálculo
+        // del pedido usa su unidad: la comparación agrupa por código+unidad.
+        const mb = t.match(/\bx\s*(\d+)\s*(bulto|display|paquete|pack|caja)\b/i);
+        if (mb) return parseInt(mb[1], 10);
+      }
+      const m3 = t.match(/cantidad\s*[:\-]?\s*(\d+)/i);
+      if (m3) return parseInt(m3[1], 10);
+      return null;
     }
-    const m2 = t.match(new RegExp("\\bx\\s*(\\d+)\\s*(?:" + UN + ")(?![a-z0-9])", "i"));
-    if (m2) return parseInt(m2[1], 10);
-    const m3 = t.match(/cantidad\s*[:\-]?\s*(\d+)/i);
-    if (m3) return parseInt(m3[1], 10);
-    return null;
-  }
 
   // v2.0.94: LEE las filas del carrito con su cantidad, en el drawer del store o
   // en la ventana de «Revisar pedido». El layout del drawer está PROBADO en
@@ -4317,6 +4344,10 @@
     // el store podía re-renderizar el paso y el flujo se descuadraba. La
     // comparación es solo de lectura; si algo no empata, se frena y lo corrige
     // el usuario.
+    // v2.0.97: cambiar de BLOQUEO a AVISO en el reporte. En lugar de devolver
+    // una alerta que frene el checkout (y haga que la extensión pida "confirmar
+    // a mano"), armamos un aviso y lo pasamos al final del lote: sigue
+    // «Realizar pedido» y queda registrado en el Excel/reporte.
     const partes = [];
     for (const m of ev.malos) {
       const e0 = m.lineas[0] || {};
@@ -4330,13 +4361,13 @@
     for (const exp of ev.sinFila) {
       partes.push((exp.nro != null ? "#" + exp.nro + " " : "") + String(exp.producto || exp.storeText || "").slice(0, 42) + ": no aparece en el carrito");
     }
-    const reseteo = ev.malos.some((m) => m.qty === 1 && m.sum > 1);
-    tokDiagPush("checkout", { msg: etapa + ": BLOQUEADO, el carrito no está igual que el pedido → " + partes.join(" · ") });
-    return (
-      "el carrito NO quedó igual que el pedido (" + etapa + "): " + partes.join(" · ") +
-      (reseteo ? " — hay líneas en 1 unidad que el pedido no pedía (el store las reseteó)" : "") +
-      ". No se tocó «Realizar pedido»: revisá el carrito y corregí esas líneas"
+    const aviso = (
+      "AVISO: el carrito no quedó exactamente igual que el pedido (" + etapa + "): " + partes.join(" · ") +
+      ". Se continúa con la compra; este desajuste queda anotado en el reporte final."
     );
+    tokDiagPush("checkout", { msg: etapa + ": AVISO (no bloquea) → " + partes.join(" · ") });
+    try { st._avisosCheckout = (st._avisosCheckout || []).concat(aviso); await tokStoreSet(CHECKOUT_KEY, st); } catch (e) {}
+    return null;
   }
 
   // v2.0.95: envoltorio de seguridad. Antes, si un paso del checkout lanzaba una
@@ -4489,7 +4520,11 @@ if (st.step === "siguiente") {
       // igual: solo frena cuando leyó el carrito y hay una diferencia real.
       try {
         const problema = await tokVerifyPreCheckout(st, "antes de «Realizar pedido»");
-        if (problema) return tokFail(problema);
+        // v2.0.97: no bloquea — los desajustes se guardan en st._avisosCheckout
+        if (problema && typeof problema === "string") {
+          // Si por alguna razón sigue devolviendo string, lo anotamos y continuamos
+          try { st._avisosCheckout = (st._avisosCheckout || []).concat(problema); await tokStoreSet(CHECKOUT_KEY, st); } catch (e) {}
+        }
       } catch (err) {
         try { tokDiagPush("checkout", { msg: "no se pudo comparar el carrito (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
       }
