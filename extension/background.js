@@ -294,7 +294,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, message: "Abrí la pestaña del store para confirmar el pedido." });
           return;
         }
-        chrome.tabs.sendMessage(store.id, { type: "CHECKOUT_BATCH", lote: msg.lote || 1 }, (res) => {
+// v2.0.96: se reenvía `expect` (las cantidades que el lote espera
+        // encontrar). El relay solo pasaba `lote`, así que la lista llegaba
+        // vacía al content script y la verificación de la confirmación no tenía
+        // con qué comparar: siempre caía en "se sigue sin verificar".
+        chrome.tabs.sendMessage(store.id, { type: "CHECKOUT_BATCH", lote: msg.lote || 1, expect: msg.expect || [] }, (res) => {
           if (chrome.runtime.lastError) {
             sendResponse({ ok: false, message: chrome.runtime.lastError.message || "sin respuesta" });
           } else {

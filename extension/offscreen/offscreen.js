@@ -70,7 +70,31 @@ function sessionView() {
     grupos: (state.cartApi && state.cartApi.grupos) || {},
     cartIsManual: state.cartIsManual,
     manualRun: state.manualRun,
+    // v2.0.96: el lote cuyo checkout está en vuelo. Sin esto, si Chrome recrea
+    // este documento a mitad del lote (o se reinicia), el checkout perdedor se
+    // quedaba esperando un CHECKOUT_DONE que quizá nunca llegaba, el temporizador
+    // de seguridad se perdía con el documento y el primer envío NUNCA terminaba:
+    // la tarea quedaba clavada en «cargando carrito» sin error. Además, el
+    // CHECKOUT_DONE que llegara tarde tomaba lote=1 por defecto y marcaba como
+    // confirmado un lote que no era.
+    checkoutLote: state.checkoutLote || 0,
   };
+}
+
+// v2.0.96: red de seguridad del checkout de un lote. Si el content script no
+// confirma en ~3 min (página caída, botones distintos, extensión descargada a
+// medio camino), se continúa igual y no se clava el flujo. Es idempotente: la
+// vuelve a armar el offscreen al recrearse, con el lote que tenía en vuelo.
+function armCheckoutTimer() {
+  clearTimeout(state.checkoutTimer || 0);
+  state.checkoutTimer = 0;
+  if (!state.checkoutLote) return;
+  const loteT = state.checkoutLote;
+  state.checkoutTimer = setTimeout(function () {
+    if (state.checkoutLote !== loteT) return;
+    state.checkoutLote = 0;
+    continueAfterCheckout(loteT, "checkout sin confirmación — continuando", true);
+  }, 180000);
 }
 
 // Un sendMessage con callback vacío sin leer chrome.runtime.lastError dispara
@@ -691,13 +715,7 @@ function applyCartDone(msg) {
     sendSw({ type: "CHECKOUT_BATCH", lote, expect: checkoutExpect }).catch(() => {});
     // Red de seguridad: si el content script no confirma en ~3 min (página de
     // checkout caída o botones distintos), continuar igual y no clavar el flujo.
-    clearTimeout(state.checkoutTimer || 0);
-    state.checkoutTimer = setTimeout(() => {
-      if (!state.checkoutLote) return;
-      const loteT = state.checkoutLote;
-      state.checkoutLote = 0;
-      continueAfterCheckout(loteT, "checkout sin confirmación — continuando", true);
-    }, 180000);
+    armCheckoutTimer();
     return;
   }
   setStatus("canceled", "Carga del carrito cancelada.", 3);
@@ -1057,6 +1075,15 @@ function restoreSession() {
             state.manualRun = Number(s.manualRun) || 0;
             state.lotChecks = (s && s.lotChecks) || state.lotChecks || {};
             if (rep && rep.lotChecks) state.lotChecks = Object.assign({}, state.lotChecks, rep.lotChecks);
+            // v2.0.96: recuperar el lote con el checkout en vuelo y volver a armar
+            // su temporizador de seguridad. Si no, el offscreen recreado se
+            // quedaba esperando un CHECKOUT_DONE que no iba a llegar y el lote no
+            // terminaba nunca (la tarea clavada en «cargando carrito»).
+            state.checkoutLote = Number(s.checkoutLote) || 0;
+            if (state.checkoutLote) {
+              try { console.log("[Tokin] offscreen recreado con el checkout del lote " + state.checkoutLote + " en vuelo: rearmo la red de seguridad"); } catch (e) {}
+              armCheckoutTimer();
+            }
             try {
               if (state.cartApi) {
                 state.cartApi.grupos = state.cartApi.grupos || {};

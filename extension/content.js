@@ -363,19 +363,39 @@
   // v2.0.23: verificación de conectividad antes de cada búsqueda.
   // Si no hay internet, se frena el job y se avisa al usuario.
   async function tokCheckNet() {
+    // v2.0.96: la pausa por "sin internet" era la causa de los cuelgues. El
+    // chequeo era un fetch HEAD a /store con 5s de timeout y se hacía antes de
+    // CADA búsqueda: con el carrito grande el store responde lento, el fetch
+    // abortaba, la tarea se pausaba, y al reanudar el qIdx volvía a 0 → la
+    // línea reiniciaba su búsqueda desde el primer código para siempre. Eso es
+    // lo que dejaba el primer envío clavado (y el pop-up saying «pausada»).
+    // Ahora: timeout más holgado, se confirma la caída con un segundo intento y
+    // se respeta navigator.onLine; una respuesta rara NO es "sin internet".
     try {
-      const ctrl = new AbortController();
-      const tid = setTimeout(function() { ctrl.abort(); }, 5000);
-      const r = await fetch("https://tokintienda.com.ar/store", {
-        method: "HEAD",
-        mode: "no-cors",
-        cache: "no-store",
-        signal: ctrl.signal,
-      });
-      clearTimeout(tid);
-      return true;
+      if (navigator && navigator.onLine === false) return false;
+      const uno = async () => {
+        const ctrl = new AbortController();
+        const tid = setTimeout(function () { ctrl.abort(); }, 12000);
+        try {
+          await fetch("https://tokintienda.com.ar/store", {
+            method: "HEAD",
+            mode: "no-cors",
+            cache: "no-store",
+            signal: ctrl.signal,
+          });
+          return true;
+        } finally {
+          clearTimeout(tid);
+        }
+      };
+      if (await uno()) return true;
+      // Un fallo aislado con el carrito cargado no prueba que no haya red: se
+      // reintenta una vez antes de pausar la tarea.
+      await toksleep(1500);
+      if (navigator && navigator.onLine === false) return false;
+      return await uno();
     } catch (e) {
-      return false;
+      try { return !(navigator && navigator.onLine === false); } catch (e2) { return true; }
     }
   }
 
@@ -1572,6 +1592,10 @@
   // lote (todos los waits del flujo quedan muy por debajo de este valor).
   const TOK_PAUSE_MAX_MS = 30 * 60 * 1000;
   const TOK_STALE_MS = 15000;
+  // v2.0.96: tope de búsquedas por línea. Con ~6 queries por línea y un reintento
+  // de la query de código, 14 intentos es amplio para un producto que existe y
+  // cortocircuita el bucle infinito de las líneas imposibles.
+  const TOK_BUSQUEDAS_MAX = 14;
   let tokChainAlive = false;
 
   function tokStoreGet(key) {
@@ -1588,10 +1612,14 @@
   function tokStoreSet(key, value) {
     // v2.0.66: nunca re-escribir un job cuyo token fue matado (Terminar/Reanudar),
     // aunque siga vivo en memoria en este content script.
-    if (key === CART_JOB_KEY && value && tokKilledToken && String(value.token) === tokKilledToken) {
+        if (key === CART_JOB_KEY && value && tokKilledToken && String(value.token) === tokKilledToken) {
       try { console.log("[Tokin] ignorada re-escritura de job matado (token " + tokKilledToken + ")"); } catch (e) {}
       return Promise.resolve();
     }
+    // v2.0.96: sellar la actividad del job en CADA guardado. Es el punto único por
+    // el que pasa todo avance/búsqueda, así que sirve de "último movimiento" para
+    // que resumeCart no mate un pedido largo que sí está avanzando.
+    if (key === CART_JOB_KEY && value && typeof value === "object") value.tocado = Date.now();
     return new Promise((resolve) => {
       try {
         chrome.storage.local.set({ [key]: value }, () => {
@@ -1889,6 +1917,24 @@
         const query = queries[job.qIdx];
         job.phase = "searching";
         job.query = query;
+        // v2.0.96: GUARDA DE COLGADO. Cada búsqueda de la línea cuenta; si la
+        // línea supera el tope (muchas queries + reintentos + pauses), se
+        // abandona con "revisión manual" y el lote SIGUE. Antes una sola línea
+        // difícil (p. ej. un código que el store no muestra) podía reiniciar su
+        // búsqueda indefinidamente y el primer envío no terminaba nunca.
+        job.busquedas = (job.busquedas || 0) + 1;
+        if (job.busquedas > (job.topeBusquedas || TOK_BUSQUEDAS_MAX)) {
+          job.busquedas = 0;
+          job.qIdx = 0;
+          job.codeRetried = false;
+          job.results[job.index] = {
+            producto: it.producto || it.sku || "",
+            ok: false,
+            message: "no se encontró en el store tras " + (job.topeBusquedas || TOK_BUSQUEDAS_MAX) + " búsquedas (se cortó para no colgar el lote) — revisalo a mano",
+          };
+          tokDiagPush("match", { idx: job.index, nro: it.nro, msg: "tope de búsquedas alcanzado → se abandona la línea y el lote sigue" });
+          return tokAdvance(job, false);
+        }
         await tokStoreSet(CART_JOB_KEY, job);
         tokToastSet(
           "Buscando «" + String(it.producto || "").slice(0, 36) + "» (" + (job.index + 1) + "/" + job.total + ")",
@@ -3067,6 +3113,8 @@
     job.index++;
     job.qIdx = 0;
     job.codeRetried = false;
+    // v2.0.96: el contador de búsquedas es por línea.
+    job.busquedas = 0;
     job.phase = "pending";
     if (job.index >= job.total) {
       job.phase = "done";
@@ -3605,6 +3653,9 @@
   async function tokPauseCart(job) {
     job.phase = "paused";
     job.pausedAt = Date.now();
+    // v2.0.96: la línea en la que quedó pausada, para que al reanudar no se le
+    // reinicie la búsqueda desde el primer código.
+    job.pausedLine = job.index;
     await tokStoreSet(CART_JOB_KEY, job);
     await tokStoreRemove(CART_CANCEL_KEY);
     setTokRun(false);
@@ -3717,8 +3768,26 @@
       if (cancel) return tokAbortCart(job, cancel === "stop");
       const email = getSessionInfo().email;
       const lostSession = (job.email && (!email || email !== job.email));
-      const stale = lostSession || (job.started && Date.now() - job.started > 60 * 60 * 1000);
-      if (stale) return tokAbortCart(job, true);
+      // v2.0.96: la vejez se mide por INACTIVIDAD, no por duración total. Antes
+      // era (Date.now() - job.started > 60 min) con `started` fijo: cualquier
+      // pedido que tardara más de una hora se mataba en la siguiente navegación.
+      // Con la tienda lenta, el pedido de 145 líneas moría siempre cerca de la
+      // 125 (se vio en vivo: "tokAbortCart interrupted=true" en la 125) y el
+      // pedido quedaba incompleto sin que nadie entendiera por qué. Ahora sólo
+      // es viejo si lleva 60 min SIN avanzar; y hay un tope total de 8 h para
+      // los jobs que nadie retoma.
+      const ultimoMovimiento = job.tocado || job.started;
+      const inactivo = ultimoMovimiento && Date.now() - ultimoMovimiento > 60 * 60 * 1000;
+      const interminable = job.started && Date.now() - job.started > 8 * 60 * 60 * 1000;
+      const stale = lostSession || inactivo || interminable;
+      if (stale) {
+        try {
+          tokDiagPush("job", {
+            msg: "job descartado: " + (lostSession ? "cambió la sesión" : inactivo ? "60 min sin avanzar" : "8 h de duración total"),
+          });
+        } catch (e) {}
+        return tokAbortCart(job, true);
+      }
       // v2.0.66: registrar cada reanudación real para detectar reanudaciones
       // fantasma (líneas "que el pedido no pide" apareciendo de nuevo).
       tokDiagPush("resume", { msg: "reanudando job token=" + job.token + " phase=" + job.phase + " index=" + job.index + " file=" + (job.filename || "?") + " url=" + location.href.slice(0, 80) });
@@ -3759,6 +3828,8 @@
         const inCart = cards.filter((c) => c.qty > 0);
         // v2.0.39: si el carrito quedó vacío (lo vació «Reanudar»), reiniciar
         // el lote desde la línea 0 para cargar TODO el pedido de nuevo.
+        const lineaPausada = (job.pausedLine == null ? job.index : job.pausedLine);
+        job.pausedLine = undefined;
         if (inCart.length === 0) {
           job.index = 0;
           job.results = [];
@@ -3791,7 +3862,15 @@
           // Si no se encontró ninguna línea en el carrito, reintentar desde job.index.
           job.index = resumeFrom;
         }
-        job.qIdx = 0;
+        // v2.0.96: al reanudar tras una pausa NO se reinicia la búsqueda de la
+        // línea. Antes se ponía qIdx=0 siempre: una pausa (por un chequeo de red
+        // fallido, por un refresh) reiniciaba la línea desde su primer código y,
+        // si la pausa se repetía, la línea no avanzaba nunca — el lote quedaba
+        // clavado. Solo se resetea cuando la línea cambió de verdad.
+        if (job.index !== lineaPausada) {
+          job.qIdx = 0;
+          job.codeRetried = false;
+        }
         job.phase = "pending";
         await tokStoreSet(CART_JOB_KEY, job);
         tokStartChain();
@@ -4133,8 +4212,11 @@
   //   - si la ventana no muestra cantidades → se sigue (no se frena el pedido
   //     por una lectura que no se pudo hacer);
   //   - si no se reconoce NINGUNA línea del lote → se sigue (lectura dudosa);
-  //   - si algo no empata se intenta corregir y se relee; si sigue mal, NO se
-  //     toca «Siguiente»: se frena con el detalle de las líneas.
+  //   - si algo no empata → NO se toca «Realizar pedido»: se frena con el detalle
+  //     de las líneas y lo corrige el usuario.
+  // v2.0.96: es de SOLO LECTURA (no escribe ni tipea en el carrito) y tiene un
+  // tope de tiempo: si la lectura se demora o falla, se sigue con la
+  // confirmación. No puede colgar el checkout ni desandar el flujo previo.
   // Devuelve null cuando todo está bien, o el motivo por el que hay que frenar.
   async function tokVerifyPreCheckout(st, etapa) {
     const expect = Array.isArray(st && st.expect) ? st.expect : [];
@@ -4142,13 +4224,23 @@
       tokDiagPush("checkout", { msg: etapa + ": el lote no trajo lista de cantidades; se sigue sin verificar" });
       return null;
     }
+    const deadline = Date.now() + 15000;
     let filas = tokCartReadCheckout();
     // Un re-render puede tardar: antes de aceptar que no hay nada que comparar
     // se relee un par de veces.
-    for (let i = 0; i < 3 && !filas.length; i++) { await toksleep(700); filas = tokCartReadCheckout(); }
+    for (let i = 0; i < 3 && !filas.length && Date.now() < deadline; i++) { await toksleep(700); filas = tokCartReadCheckout(); }
+    if (!filas.length) {
+      // La página de pago no lista los productos (medido en la tienda): se usa la
+      // foto de solo lectura tomada en la página del carrito, que es la última
+      // página donde el store muestra las cantidades.
+      const foto = Array.isArray(st && st.snapshot) ? st.snapshot : [];
+      if (foto.length) {
+        filas = foto;
+        tokDiagPush("checkout", { msg: etapa + ": la pantalla de pago no lista los productos; se compara contra la foto de la página del carrito (" + filas.length + " filas)" });
+      }
+    }
     if (!filas.length) {
       tokDiagPush("checkout", { msg: etapa + ": la ventana no muestra cantidades por producto; se sigue sin verificar" });
-      try { tokToastSet("No se pudo leer el detalle del carrito — se sigue sin verificar", ""); } catch (e) {}
       return null;
     }
     // Comparación POR TOTAL de cada producto: el store puede fusionar dos
@@ -4219,31 +4311,12 @@
       tokDiagPush("checkout", { msg: etapa + ": se leyeron " + filas.length + " filas pero no se reconoce ninguna del lote; se sigue sin verificar (lectura dudosa)" });
       return null;
     }
-    // Corrección: solo cuando el producto está en UNA sola fila. Con varias filas
-    // del mismo producto, repartirlas es criterio del store y no conviene tocarlo
-    // a ciegas: se frena y lo corrige el usuario.
-    for (const m of ev.malos) {
-      if (m.rows.length !== 1) continue;
-      const card = m.rows[0];
-      const inp = card.el.querySelector ? card.el.querySelector("input[type=number]") : null;
-      const sel = card.el.querySelector ? card.el.querySelector("select") : null;
-      if (inp) await tokCartSetQty(inp, m.sum);
-      else if (sel) {
-        try { sel.value = String(m.sum); sel.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
-        await toksleep(500);
-      }
-      const nom = String((m.lineas[0] || {}).producto || "").slice(0, 40);
-      tokDiagPush("checkout", { msg: etapa + ": se intentó corregir " + nom + " a " + m.sum + " (el carrito mostraba " + m.qty + ")" });
-    }
-    if (ev.malos.length) {
-      await toksleep(900);
-      filas = tokCartReadCheckout();
-      ev = evalua();
-      if (!ev.malos.length && !ev.sinFila.length) {
-        tokDiagPush("checkout", { msg: etapa + ": se corrigieron las cantidades y el carrito quedó igual que el pedido" });
-        return null;
-      }
-    }
+    // v2.0.96: NO se corrige el carrito desde acá. En v2.0.94/95 esta función
+    // tipeaba la cantidad en el carrito cuando no empataba, y eso escribía en la
+    // página del store en mitad del checkout (el input es un React controlled):
+    // el store podía re-renderizar el paso y el flujo se descuadraba. La
+    // comparación es solo de lectura; si algo no empata, se frena y lo corrige
+    // el usuario.
     const partes = [];
     for (const m of ev.malos) {
       const e0 = m.lineas[0] || {};
@@ -4262,7 +4335,7 @@
     return (
       "el carrito NO quedó igual que el pedido (" + etapa + "): " + partes.join(" · ") +
       (reseteo ? " — hay líneas en 1 unidad que el pedido no pedía (el store las reseteó)" : "") +
-      ". No se tocó «Siguiente»: revisá el carrito y corregí esas líneas"
+      ". No se tocó «Realizar pedido»: revisá el carrito y corregí esas líneas"
     );
   }
 
@@ -4324,22 +4397,6 @@
         st.hadItems = Array.isArray(cards0) ? cards0.filter((c) => c.qty > 0).length > 0 : true;
         await tokStoreSet(CHECKOUT_KEY, st);
       } catch (e) {}
-      // v2.0.94: PRIMERO se compara el carrito contra el pedido y DESPUÉS se
-      // busca el botón. La comparación tarda (relee el carrito y puede corregir
-      // una cantidad) y React re-renderiza la fila: si el nodo del botón se
-      // guardara antes, el click caería en un nodo viejo, el paso no avanzaría y
-      // el error que aparecería después sería de otro paso, sin relación con la
-      // causa. Acá la fila es editable, así que una cantidad reseteada a 1 se
-      // puede corregir en el momento.
-      let problemaRev = null;
-      try { problemaRev = await tokVerifyPreCheckout(st, "antes de «Revisar pedido»"); }
-      catch (err) {
-        // La comparación NUNCA puede romper el checkout: si algo falla adentro,
-        // se avisa en el diagnóstico y el flujo sigue exactamente igual que
-        // antes de v2.0.94.
-        try { tokDiagPush("checkout", { msg: "la comparación del carrito falló (" + String((err && err.message) || err) + "): se sigue con el checkout" }); } catch (e) {}
-      }
-      if (problemaRev) return tokFail(problemaRev);
       const el = await waitForTokin(() => {
         return document.querySelector('[data-id="go-to-checkout-buton"]:not([disabled]):not([aria-disabled="true"])')
           || document.querySelector('[data-id="go-to-checkout-buton"]')
@@ -4359,18 +4416,7 @@
       if (!st) return false;
     }
 
-    if (st.step === "siguiente") {
-      // v2.0.94: ÚLTIMA puerta antes de confirmar. Entre «Revisar pedido» y
-      // «Siguiente» la página carga los totales y el store puede re-renderizar
-      // el carrito desde el server: si eso resetea una cantidad a 1, el pedido
-      // salía corto sin aviso. La comparación va PRIMERO y el botón se busca
-      // DESPUÉS, para no clickear un nodo que React ya reemplazó.
-      let problemaSig = null;
-      try { problemaSig = await tokVerifyPreCheckout(st, "antes de «Siguiente»"); }
-      catch (err) {
-        try { tokDiagPush("checkout", { msg: "la comparación del carrito falló (" + String((err && err.message) || err) + "): se sigue con el checkout" }); } catch (e) {}
-      }
-      if (problemaSig) return tokFail(problemaSig);
+if (st.step === "siguiente") {
       // Página /store/checkout/cart: botón «Siguiente». El selector EXACTO del
       // store es [data-id="next-step-button"] (botón React con texto
       // «Siguiente», clase disabled:* cuando aún no está habilitado). Se busca
@@ -4383,18 +4429,13 @@
           || document.querySelector("[data-id*=next], [data-id*=siguiente], [class*=next-step], a[href*=\"/checkout/payment\"]");
       }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
       if (!el) {
-        // v2.0.95: este paso solo tiene que buscar «Siguiente». Si no aparece,
-        // el store puede estar mostrando otra pantalla del checkout: en vez de
-        // inventar el paso siguiente (ir directo a payment), se vuelve al paso
-        // anterior, que es el que sabe qué botón tiene que haber.
-        try { console.log("[Tokin] checkout siguiente: no hay botón «Siguiente» en " + location.pathname); } catch (e) {}
-        const antes = st.retries || 0;
-        st.retries = antes + 1;
-        if (st.retries >= 3) {
-          return tokFail("no se encontró el botón «Siguiente» en " + location.pathname + " tras " + st.retries + " intentos");
-        }
-        st.step = "revisar";
+        try { console.log("[Tokin] checkout siguiente: botón no hallado, ir directo a payment"); } catch (e) {}
+        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
+        st.step = "realizar";
         await tokStoreSet(CHECKOUT_KEY, st);
+        await toksleep(1000);
+        st = await tokStoreGet(CHECKOUT_KEY);
+        if (!st || !st.step) return false;
         return tokCheckoutStep();
       }
       // Si el botón está disabled, esperar a que se habilite (el checkout lo
@@ -4403,6 +4444,25 @@
         await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
       try { console.log("[Tokin] checkout siguiente: click en «" + String((el.innerText || el.getAttribute("data-id") || "")).slice(0, 40) + "» (" + el.tagName + ") disabled=" + !!el.disabled); } catch (e) {}
+      // v2.0.96: FOTO de solo lectura de las cantidades, acá en la página del
+      // carrito. MEDIDO en la tienda real: /store/checkout/payment NO muestra
+      // los productos ni sus cantidades (sólo "Resumen" con subtotal, descuentos
+      // y envío), así que la comparación del paso final no tenía nada que
+      // leer y terminaba siempre en "se sigue sin verificar". Esta página sí
+      // muestra cada fila con su cantidad (input[data-id=quantity-selector-input]).
+      // Es SOLO lectura: no tipea, no clickea, no navega; el paso sigue igual.
+      // La comparación y la decisión igual se toman SOLO antes de «Realizar
+      // pedido».
+      try {
+        if (!st.snapshot || !st.snapshot.length) {
+          const foto = tokCartReadCheckout();
+          if (foto.length) {
+            st.snapshot = foto;
+            await tokStoreSet(CHECKOUT_KEY, st);
+            tokDiagPush("checkout", { msg: "foto de cantidades tomada en la página del carrito: " + foto.length + " filas" });
+          }
+        }
+      } catch (e) {}
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(el);
@@ -4411,20 +4471,6 @@
     }
 
     if (st.step === "realizar") {
-      // v2.0.95: este paso solo se ocupa de «Realizar pedido» en
-      // /checkout/payment. Si la URL no es esa, el flujo quedó desfasado (una
-      // recarga, un paso saltado): no se falla acá diciendo que no se encontró
-      // el botón —que era un error que no decía nada del problema real— sino
-      // que se vuelve al paso que tiene que buscar «Siguiente».
-      if (location.pathname.indexOf("/checkout/payment") !== 0) {
-        st.retries = (st.retries || 0) + 1;
-        if (st.retries >= 3) {
-          return tokFail("el checkout no llegó a /checkout/payment tras " + st.retries + " intentos (la url quedó en " + location.pathname + ")");
-        }
-        st.step = "siguiente";
-        await tokStoreSet(CHECKOUT_KEY, st);
-        return tokCheckoutStep();
-      }
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
       // "place-order-button" (botón React, disabled hasta que terminan los
       // cálculos de envío/pago).
@@ -4434,7 +4480,19 @@
         if (direct) return direct;
         return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido|place.?order/i);
       }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
-      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (la url es " + location.pathname + "): puede que el store esté pidiendo completar los datos de envío o de pago antes de habilitarla");
+      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment");
+      // v2.0.96: ÚNICA verificación de cantidades del pedido, y va acá: en la
+      // confirmación. Antes de tocar «Realizar pedido» se lee lo que muestra el
+      // carrito y se compara contra lo que el lote pidió. Es de SOLO LECTURA: no
+      // escribe en el carrito, no tipea, no navega — no puede desandar el flujo.
+      // Si no se puede leer (o no se reconoce ninguna línea del lote) se sigue
+      // igual: solo frena cuando leyó el carrito y hay una diferencia real.
+      try {
+        const problema = await tokVerifyPreCheckout(st, "antes de «Realizar pedido»");
+        if (problema) return tokFail(problema);
+      } catch (err) {
+        try { tokDiagPush("checkout", { msg: "no se pudo comparar el carrito (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
+      }
       // Esperar a que quede habilitado antes de clickear (el toggle es por
       // clase/atributo disabled mientras el store calcula envío).
       try {
