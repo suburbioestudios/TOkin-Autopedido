@@ -4325,7 +4325,11 @@
         const e0 = g.lineas[0] || {};
         let hay = 0;
         for (const c of g.rows) hay += qtyDe(c, e0);
-        if (hay !== g.sum) malos.push({ rows: g.rows, qty: hay, sum: g.sum, lineas: g.lineas });
+        // tolerancia pack
+        const packU2 = parseInt((String(e0.storeText || (g.rows[0] && g.rows[0].name) || "").match(/\(\s*(\d+)\s*(unidad|un|uds|ud)\b/i) || [])[1], 10);
+        let okDif = (hay === g.sum);
+        if (!okDif && packU2 > 1 && hay === 1 && g.sum === packU2) okDif = true;
+        if (!okDif) malos.push({ rows: g.rows, qty: hay, sum: g.sum, lineas: g.lineas });
       }
       return { matched: grupos.size, malos, sinFila };
     };
