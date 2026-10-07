@@ -461,17 +461,31 @@
 
   // Fijar qty en la card del CARRITO con la confirmación del valor que quedó.
   async function tokCartSetQty(cartInp, wantQty) {
-    // v2.0.78
+    // v2.0.98: el input del carrito del store debouncea 1000ms ANTES de mandar
+    // el updateCart al server, y un re-render (respuesta de un addItems/otra
+    // mutación en vuelo, refetch) resetea el input a su valor previo y CANCELA
+    // el updateCart pendiente. Leer a los ~700ms era leer el óptimismo del DOM
+    // (la extensión decía "4 verificado" y el server quedaba en 1). Ahora se
+    // espera el debounce completo + la respuesta del server y se reintenta.
     if (!cartInp) return null;
-    await tokTypeInto(cartInp, wantQty);
-    await toksleep(700);
-    let v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
-    if (isNaN(v) || v !== wantQty) {
-      tokSetValue(cartInp, String(wantQty));
-      await toksleep(700);
-      v = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+    if (wantQty === 0) {
+      await tokTypeInto(cartInp, 0);
+      await toksleep(1600);
+      return isNaN(parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10)) ? null
+        : parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
     }
-    return isNaN(v) ? null : v;
+    let last = null;
+    for (let intento = 0; intento < 3; intento++) {
+      await tokTypeInto(cartInp, wantQty);
+      await toksleep(1600);
+      last = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+      if (isNaN(last) || last !== wantQty) {
+        await toksleep(500);
+        last = parseInt(String(cartInp.value || "").replace(/\D+/g, ""), 10);
+      }
+      if (last === wantQty) break;
+    }
+    return isNaN(last) ? null : last;
   }
 
   // v2.0.82: SACAR el producto del carrito dejando su cantidad en 0. Es la
@@ -922,10 +936,21 @@
       /(?:maximo|limite)[\s\w]{0,24}alcanzado/i,
       /\bcuota\b/i,
       /alcanz(?:ado|o)?\s+(?:el\s+)?(?:maximo|limite)/i,
+      // v2.0.98: textos REALES del store cuando no deja llegar a la cantidad
+      // pedida (toast del selector de cantidad y mensajes del updateCart). El
+      // texto exacto puede variar ("cantidad máxima alcanzada" y sinónimos),
+      // así que se cubre la familia en vez de una única frase.
+      /maxim[ao]s?\s+(?:de\s+\w+\s+)?alcanzad[ao]s?/i,
+      /alcanz(?:aste|o|aron|a|as)\s+(?:el\s+|la\s+|tu\s+|los\s+|las\s+)?(?:maxim|limite)/i,
+      /alcanzad[ao]s?\s+(?:el\s+|la\s+|tu\s+)?(?:maxim|limite)/i,
+      /compra\s+limitad[ao]s?/i,
+      /limitad[ao]s?\s+a\s+\d+\s+(?:unidad|un|uds|unidades)/i,
+      /sin\s+suficiente\s+stock/i,
+      /unidades?\s*(?:maxim|tope)/i,
     ];
     if (!patterns.some((r) => r.test(t2))) return null;
     const m =
-      t2.match(/(?:maximo|max|pedido|limite|cantidad|cuota)[^\d]{0,40}(\d{1,4})/i) ||
+      t2.match(/(?:maximo|max|pedido|limite|limitad[ao]s?|maxim[ao]s?|cantidad|cuota)[^\d]{0,40}(\d{1,4})/i) ||
       t2.match(/(\d{1,4})[^\d]{0,12}(?:maximo|pedido|limite|cuota)/i);
     return { max: m ? parseInt(m[1], 10) : 0, text: t.slice(0, 180) };
   }
@@ -1729,9 +1754,15 @@
     if (!clean) return out;
     push(clean);
     push(wordsOnly(clean) + " " + (tokGrams(item.producto).length ? tokGrams(item.producto)[0] + "g" : ""));
-    push(wordsOnly(clean).split(" ").slice(0, 3).join(" "));
-    push(wordsOnly(clean).split(" ").slice(0, 2).join(" "));
-    push(wordsOnly(clean).split(" ")[0] || "");
+    // v2.0.98: evitar términos genéricos aislados (ej. solo marca como "arcor" o "butter");
+    // exigir coincidencia de marca + producto + gramaje.
+    const g = tokGrams(item.producto).length ? tokGrams(item.producto)[0] + "g" : "";
+    const words = wordsOnly(clean).split(" ").filter(Boolean);
+    if (g && words.length >= 2) {
+      push(words.slice(0, 3).join(" ") + " " + g);
+    } else if (words.length >= 2) {
+      push(words.slice(0, 3).join(" "));
+    }
     return out;
   }
 
@@ -2700,7 +2731,10 @@
             let capInfo = null;
             try { capInfo = tokLimitInfo(tokCapScan(cartText, out.storeName)); } catch (e) {}
             if (capInfo) {
-              try { tokCartSetQty(cartInp, 0); await toksleep(400); } catch (e) {}
+              try { 
+                await tokCartSetQty(cartInp, 0); 
+                await toksleep(800); 
+              } catch (e) {}
             }
             try {
               const closeBtn = document.querySelector("[data-id=minicart-close-drawer-button]");
@@ -2862,12 +2896,16 @@
               ? "agregado: " + qty + " " + wantUnit + " (" + convertedQty + " " + usedUnit + ")"
               : "agregado: " + qty + " " + wantUnit;
         } else {
-          const took = second > 0 ? second : actualQty;
-          const code0 = tokArcCode(cardText);
-          await tokDropFromCart(code0, nums);
-          out.ok = false;
-          out.added = 0;
-          out.usedUnit = usedUnit;
+            const took = second > 0 ? second : actualQty;
+            const code0 = tokArcCode(cardText);
+            // v2.0.98: borrado agresivo y verificado. Nada parcial queda en el carro.
+            try {
+              await tokDropFromCart(code0, nums);
+              await toksleep(800);
+            } catch (e) {}
+            out.ok = false;
+            out.added = 0;
+            out.usedUnit = usedUnit;
           const conv = convertedQty > 0 ? convertedQty / qty : 0;
           // v2.0.88: este cálculo dividía SIEMPRE por conv, incluso cuando la
           // unidad en que el store tomó la cantidad es la MISMA que la pedida. En
@@ -3550,6 +3588,16 @@
           });
           if (sameOrder && prev.grupos) merged.grupos = prev.grupos;
           if (sameOrder && prev.lotChecks) merged.lotChecks = prev.lotChecks;
+          // v2.0.98: asegurar que los grupos se propaguen incluso si no es sameOrder
+          // o cuando se cierra el bloque y cambia el reporte (no debe perderse la
+          // información de confirmación de checkout entre bloques).
+          try {
+            const gCur = (state && state.grupos) || (job && job.grupos);
+            if (gCur) {
+              merged.grupos = Object.assign({}, merged.grupos || {}, gCur);
+            }
+            if (prev && prev.grupos && !merged.grupos) merged.grupos = prev.grupos;
+          } catch (e4) {}
           chrome.storage.local.set({ tokinCartReport: merged }, () => { void chrome.runtime.lastError; });
         } catch (e2) {
           try { chrome.storage.local.set({ tokinCartReport: report }, () => { void chrome.runtime.lastError; }); } catch (e3) {}
@@ -4131,12 +4179,17 @@
     return tokUnitTok(m ? m[1] : "");
   }
 
-    // v2.0.94: CANTIDAD QUE MUESTRA UNA FILA DEL CARRITO. En el drawer del store
-    // la cantidad vive en un input[type=number]; en la ventana de «Revisar
-    // pedido» (/checkout/cart) NO hay input y la cantidad va en el texto de la
-    // fila ("x 24 Unidad(s)"). Con `unitPref` se busca primero "x N <esa unidad>"
-    // porque una fila puede traer dos números (x 2 Bultos · 48 Uds) y el que
-    // importa es el de la unidad que se cargó.
+// v2.0.94: CANTIDAD QUE MUESTRA UNA FILA DEL CARRITO. En el drawer del store
+  // la cantidad vive en un input[type=number]; en la ventana de «Revisar
+  // pedido» (/checkout/cart) NO hay input y la cantidad va en el texto de la
+  // fila ("x 24 Unidad(s)"). Con `unitPref` se busca primero "x N <esa unidad>"
+  // porque una fila puede traer dos números (x 2 Bultos · 48 Uds) y el que
+  // importa es el de la unidad que se cargó.
+  // v2.0.98 (revisión en el SDK del store): el comentario de v2.0.94 estaba
+  // MAL para /checkout/cart: esa página renderiza la MISMA card del drawer y
+  // su selector de cantidad SÍ trae input[type=number] (sólo los ítems de
+  // regalo quedan como texto plano). El fallback por texto de abajo sigue
+  // siendo útil para filas sin input y por eso se mantiene.
     // v2.0.97: cuando la fila viene como "x 1 Bulto (20 Uds)" o con el factor
     // interno, no nos engañamos: si se cargaron 20 UNIDADES pero la UI muestra
     // el paquete como 1, hay que tener en cuenta el factor de conversión que usó
@@ -4226,6 +4279,195 @@
       push(row, isNaN(qIn) ? h.qty : qIn, !!inp);
     }
     return out;
+  }
+
+  // v2.0.98: CORRIGE el carrito ANTES de pasar al checkout (se corre en
+  // /store/checkout/cart, la única ventana que lista las filas con input).
+  // Reglas:
+  //   - una fila del lote con OTRA cantidad -> se ESCRIBE la cantidad pedida
+  //     (tokCartSetQty confirma contra el servidor) y la fila queda cargada.
+  //   - si el store NO deja llegar a la cantidad pedida (tope de stock /
+  //     "máximo alcanzado") -> nada parcial queda: el ítem SALE del carrito,
+  //     con el mismo criterio que la carga (falta de stock con evidencia, o
+  //     revisión manual si el store no dio mensaje).
+  //   - un producto del lote en OTRA unidad -> la cantidad es irrelevante, no
+  //     sirve; ese ítem sale del carrito (qty 0) y se reporta.
+  //   - una fila del carrito que NO es de ninguna línea del lote -> extra, se
+  //     saca del carrito y se reporta.
+  // No bloquea el checkout: si un arreglo no se puede aplicar se anota y se
+  // sigue; los avisos quedan en st._avisosCheckout (reporte final).
+  async function tokCorregirCarrito(st) {
+    const expect = Array.isArray(st && st.expect) ? st.expect : [];
+    const res = { avisos: [], corregidas: [], quitas: 0, quitasFallidas: 0, sinFila: 0 };
+    if (!expect.length) return res;
+    // Sin cards no hay nada que corregir ni que reportar (p.ej. la página no
+    // terminó de renderizar): no inventar avisos "sin fila" por cada línea.
+    if (!document.querySelector("article[data-id=cart-product-card]")) {
+      try { tokDiagPush("checkout", { msg: "tokCorregirCarrito: sin cards en la página, no se corrige nada" }); } catch (e) {}
+      return res;
+    }
+    const enLote = new Map(); // code -> { producto, nro, units:Set }
+    for (const exp of expect) {
+      const code = tokArcCode(String(exp.storeText || ""));
+      if (!code) continue;
+      if (!enLote.has(code)) {
+        enLote.set(code, { producto: exp.producto, nro: exp.nro, units: new Set() });
+      }
+      const u = tokUnitTok(exp.unit);
+      // Unit vacía = no se pudo canonicalizar: NO juzgar la unidad ajena con
+      // eso (se colaría "" y quitaría filas legítimas).
+      if (u) enLote.get(code).units.add(u);
+    }
+    // Códigos ya fuera del carrito en la pasada 1: no se vuelven a reportar.
+    const quitados = new Set();
+    const codeDe = (el) => tokArcCode(
+      (el.querySelector("[data-id^=unit-size-ARC-]") || { getAttribute: () => "" }).getAttribute("data-id") || ""
+    );
+    const mismoCodigo = (a, b) => !!a && !!b && (a === b || a.endsWith(b) || b.endsWith(a));
+    // Pasada 1a: quién sale (sólo escanear, sin tocar el DOM todavía).
+    const paraQuitar = [];
+    for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+      const sc = codeDe(el);
+      if (!sc) continue;
+      const lot = enLote.get(sc);
+      if (!lot) {
+        paraQuitar.push({
+          sc, inp: el.querySelector("input[type=number]"),
+          label: "«" + String(el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 42) + "», que no es del pedido"
+        });
+        continue;
+      }
+      // Producto del lote pero en OTRA unidad: la cantidad no sirve, sale.
+      const rowUnit = tokRowUnitTok(el.innerText || "");
+      if (lot.units.size && rowUnit && !lot.units.has(rowUnit)) {
+        paraQuitar.push({
+          sc, inp: el.querySelector("input[type=number]"),
+          label: (lot.nro != null ? "#" + lot.nro + " " : "") + String(lot.producto || "").slice(0, 42) +
+            ": estaba como " + rowUnit + " y el pedido pide " + Array.from(lot.units).join("/") + " — la cantidad no sirve"
+        });
+      }
+    }
+    // Pasada 1b: quitar de a uno, releyendo el DOM en cada paso (un re-render
+    // posterior deja colgados los nodos del scan anterior) con la herramienta
+    // ya probada de v2.0.82 (teclea 0, reintenta y, si hace falta, el botón de
+    // quitar de la card), y VERIFICANDO que realmente salió.
+    for (const q of paraQuitar) {
+      let inp = q.inp, rowEl = null;
+      for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+        const sc = codeDe(el);
+        if (mismoCodigo(sc, q.sc)) { rowEl = el; inp = el.querySelector("input[type=number]") || inp; break; }
+      }
+      if (rowEl) {
+        try { await tokDropFromCart(q.sc, inp ? [inp] : []); } catch (e) {}
+      }
+      let sigue = false;
+      for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+        const sc = codeDe(el);
+        if (!mismoCodigo(sc, q.sc)) continue;
+        const i = el.querySelector("input[type=number]");
+        const v = i ? parseInt(String(i.value || "").replace(/\D+/g, ""), 10) : NaN;
+        if (!isNaN(v) && v > 0) sigue = true;
+        else if (!i && tokQtyFromText(el.innerText || "")) sigue = true;
+      }
+      quitados.add(q.sc);
+      if (sigue) {
+        res.quitasFallidas++;
+        res.avisos.push(q.label + " — NO se pudo quitar del carrito, revisarlo a mano");
+      } else {
+        res.quitas++;
+        res.avisos.push(q.label + (rowEl ? " — se quitó del carrito" : " — no está más en el carrito"));
+      }
+    }
+    // Pasada 2: cantidades de cada línea del lote.
+    for (const exp of expect) {
+      const code = tokArcCode(String(exp.storeText || ""));
+      const want = Number(exp.want) || 0;
+      if (!code || want <= 0) continue;
+      const u = tokUnitTok(exp.unit);
+      let inp = null, rowEl = null, filaSinInput = false;
+      for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+        const sc = codeDe(el);
+        if (!mismoCodigo(sc, code)) continue;
+        const i = el.querySelector("input[type=number]");
+        if (!i) { filaSinInput = true; continue; }
+        if (rowEl) {
+          const pref = tokRowUnitTok(el.innerText || "");
+          const act = tokRowUnitTok(rowEl.innerText || "");
+          // Cambiar sólo si la NUEVA fila es la de la unidad pedida y la
+          // actual no (si no, quedarse con la primera).
+          if (u && pref === u && act !== u) { inp = i; rowEl = el; }
+        } else { inp = i; rowEl = el; }
+      }
+      if (!inp) {
+        let fuera = false;
+        for (const c of quitados) if (mismoCodigo(c, code)) fuera = true;
+        if (fuera) continue; // ya lo sacamos por unidad ajena
+        if (filaSinInput) {
+          // La fila existe pero sin input escribible (ítem de regalo u otra
+          // variante): no se puede fijar la cantidad acá; queda para revisar.
+          res.sinFila++;
+          res.avisos.push((exp.nro != null ? "#" + exp.nro + " " : "") + String(exp.producto || exp.storeText || "").slice(0, 42) +
+            ": está en el carrito pero su fila no tiene campo de cantidad — verificar " + want + " " + String(exp.unit || "").trim() + " a mano");
+          continue;
+        }
+        res.sinFila++;
+        res.avisos.push((exp.nro != null ? "#" + exp.nro + " " : "") + String(exp.producto || exp.storeText || "").slice(0, 42) +
+          ": no aparece en el carrito para verificar " + want + " " + String(exp.unit || "").trim() + " — revisarla a mano");
+        continue;
+      }
+      const ru = tokRowUnitTok((rowEl && rowEl.innerText) || "");
+      if (u && ru && ru !== u) continue; // luego de la pasada 1 ya no debería existir
+      const valor = parseInt(String(inp.value || "").replace(/\D+/g, ""), 10);
+      if (isNaN(valor) || valor !== want) {
+        const label = (exp.nro != null ? "#" + exp.nro + " " : "") + String(exp.producto || exp.storeText || "").slice(0, 42);
+        const unidad = String(exp.unit || "").trim();
+        try { await tokCartSetQty(inp, want); } catch (e) {}
+        // v2.0.98: re-leer fila VIVA
+        let vivInp = inp, vivRow = rowEl;
+        for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+          if (!mismoCodigo(codeDe(el), code)) continue;
+          vivRow = el; vivInp = el.querySelector("input[type=number]") || vivInp;
+        }
+        const v2 = vivInp ? parseInt(String(vivInp.value || "").replace(/\D+/g, ""), 10) : NaN;
+        if (v2 === want) {
+          res.corregidas.push(label + " → " + want + " " + unidad);
+        } else {
+          // v2.0.98 (criterio v2.0.67): si no llega a la cantidad pedida, NADA parcial queda — sale del carrito.
+          try {
+            const code0 = code;
+            if (vivInp) tokSetValue(vivInp, "0");
+            await toksleep(600);
+            for (const cartEl of document.querySelectorAll("article[data-id=cart-product-card]")) {
+              const sc = codeDe(cartEl);
+              if (sc && mismoCodigo(sc, code0)) {
+                const i = cartEl.querySelector("input[type=number]");
+                if (i) tokSetValue(i, "0");
+              }
+            }
+            await toksleep(500);
+          } catch (e) {}
+          quitados.add(code);
+          let sigue = false;
+          for (const el of document.querySelectorAll("article[data-id=cart-product-card]")) {
+            if (!mismoCodigo(codeDe(el), code)) continue;
+            const i = el.querySelector("input[type=number]");
+            const vq = i ? parseInt(String(i.value || "").replace(/\D+/g, ""), 10) : NaN;
+            if (!isNaN(vq) && vq > 0) sigue = true;
+            else if (!i && tokQtyFromText(el.innerText || "")) sigue = true;
+          }
+          if (sigue) {
+            res.quitasFallidas++;
+            res.avisos.push(label + ": el store no deja llegar a " + want + " " + unidad + (isNaN(v2) ? "" : " (quedó en " + v2 + ")") + " y NO se pudo sacar del carrito — revisarlo a mano");
+          } else {
+            res.quitas++;
+            res.avisos.push(label + ": sin stock: faltante para completar el pedido (máximo de unidades alcanzado) — se sacó del carrito");
+          }
+        }
+      }
+    }
+    if (res.corregidas.length) tokDiagPush("checkout", { msg: "cantidades corregidas en el carrito antes del checkout: " + res.corregidas.length + " (" + res.corregidas.join(" · ") + ")" });
+    if (res.quitas || res.quitasFallidas) tokDiagPush("checkout", { msg: "ítems fuera del carrito antes del checkout: " + res.quitas + " quitados" + (res.quitasFallidas ? ", " + res.quitasFallidas + " NO se pudieron quitar" : "") });
+    return res;
   }
 
   // v2.0.94: VERIFICA QUE EL CARRITO SIGA IGUAL QUE EL PEDIDO antes de tocar
@@ -4485,22 +4727,49 @@ if (st.step === "siguiente") {
       // y envío), así que la comparación del paso final no tenía nada que
       // leer y terminaba siempre en "se sigue sin verificar". Esta página sí
       // muestra cada fila con su cantidad (input[data-id=quantity-selector-input]).
-      // Es SOLO lectura: no tipea, no clickea, no navega; el paso sigue igual.
-      // La comparación y la decisión igual se toman SOLO antes de «Realizar
-      // pedido».
+      // v2.0.98: además de la foto, acá se CORRIGE el carrito ANTES de avanzar.
+      // Es la última ventana que lista las filas con input, así que el arreglo
+      // va antes de tocar «Siguiente»: si una fila del lote quedó con otra
+      // cantidad se escribe la correcta; si un producto está en otra unidad (la
+      // cantidad no sirve) o hay algo que no es del lote, ese ítem sale del
+      // carrito y se reporta. Después sí se confirma.
       try {
-        if (!st.snapshot || !st.snapshot.length) {
-          const foto = tokCartReadCheckout();
-          if (foto.length) {
-            st.snapshot = foto;
-            await tokStoreSet(CHECKOUT_KEY, st);
-            tokDiagPush("checkout", { msg: "foto de cantidades tomada en la página del carrito: " + foto.length + " filas" });
-          }
+        const rep = await tokCorregirCarrito(st);
+        if (rep.avisos && rep.avisos.length) {
+          st._avisosCheckout = (st._avisosCheckout || []).concat(rep.avisos);
+          await tokStoreSet(CHECKOUT_KEY, st);
         }
+      } catch (err) {
+        try { tokDiagPush("checkout", { msg: "corrección previa al checkout con error (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
+      }
+      try {
+        const foto = tokCartReadCheckout();
+        if (foto.length) {
+          st.snapshot = foto;
+          await tokStoreSet(CHECKOUT_KEY, st);
+          tokDiagPush("checkout", { msg: "foto de cantidades (post-corrección): " + foto.length + " filas" });
+        }
+      } catch (e) {}
+      // v2.0.98: la corrección puede haber re-renderizado la página y dejar `el`
+      // colgado (nodo viejo = click en el vacío). Re-buscar «Siguiente» recién
+      // antes del click, y esperar a que esté habilitado: el store lo deja
+      // disabled mientras recalcula totales después de un cambio de cantidad.
+      let elFinal = el;
+      try {
+        elFinal = await waitForTokin(() => {
+          const direct = document.querySelector('button[data-id="next-step-button"]:not([disabled]):not([aria-disabled="true"])')
+            || document.querySelector('[data-id="next-step-button"]');
+          if (direct) return direct;
+          return tokFindBtnByText(/siguiente|continuar/i)
+            || document.querySelector("[data-id*=next], [data-id*=siguiente], [class*=next-step], a[href*=\"/checkout/payment\"]");
+        }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250) || el;
+      } catch (e) {}
+      try {
+        await waitForTokin(() => !elFinal.disabled && elFinal.getAttribute("aria-disabled") !== "true", 15000, 300);
       } catch (e) {}
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      await tokRealClick(el);
+      await tokRealClick(elFinal);
       st = await tokWaitCheckUrl("realizar", st, /\/checkout\/payment/);
       if (!st) return false;
     }
@@ -4549,6 +4818,20 @@ if (st.step === "siguiente") {
       // verdad. Señales válidas, la más fuerte según la tienda: el carrito
       // queda VACÍO ("el carro se vacía solo al enviar el pedido"). Si vuelve
       // antes, el siguiente lote se apila sobre el carro del lote anterior.
+      try {
+        if (st && st.jobId) {
+          const jg = state && state.grupos;
+          if (jg && jg[st.jobId]) {
+            jg[st.jobId].checkoutConfirmed = true;
+            jg[st.jobId].confirmado = true;
+            jg[st.jobId].checkoutAt = Date.now();
+          }
+          if (job && job.grupos && job.grupos[st.jobId]) {
+            job.grupos[st.jobId].checkoutConfirmed = true;
+            job.grupos[st.jobId].confirmado = true;
+          }
+        }
+      } catch (e) {}
       let okDone = false;
       const deadline = Date.now() + 60000;
       while (Date.now() < deadline) {
@@ -4571,6 +4854,20 @@ if (st.step === "siguiente") {
         return tokFail("el pedido no se confirmó (el carrito sigue cargado): revisar el checkout del store");
       }
       // Esperar que la pantalla de éxito renderice y volver al store.
+      try {
+        if (st && st.jobId) {
+          const jg = state && state.grupos;
+          if (jg && jg[st.jobId]) {
+            jg[st.jobId].checkoutConfirmed = true;
+            jg[st.jobId].confirmado = true;
+            jg[st.jobId].checkoutAt = Date.now();
+          }
+          if (job && job.grupos && job.grupos[st.jobId]) {
+            job.grupos[st.jobId].checkoutConfirmed = true;
+            job.grupos[st.jobId].confirmado = true;
+          }
+        }
+      } catch (e) {}
       await toksleep(1500);
       st.step = "volver";
       await tokStoreSet(CHECKOUT_KEY, st);
@@ -4656,7 +4953,14 @@ if (st.step === "siguiente") {
       // el estado del checkout porque cada click navega y destruye este script:
       // al cargar la página siguiente se reanuda con la lista a verificar.
       tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now(), expect: Array.isArray(expect) ? expect : [] })
-        .then(() => tokCheckoutStep());
+        .then((stx) => {
+          try {
+            if (stx && stx.jobId && state && state.grupos && state.grupos[stx.jobId]) {
+              state.grupos[stx.jobId].checkoutConfirmed = false;
+            }
+          } catch (e) {}
+          tokCheckoutStep();
+        });
     });
   }
 

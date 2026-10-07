@@ -81,6 +81,9 @@ function persist() {}
 function emitState() {}
 function continueAfterCheckout(lote, note, degraded) { contCalls.push({ lote, degraded }); }
 function sendSw(msg) { checkoutSends.push(msg); return Promise.resolve({ ok: true }); }
+// El applyCartDone real llama a armCheckoutTimer (definido arriba en
+// offscreen.js); al extraer sólo esa función hay que stubearla acá.
+function armCheckoutTimer() {}
 
 const applyCartDone = eval("(" + extractFunction(offSrc, "applyCartDone") + ")");
 

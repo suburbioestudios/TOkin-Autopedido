@@ -858,26 +858,58 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     try {
       res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
     } catch (e) {
-      return false;
+      res = {};
     }
     const job = res[JOB_KEY];
-    // v2.0.92: phase="done" NO significa "tarea terminada": el content lo marca
-    // al cerrar el bloque y recién libera el job después de mandar el CART_DONE.
-    // Si el popup se abre en esa ventana (o la pestaña quedó congelada), hay que
-    // tratarla como tarea en curso y no caer al cartel de F5.
-    if (!job || !job.phase) return false;
-    setBadge("ok", "Tarea en curso", "");
-    $("#access-screen").classList.add("hidden");
-    $("#main-screen").classList.remove("hidden");
-    $("#cfg-session").textContent = "Tarea en curso: " + (job.docName || "pedido en el store");
-    // v2.0.87: el job vivo es una RUPTURA real del proceso (se perdio al
-    // cerrar el popup, caerse la señal o un reload del store). Si se puede
-    // recuperar, se avisa; si no, se deja el estado de error que ya diga
-    // syncFromJob. La reanudacion silenciosa por senal (solo recargar la
-    // extension) no pasa por aca y por eso no dispara cartel.
-    const ok = await syncFromJob();
-    if (ok) setStatus("Restaurando Información activa.", "ok");
-    return true;
+    // v2.0.98: intentar recuperar desde reporte persistido SIEMPRE que haya datos,
+    // aunque no haya job vivo. Esto evita el cartel "Presioná F5..." al terminar
+    // un bloque (job pasa a done/liberado) y el popup se vuelve a abrir.
+    let hadSaved = false;
+    try {
+      const saved = await new Promise((r) => chrome.storage.local.get("tokinCartReport", (x) => r(x && x.tokinCartReport)));
+      if (saved && (Array.isArray(saved.allResults) || Array.isArray(saved.results) || Array.isArray(saved.allLineItems))) {
+        hadSaved = true;
+        // Aplicar backup silencioso antes de decidir.
+        ui.cart = ui.cart || {};
+        const savedFull = Array.isArray(saved.allResults) && saved.allResults.length ? saved.allResults : (saved.results || []);
+        ui.cart.results = savedFull;
+        if (saved.docName) ui.cart.docName = saved.docName;
+        if (saved.prodAdded != null) ui.cart.prodAdded = saved.prodAdded;
+        if (saved.totalProducts != null) ui.cart.totalProducts = saved.totalProducts;
+        const savedItems = Array.isArray(saved.allLineItems) ? saved.allLineItems : [];
+        if (savedItems.length) ui.cart.allLineItems = savedItems;
+        if (saved.lotChecks) {
+          ui.sessionState = ui.sessionState || { lotChecks: {} };
+          ui.sessionState.lotChecks = Object.assign({}, saved.lotChecks, ui.sessionState.lotChecks || {});
+        }
+        if (saved.grupos) {
+          ui.sessionState = ui.sessionState || {};
+          ui.sessionState.grupos = Object.assign({}, saved.grupos, ui.sessionState.grupos || {});
+        }
+        if (saved.carrito && !ui.cart.carrito) ui.cart.carrito = saved.carrito;
+      }
+    } catch (e) {}
+    // v2.0.92: phase="done" NO significa "tarea terminada": tratar como en curso
+    // para no pedir F5. Si no hay job pero SÍ hay backup, también restaurar
+    // silenciosamente para evitar el cartel al finalizar bloques.
+    if (job && job.phase) {
+      setBadge("ok", "Tarea en curso", "");
+      $("#access-screen").classList.add("hidden");
+      $("#main-screen").classList.remove("hidden");
+      $("#cfg-session").textContent = "Tarea en curso: " + (job.docName || "pedido en el store");
+      const ok = await syncFromJob();
+      if (ok) setStatus("Restaurando Información activa.", "ok");
+      return true;
+    }
+    if (hadSaved) {
+      $("#access-screen").classList.add("hidden");
+      $("#main-screen").classList.remove("hidden");
+      $("#cfg-session").textContent = "Tarea recuperada desde el último reporte";
+      await syncFromJob();
+      setStatus("Restaurando Información activa.", "ok");
+      return true;
+    }
+    return false;
   }
 
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -1356,7 +1388,7 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     const estadoCompra = (g) => {
       const gr = gruposXls[g];
       if (!gr && !checksXls[g]) return "— estado de compra desconocido";
-      const conf = gr ? !!gr.confirmado : !!checksXls[g];
+      const conf = (gr && (gr.confirmado === true || gr.checkoutConfirmed === true)) || !!checksXls[g];
       return conf ? "PEDIDO REALIZADO" : "CARGADO EN CARRITO (SIN CONFIRMAR)";
     };
     // v2.0.84: la foto del carrito por bloque era una hoja propia y con el Excel
