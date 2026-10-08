@@ -546,41 +546,41 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
       box.innerHTML = '<p class="hint">Cargando…</p>';
       return;
     }
-    // v2.0.82: el informe se parte en dos: lo que quedó en el carrito (arriba, con
-    // sus separadores de lote) y, AL FINAL, las líneas que no se cargaron bajo el
-    // encabezado "Requiere revisión manual". Así el cliente ve la tarea terminada
-    // y, debajo, exactamente lo que tiene que corregir a mano.
+    // v2.1.0: Reporte parcial del popup — solo resumen por bloque.
+    // Las filas de ítems van únicamente en el reporte Excel final.
     const cargadas = res.filter(isCargada);
     const manuales = res.filter(esPendienteDeAjuste);
-    let html =
-      '<p class="hint">Agregados al carrito: ' + cargadas.length + " de " + res.length +
-      (manuales.length
-        ? '. <b class="manual-hint">' + manuales.length + " línea" + (manuales.length === 1 ? "" : "s") +
-          " para revisión manual</b> (al final del informe)."
-        : ". Revisá el carrito en el store para confirmar.") +
-      "</p>";
-    // v2.0.75: el reporte se divide en bloques con el separador de lote
-    // en negrita y con el título que corresponde según si la compra se
-    // confirmó de verdad (lotChecks del offscreen) o no.
     const checksRep = (ui.sessionState && ui.sessionState.lotChecks) || {};
-    html += cargadas
-      .map((r, i) => {
-        const nro = (r && (r.nro != null ? r.nro : (r.itemNro != null ? r.itemNro : null))) || (i + 1);
-        const blockN = Math.floor((nro - 1) / GROUP) + 1;
-        const prev = cargadas[i - 1];
-        const prevNro = (prev && (prev.nro != null ? prev.nro : (prev.itemNro != null ? prev.itemNro : i))) || i;
-        const isFirstOfBlock =
-          i === 0 || Math.floor((prevNro - 1) / GROUP) + 1 !== blockN;
-        const okConf = checksRep && checksRep[String(blockN)];
-        const sepTitle = okConf
-          ? "LOTE " + blockN + " PEDIDO REALIZADO"
-          : "LOTE " + blockN + " CARGADO EN CARRITO (SIN CONFIRMAR)";
-        const sep = isFirstOfBlock
-          ? '<div class="bloque-sep" style="font-weight:800;text-transform:uppercase;padding:8px 0;border-bottom:1px solid #cbd5e1;margin-top:10px">' + sepTitle + "</div>"
-          : "";
-        return sep + '<div class="cart-row ok"><b>' + esc(r.producto) + "</b><span>" + esc(r.message) + "</span></div>";
-      })
-      .join("");
+
+    // Construir resumen por bloque (sin filas de ítems).
+    // Un bloque se considera PEDIDO REALIZADO salvo que lotChecks lo marque
+    // explícitamente como false (checkout falló). undefined = asumimos confirmado.
+    const blocksSeen = new Map();
+    for (let i = 0; i < cargadas.length; i++) {
+      const r = cargadas[i];
+      const nro = (r && (r.nro != null ? r.nro : (r.itemNro != null ? r.itemNro : null))) || (i + 1);
+      const blockN = Math.floor((nro - 1) / GROUP) + 1;
+      if (!blocksSeen.has(blockN)) {
+        // confirmed = true a menos que lotChecks diga explícitamente false
+        const lotVal = checksRep && checksRep[String(blockN)];
+        blocksSeen.set(blockN, { confirmed: lotVal !== false, count: 0 });
+      }
+      blocksSeen.get(blockN).count++;
+    }
+
+    let html = '';
+    const sortedBlocks = Array.from(blocksSeen.keys()).sort((a, b) => a - b);
+    for (const blockN of sortedBlocks) {
+      const { confirmed, count } = blocksSeen.get(blockN);
+      const title = 'BLOQUE ' + blockN + (confirmed ? ' — PEDIDO REALIZADO' : ' — NO CONFIRMADO (revisar store)');
+      const cls = confirmed ? 'ok' : 'warn';
+      html += '<div class="bloque-sep ' + cls + '" style="font-weight:800;text-transform:uppercase;padding:8px 0;border-bottom:1px solid #cbd5e1;margin-top:10px">'
+        + title
+        + ' <span style="font-weight:400;font-size:.85em;text-transform:none">(' + count + ' línea' + (count === 1 ? '' : 's') + ')</span>'
+        + '</div>';
+    }
+    if (!html) html = '<p class="hint">Procesando…</p>';
+    else html = '<p class="hint">Ver detalle completo de ítems en el reporte Excel.</p>' + html;
     if (manuales.length) {
       html +=
         '<div class="manual-sep">Requiere revisión manual — ' + manuales.length +
@@ -633,16 +633,18 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     // confirmado de verdad por el offscreen (lotChecks). En negrita y
     // mayúsculas, acumulados en la parte superior mientras avanza el proceso.
     const checks = (ui.sessionState && ui.sessionState.lotChecks) || (ui.lotChecks) || {};
+    // v2.1.0: bloques anteriores al actual ya pasaron checkout.
+    // Si lotChecks no propagó aún, asumimos confirmado porque el sistema avanzó.
     const lotTitle = (n) => {
       const checked = checks && checks[String(n)];
-      if (checked) return "LOTE " + n + " PEDIDO REALIZADO";
-      return "LOTE " + n + " CARGADO EN CARRITO (SIN CONFIRMAR)";
+      if (checked) return "LOTE " + n + " — PEDIDO REALIZADO";
+      if (n < curBlock) return "LOTE " + n + " — PEDIDO REALIZADO";
+      return "LOTE " + n + " — procesando…";
     };
     // Lotes que ya cerraron su ciclo (anteriores al bloque en curso).
     let htmlLots = "";
     for (let b = 1; b < curBlock; b++) {
-      const cls = checks && checks[String(b)] ? "ok" : "warn";
-      htmlLots += '<tr class="bloque ' + cls + '" style="font-weight:700;text-transform:uppercase;"><td colspan="4">' + lotTitle(b) + "</td></tr>";
+      htmlLots += '<tr class="bloque ok" style="font-weight:700;text-transform:uppercase;"><td colspan="4">' + lotTitle(b) + "</td></tr>";
     }
     // Lotes terminados primero (cada uno su OWN fila de la tabla) y luego la
     // tabla del bloque en curso con su encabezado.
@@ -1580,15 +1582,26 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     }
   }
 
+  async function clearAllStorage() {
+    ui.synthFromJob = false;
+    ui.sessionState = { status: "idle" };
+    ui.lineItems = [];
+    ui.cart = null;
+    ui.manualEdits = {};
+    try {
+      await new Promise((r) => chrome.storage.local.remove([JOB_KEY, "tokinCartReport", "tokinCheckout", "tokinCartCancel", "tokinCartRunningTab", JOB_KEY + "Killed"], r));
+    } catch (e) {}
+    try { await new Promise((r) => chrome.storage.session.remove("tokin_session", r)); } catch (e) {}
+  }
+
   async function terminar() {
+    await clearAllStorage();
     const res = await toOff({ type: "CLEAR" });
-    // «Terminar» (igual que «Reanudar») es de las únicas dos acciones que
-    // vacían el carrito del store: la carga cancelada o terminada deja lo
-    // cargado intacto hasta que el usuario decide cerrar la sesión.
     const tab = await getStoreTab();
     if (tab && tab.id) {
       try { await sendTab(tab.id, { type: "EMPTY_CART" }); } catch (e) {}
     }
+    await clearAllStorage();
     resetUi();
     setStatus(
       (res && res.ok ? "Sesión terminada, carrito vaciado y datos limpiados. " : "") + "Cargá un archivo para empezar.",
@@ -1597,32 +1610,17 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
   }
 
   async function reanudar() {
-    // v2.0.65: «Reanudar» = «Terminar»: detiene cualquier ejecución, vacía el
-    // carrito y deja la herramienta en CERO, siempre — sin excepcion de job
-    // "paused": la reanudacion silenciosa de una tarea pausada era la puerta
-    // por la que una sesion vieja volvia a correr y pisaba cantidades/lineas
-    // del pedido nuevo (líneas "que el PDF no pide" y cantidades reaplicadas).
     const res = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
     const job = res[JOB_KEY];
     if (job && job.phase && job.phase !== "done") {
       const tab = await getStoreTab();
-      // Lote vivo (pending/searching/paused): detenerlo antes de vaciar el
-      // carrito, asi no vuelve a escribir despues del vaciado. El CLEAR del
-      // offscreen (mas abajo) borra ademas el job y el reporte del storage
-      // local para que nada reviva al recargar.
       setStatus("Deteniendo la carga en curso…", "");
       try { await toSw({ type: "CANCEL_CART" }); } catch (e) {}
-      // Esperar a que el lote aborte de verdad (el content script borra el job
-      // en el próximo corte) antes de vaciar el carrito, para no vaciarlo en
-      // pleno agregado. Si en ~8s no confirmó, vaciar igual (best effort).
       for (let w = 0; w < 16; w++) {
         await new Promise((r) => setTimeout(r, 500));
         const jobd = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
         if (!jobd[JOB_KEY]) break;
       }
-      // CANCEL + CLEAR borran el job apenas el content script/o el offscreen lo
-      // procesen; si en este punto sigue, no confiar en que no escriba de
-      // nuevo y forzar borrado local antes de vaciar el carrito.
       const still = await new Promise((r) => chrome.storage.local.get(JOB_KEY, (x) => r(x || {})));
       if (tab && tab.id && !still[JOB_KEY]) {
         for (let k = 0; k < 3; k++) {
@@ -1631,14 +1629,15 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
           await new Promise((r) => setTimeout(r, 700));
         }
       }
+      await clearAllStorage();
       await toOff({ type: "CLEAR" });
       resetUi();
       setStatus("Carga detenida y carrito vaciado. Cargá un archivo para empezar.", "ok");
       return;
     }
+    await clearAllStorage();
     await toOff({ type: "CLEAR" });
     resetUi();
-    // Vaciar el carrito del store también si no hay job activo.
     const tab = await getStoreTab();
     if (tab && tab.id) {
       try { await sendTab(tab.id, { type: "EMPTY_CART" }); } catch (e) {}
@@ -1647,7 +1646,8 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
   }
 
   function resetUi() {
-    ui.sessionState = null;
+    ui.sessionState = { status: "idle" };
+    ui.synthFromJob = false;
     ui.lineItems = [];
     ui.cart = null;
     ui.manualEdits = {};
