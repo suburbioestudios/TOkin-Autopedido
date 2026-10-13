@@ -40,6 +40,11 @@ de la PC del usuario. Uso interno, solo para usuarios autorizados.
 - `/store/checkout/payment` **NO lista los productos** (solo "Resumen"). La única
   página con las filas + cantidad es `/store/checkout/cart` (o el drawer). Por
   eso la foto de cantidades se toma en una y se compara en la otra.
+- En `/store/checkout/payment` el botón `[data-id=place-order-button]` ("Realizar pedido")
+  puede tardar varios segundos en renderizar y habilitarse (la SPA valida métodos
+  de entrega y costos de envío). El content script espera activamente hasta 35s su renderizado
+  y hasta 35s a que se retire el estado `disabled`/`aria-disabled` antes de clickear. Asegura
+  además que la URL sea efectivamente `/checkout/payment` antes de evaluar el botón final.
 
 ## Regla de oro
 

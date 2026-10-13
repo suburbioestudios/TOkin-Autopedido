@@ -22,9 +22,11 @@ Funciona 100% en tu navegador: los datos de tu pedido nunca salen de tu PC.
 4. Esperá el aviso de finalización y confirmá en el carrito del store.
 
 La extensión busca cada producto, elige la unidad correcta
-(Unidad/Display/Bulto), fija la cantidad y agrega al carrito. Podés cancelar
-cuando quieras; al terminar o cancelar verás un resumen de lo procesado.
+(Unidad/Display/Bulto), fija la cantidad y agrega al carrito lote a lote (con
+verificación previa de cantidades en `/checkout/cart` y confirmación automática
+segura en `/checkout/payment`). Podés cancelar cuando quieras; al terminar o
+cancelar verás un resumen de los bloques realizados y las líneas manuales a revisar.
 
-> **Reanudar** vacía el carrito antes de seguir: si había una tarea pausada
-> (por ejemplo, por corte de internet), se relanza desde cero y re-carga todo
-> el pedido. Usalo cuando quieras empezar limpio.
+> **Reanudar** vacía el carrito y limpia los datos de almacenamiento local:
+> si había una tarea anterior o pausada, se reinicia limpia desde cero. Usalo
+> cuando quieras empezar un nuevo pedido sin arrastrar estados previos.

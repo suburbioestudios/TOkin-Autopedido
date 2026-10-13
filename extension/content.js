@@ -1,4 +1,4 @@
-// Tokin AutoPedido - content script
+﻿// Tokin AutoPedido - content script
 // Descubre campos del formulario, rellena valores (compatible con React/Next.js)
 // y expone una API de mensajes para el popup.
 
@@ -4775,16 +4775,27 @@ if (st.step === "siguiente") {
     }
 
     if (st.step === "realizar") {
+      // Si por alguna razón el navegador sigue en /checkout/cart o no llegó a payment,
+      // asegurar navegación antes de buscar el botón final.
+      if (!/\/checkout\/payment/.test(location.pathname)) {
+        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
+        await toksleep(1500);
+      }
+
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
       // "place-order-button" (botón React, disabled hasta que terminan los
-      // cálculos de envío/pago).
+      // cálculos de envío/pago y métodos de entrega).
+      // Damos hasta 35s para que renderice en el DOM.
       const el = await waitForTokin(() => {
-        const direct = document.querySelector('button[data-id="place-order-button"]:not([disabled]):not([aria-disabled="true"])')
-          || document.querySelector('[data-id="place-order-button"]');
+        const direct = document.querySelector('button[data-id="place-order-button"]')
+          || document.querySelector('[data-id="place-order-button"]')
+          || document.querySelector('button[data-id*="place-order"]')
+          || document.querySelector('[data-id*="place-order"]');
         if (direct) return direct;
-        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*pedido|place.?order/i);
-      }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
-      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment");
+        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)|place.?order/i);
+      }, 35000, 300);
+      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (url=" + location.pathname + ")");
+
       // v2.0.96: ÚNICA verificación de cantidades del pedido, y va acá: en la
       // confirmación. Antes de tocar «Realizar pedido» se lee lo que muestra el
       // carrito y se compara contra lo que el lote pidió. Es de SOLO LECTURA: no
@@ -4801,15 +4812,21 @@ if (st.step === "siguiente") {
       } catch (err) {
         try { tokDiagPush("checkout", { msg: "no se pudo comparar el carrito (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
       }
+
       // Esperar a que quede habilitado antes de clickear (el toggle es por
-      // clase/atributo disabled mientras el store calcula envío).
+      // clase/atributo disabled mientras el store calcula envío). Damos hasta 35s.
       try {
-        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true" && !/disabled-/.test(el.className || ""), 20000, 300);
+        await waitForTokin(() => {
+          const btn = document.querySelector('button[data-id="place-order-button"]') || el;
+          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true" && !/disabled-/.test(btn.className || "");
+        }, 35000, 300);
       } catch (e) {}
-      try { console.log("[Tokin] checkout realizar: click place-order-button disabled=" + !!el.disabled); } catch (e) {}
+
+      const elTarget = document.querySelector('button[data-id="place-order-button"]') || el;
+      try { console.log("[Tokin] checkout realizar: click place-order-button disabled=" + !!elTarget.disabled); } catch (e) {}
       st.step = "confirmar";
       await tokStoreSet(CHECKOUT_KEY, st);
-      await tokRealClick(el);
+      await tokRealClick(elTarget);
       await toksleep(1500);
     }
 
