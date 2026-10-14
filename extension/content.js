@@ -4080,7 +4080,7 @@
   // v2.0.71: también mira aria-label/title/data-id/class con el texto ("next",
   // "siguiente", "revisar pedido", "realizar pedido") porque la tienda usa
   // iconos o divs con clase y no siempre texto plano.
-  function tokFindBtnByText(re) {
+  function tokFindBtnByText(re, allowDisabled) {
     const cand = document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit], span, div, label");
     for (const el of cand) {
       if (el.children.length > 4) continue; // evita el <body> entero
@@ -4096,7 +4096,7 @@
       if (!r || r.width < 6 || r.height < 6) continue;
       const cs = getComputedStyle(target);
       if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) === 0) continue;
-      if (target.disabled || target.getAttribute("aria-disabled") === "true") continue;
+      if (!allowDisabled && (target.disabled || target.getAttribute("aria-disabled") === "true")) continue;
       return target;
     }
     return null;
@@ -4693,32 +4693,38 @@
       if (!st) return false;
     }
 
-if (st.step === "siguiente") {
+    if (st.step === "siguiente") {
+      // Si la navegación a /checkout/payment ya ocurrió (SPA rápido o re-render), avanzar directo a realizar
+      if (/\/checkout\/payment/.test(location.pathname)) {
+        st.step = "realizar";
+        await tokStoreSet(CHECKOUT_KEY, st);
+        return tokCheckoutStep();
+      }
+
       // Página /store/checkout/cart: botón «Siguiente». El selector EXACTO del
       // store es [data-id="next-step-button"] (botón React con texto
       // «Siguiente», clase disabled:* cuando aún no está habilitado). Se busca
       // primero por data-id y luego por texto/otros fallbacks.
       const el = await waitForTokin(() => {
+        if (/\/checkout\/payment/.test(location.pathname)) return "already_payment";
         const direct = document.querySelector('button[data-id="next-step-button"]:not([disabled]):not([aria-disabled="true"])')
           || document.querySelector('[data-id="next-step-button"]');
         if (direct) return direct;
         return tokFindBtnByText(/siguiente|continuar/i)
           || document.querySelector("[data-id*=next], [data-id*=siguiente], [class*=next-step], a[href*=\"/checkout/payment\"]");
-      }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250);
-      if (!el) {
-        try { console.log("[Tokin] checkout siguiente: botón no hallado, ir directo a payment"); } catch (e) {}
-        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
+      }, TOK_CHECKOUT_STEP_TIMEOUT + 6000, 250);
+      if (el === "already_payment" || /\/checkout\/payment/.test(location.pathname)) {
         st.step = "realizar";
         await tokStoreSet(CHECKOUT_KEY, st);
-        await toksleep(1000);
-        st = await tokStoreGet(CHECKOUT_KEY);
-        if (!st || !st.step) return false;
         return tokCheckoutStep();
+      }
+      if (!el) {
+        return tokFail("no se encontró «Siguiente» en /checkout/cart (url=" + location.pathname + ")");
       }
       // Si el botón está disabled, esperar a que se habilite (el checkout lo
       // activa al terminar de calcular envío/totales) antes de clickear.
       try {
-        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 15000, 300);
+        await waitForTokin(() => !el.disabled && el.getAttribute("aria-disabled") !== "true", 20000, 300);
       } catch (e) {}
       try { console.log("[Tokin] checkout siguiente: click en «" + String((el.innerText || el.getAttribute("data-id") || "")).slice(0, 40) + "» (" + el.tagName + ") disabled=" + !!el.disabled); } catch (e) {}
       // v2.0.96: FOTO de solo lectura de las cantidades, acá en la página del
@@ -4765,35 +4771,40 @@ if (st.step === "siguiente") {
         }, TOK_CHECKOUT_STEP_TIMEOUT + 4000, 250) || el;
       } catch (e) {}
       try {
-        await waitForTokin(() => !elFinal.disabled && elFinal.getAttribute("aria-disabled") !== "true", 15000, 300);
+        await waitForTokin(() => !elFinal.disabled && elFinal.getAttribute("aria-disabled") !== "true", 20000, 300);
       } catch (e) {}
       st.step = "realizar";
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(elFinal);
       st = await tokWaitCheckUrl("realizar", st, /\/checkout\/payment/);
       if (!st) return false;
+      return tokCheckoutStep();
     }
 
     if (st.step === "realizar") {
       // Si por alguna razón el navegador sigue en /checkout/cart o no llegó a payment,
-      // asegurar navegación antes de buscar el botón final.
+      // esperar hasta 25s a que el SPA termine la navegación antes de considerar error.
       if (!/\/checkout\/payment/.test(location.pathname)) {
-        try { location.href = location.origin + "/store/checkout/payment"; } catch (e) {}
-        await toksleep(1500);
+        const atPay = await waitForTokin(() => /\/checkout\/payment/.test(location.pathname), 25000, 300);
+        if (!atPay) {
+          st.step = "siguiente";
+          await tokStoreSet(CHECKOUT_KEY, st);
+          return tokCheckoutStep();
+        }
       }
 
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
       // "place-order-button" (botón React, disabled hasta que terminan los
       // cálculos de envío/pago y métodos de entrega).
-      // Damos hasta 35s para que renderice en el DOM.
+      // Damos hasta 45s para que renderice en el DOM.
       const el = await waitForTokin(() => {
         const direct = document.querySelector('button[data-id="place-order-button"]')
           || document.querySelector('[data-id="place-order-button"]')
           || document.querySelector('button[data-id*="place-order"]')
           || document.querySelector('[data-id*="place-order"]');
         if (direct) return direct;
-        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)|place.?order/i);
-      }, 35000, 300);
+        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)|place.?order/i, true);
+      }, 45000, 300);
       if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (url=" + location.pathname + ")");
 
       // v2.0.96: ÚNICA verificación de cantidades del pedido, y va acá: en la
@@ -4814,12 +4825,12 @@ if (st.step === "siguiente") {
       }
 
       // Esperar a que quede habilitado antes de clickear (el toggle es por
-      // clase/atributo disabled mientras el store calcula envío). Damos hasta 35s.
+      // clase/atributo disabled mientras el store calcula envío). Damos hasta 45s.
       try {
         await waitForTokin(() => {
           const btn = document.querySelector('button[data-id="place-order-button"]') || el;
-          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true" && !/disabled-/.test(btn.className || "");
-        }, 35000, 300);
+          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true" && !btn.classList.contains("disabled");
+        }, 45000, 300);
       } catch (e) {}
 
       const elTarget = document.querySelector('button[data-id="place-order-button"]') || el;
@@ -4828,6 +4839,7 @@ if (st.step === "siguiente") {
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(elTarget);
       await toksleep(1500);
+      return tokCheckoutStep();
     }
 
     if (st.step === "confirmar") {
@@ -4852,6 +4864,11 @@ if (st.step === "siguiente") {
       let okDone = false;
       const deadline = Date.now() + 60000;
       while (Date.now() < deadline) {
+        if (window.__TOKIN_DRY_GUARD__ && window.__TOKIN_DRY_BLOCKED__) {
+          tokDiagPush("checkout", { msg: "dry-run guard: confirmación simulada tras interceptar «Realizar pedido»" });
+          okDone = true;
+          break;
+        }
         const u = location.href.toLowerCase();
         if (/gracias|confirm|success|exito|order|thank/i.test(u)) { okDone = true; break; }
         const bodyTxt = ((document.body && document.body.innerText) || "").normalize("NFD").replace(/[̀-ͯ]/g, "");
@@ -4918,7 +4935,7 @@ if (st.step === "siguiente") {
   // entre dos pasos era infinito y el lote quedaba clavado hasta el timeout
   // general de 12 minutos, sin decir por qué.
   async function tokWaitCheckUrl(stepNow, st, urlRe) {
-    const nav = await waitForTokin(() => urlRe.test(location.pathname), 10000, 300);
+    const nav = await waitForTokin(() => urlRe.test(location.pathname), 45000, 300);
     if (nav) {
       // v2.0.85: el paso avanzados, se olvida el contador de reintentos.
       if (st.retries) {
