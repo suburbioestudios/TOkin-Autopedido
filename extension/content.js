@@ -1,4 +1,4 @@
-﻿// Tokin AutoPedido - content script
+// Tokin AutoPedido - content script
 // Descubre campos del formulario, rellena valores (compatible con React/Next.js)
 // y expone una API de mensajes para el popup.
 
@@ -4637,6 +4637,80 @@
     }
   }
 
+  // Selecciona la opción de pago "Pago contra entrega" en /checkout/payment.
+  // Requerida por la tienda para que se habiliten los totales y aparezca/se habilite
+  // el botón «Realizar pedido».
+  async function tokSelectPaymentContraEntrega() {
+    try {
+      // 1. Buscar inputs de radio o checkbox asociados a "contra entrega"
+      const inputs = Array.from(document.querySelectorAll("input[type=radio], input[type=checkbox], [role=radio]"));
+      for (const inp of inputs) {
+        let txt = "";
+        if (inp.id) {
+          try {
+            const lbl = document.querySelector(`label[for="${CSS.escape(inp.id)}"]`);
+            if (lbl) txt += " " + (lbl.innerText || "");
+          } catch (e) {}
+        }
+        const parent = inp.closest("label, div, li, tr");
+        if (parent) txt += " " + (parent.innerText || "");
+        txt += " " + (inp.value || "") + " " + (inp.name || "") + " " + (inp.getAttribute("data-id") || "");
+
+        if (/contra\s*entrega/i.test(txt)) {
+          const isSelected = inp.checked || inp.getAttribute("aria-checked") === "true";
+          tokDiagPush("checkout", { msg: "opción de pago detectada (radio/input): " + (inp.value || inp.id || "radio") + " selected=" + isSelected });
+          const clickable = inp.closest("label") || inp.closest("[role=radio]") || inp;
+          await tokRealClick(clickable);
+          try {
+            if (!inp.checked) {
+              inp.checked = true;
+              inp.dispatchEvent(new Event("change", { bubbles: true }));
+              inp.dispatchEvent(new Event("input", { bubbles: true }));
+            }
+          } catch (e) {}
+          await toksleep(600);
+          return true;
+        }
+      }
+
+      // 2. Buscar por texto visible en cualquier elemento interactivo / tarjeta / label
+      const allCand = Array.from(document.querySelectorAll("label, button, [role=button], div, p, span"));
+      for (const el of allCand) {
+        if (el.children.length > 3) continue;
+        const txt = (el.innerText || "").trim();
+        if (/pago\s*contra\s*entrega/i.test(txt) || (/contra\s*entrega/i.test(txt) && txt.length < 60)) {
+          const target = el.closest("label, button, [role=button], [role=radio], li, [data-id*='payment'], div[class*='card' i], div[class*='option' i]") || el;
+          tokDiagPush("checkout", { msg: "opción de pago detectada (texto): «" + txt.slice(0, 40) + "»" });
+          await tokRealClick(target);
+          await toksleep(600);
+          return true;
+        }
+      }
+
+      // 3. Buscar dentro del contenedor de sección "Método de pago"
+      const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, div, span, p"));
+      for (const h of headings) {
+        if (/m[eé]todo\s*de\s*pago/i.test(h.innerText || "") && h.children.length <= 1) {
+          const section = h.closest("section, div[class*='step' i], div[class*='card' i], div[class*='section' i]") || h.parentElement;
+          if (section) {
+            const opt = Array.from(section.querySelectorAll("label, input, button, [role=radio], [role=button], div")).find(el =>
+              /contra\s*entrega/i.test(el.innerText || el.getAttribute("data-id") || "")
+            );
+            if (opt) {
+              tokDiagPush("checkout", { msg: "opción de pago detectada en sección Método de Pago" });
+              await tokRealClick(opt);
+              await toksleep(600);
+              return true;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      try { tokDiagPush("checkout", { msg: "error buscando opción de pago: " + String((err && err.message) || err) }); } catch (e) {}
+    }
+    return false;
+  }
+
   async function tokCheckoutStepReal() {
     let st = await tokStoreGet(CHECKOUT_KEY);
     if (!st || !st.step) return false;
@@ -4793,18 +4867,40 @@
         }
       }
 
+      // Seleccionar opción de pago "Pago contra entrega" (requerido por la tienda para
+      // que se calculen los totales y se muestre/habilite «Realizar pedido»)
+      await tokSelectPaymentContraEntrega();
+
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
       // "place-order-button" (botón React, disabled hasta que terminan los
       // cálculos de envío/pago y métodos de entrega).
-      // Damos hasta 45s para que renderice en el DOM.
-      const el = await waitForTokin(() => {
-        const direct = document.querySelector('button[data-id="place-order-button"]')
+      // Damos hasta 45s para que renderice en el DOM, reintentando seleccionar
+      // "Pago contra entrega" si no aparece o sigue disabled.
+      let el = null;
+      let lastPayCheck = 0;
+      const tStartWait = Date.now();
+
+      while (Date.now() - tStartWait < 45000) {
+        el = document.querySelector('button[data-id="place-order-button"]')
           || document.querySelector('[data-id="place-order-button"]')
           || document.querySelector('button[data-id*="place-order"]')
-          || document.querySelector('[data-id*="place-order"]');
-        if (direct) return direct;
-        return tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)|place.?order/i, true);
-      }, 45000, 300);
+          || document.querySelector('[data-id*="place-order"]')
+          || tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)|place.?order/i, true);
+
+        // Si ya apareció y está habilitado, listo
+        if (el && !el.disabled && el.getAttribute("aria-disabled") !== "true" && !el.classList.contains("disabled")) {
+          break;
+        }
+
+        // Si no apareció o está disabled, reintentar seleccionar "Pago contra entrega" periódicamente
+        if (Date.now() - lastPayCheck > 2500) {
+          lastPayCheck = Date.now();
+          await tokSelectPaymentContraEntrega();
+        }
+
+        await toksleep(400);
+      }
+
       if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (url=" + location.pathname + ")");
 
       // v2.0.96: ÚNICA verificación de cantidades del pedido, y va acá: en la
@@ -4825,12 +4921,12 @@
       }
 
       // Esperar a que quede habilitado antes de clickear (el toggle es por
-      // clase/atributo disabled mientras el store calcula envío). Damos hasta 45s.
+      // clase/atributo disabled mientras el store calcula envío). Damos hasta 25s extra.
       try {
         await waitForTokin(() => {
           const btn = document.querySelector('button[data-id="place-order-button"]') || el;
           return !btn.disabled && btn.getAttribute("aria-disabled") !== "true" && !btn.classList.contains("disabled");
-        }, 45000, 300);
+        }, 25000, 300);
       } catch (e) {}
 
       const elTarget = document.querySelector('button[data-id="place-order-button"]') || el;

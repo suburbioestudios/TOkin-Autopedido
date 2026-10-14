@@ -309,6 +309,11 @@ async function runBlockTest(page, blockIndex, itemsForBlock) {
         placeOrderBtn = btn;
         break;
       }
+      // Reintentar seleccionar "Pago contra entrega" si la página aún no lo marcó
+      const pagoOpt = page.locator('label:has-text("Pago contra entrega"), text="Pago contra entrega", input[type=radio]').first();
+      if (await pagoOpt.count().catch(() => 0)) {
+        await pagoOpt.click().catch(() => {});
+      }
       await sleep(1000);
     }
 
