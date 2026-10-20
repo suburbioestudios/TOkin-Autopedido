@@ -540,7 +540,7 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     });
   }
 
-  function renderCartResults(results, box) {
+  function renderCartResults(results, box, wasCanceled) {
     const res = (results || []).filter(Boolean);
     if (!res.length) {
       box.innerHTML = '<p class="hint">Cargando…</p>';
@@ -553,17 +553,20 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     const checksRep = (ui.sessionState && ui.sessionState.lotChecks) || {};
 
     // Construir resumen por bloque (sin filas de ítems).
-    // Un bloque se considera PEDIDO REALIZADO salvo que lotChecks lo marque
-    // explícitamente como false (checkout falló). undefined = asumimos confirmado.
+    // Un bloque es PEDIDO REALIZADO SOLO si lotChecks lo marcó explícitamente
+    // como true (checkout completado). Si lotChecks no tiene registro del bloque
+    // (undefined) o el pedido fue cancelado, el bloque queda como NO CONFIRMADO.
+    // Antes: `lotVal !== false` → undefined !== false = true → falso positivo.
     const blocksSeen = new Map();
     for (let i = 0; i < cargadas.length; i++) {
       const r = cargadas[i];
       const nro = (r && (r.nro != null ? r.nro : (r.itemNro != null ? r.itemNro : null))) || (i + 1);
       const blockN = Math.floor((nro - 1) / GROUP) + 1;
       if (!blocksSeen.has(blockN)) {
-        // confirmed = true a menos que lotChecks diga explícitamente false
         const lotVal = checksRep && checksRep[String(blockN)];
-        blocksSeen.set(blockN, { confirmed: lotVal !== false, count: 0 });
+        // Solo confirmado si lotChecks tiene true explícito Y no se canceló
+        const confirmed = !wasCanceled && lotVal === true;
+        blocksSeen.set(blockN, { confirmed, count: 0 });
       }
       blocksSeen.get(blockN).count++;
     }
@@ -726,7 +729,9 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     // v2.0.57: no existe "sin confirmar" en el informe final.
     if (parts.length) html += "\n" + parts.join(" · ");
     $("#done-summary").textContent = html;
-    renderCartResults(c.results, $("#cart-results-final"));
+    // Pasar wasCanceled para que los bloques no aparezcan como PEDIDO REALIZADO
+    // cuando el pedido fue cancelado a mitad (lotChecks no registra checkout).
+    renderCartResults(c.results, $("#cart-results-final"), wasCanceled);
   }
 
   // ------------------------------------------------------------- init
