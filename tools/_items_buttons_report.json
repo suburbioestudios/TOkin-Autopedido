@@ -1,0 +1,146 @@
+[
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 1,
+      "codigo": "14677",
+      "producto": "MOGUL GOMITAS BANANITAS x30 G BANANI",
+      "cantidad": 2,
+      "unidad": "d"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 2,
+      "codigo": "3113",
+      "producto": "MOGUL GOMITAS CONITOS 1 K CONITOS",
+      "cantidad": 1,
+      "unidad": "b"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 3,
+      "codigo": "3081",
+      "producto": "MOGUL COMITAS JELLY BUTTONS 1 K JELL",
+      "cantidad": 2,
+      "unidad": "b"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 4,
+      "codigo": "1999",
+      "producto": "MOGUL GOMITAS OSITOS 30 G",
+      "cantidad": 2,
+      "unidad": "b"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 5,
+      "codigo": "15395",
+      "producto": "MOGUL COMITAS PELABLE 3D MANGO x61 G",
+      "cantidad": 2,
+      "unidad": "d"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 6,
+      "codigo": "15397",
+      "producto": "MOGUL COMITAS PELABLE 3D UVA x61 G P",
+      "cantidad": 2,
+      "unidad": "d"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 7,
+      "codigo": "13024",
+      "producto": "MOGUL GOMITAS SANDIA EXTREME x50 E S",
+      "cantidad": 1,
+      "unidad": "d"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  },
+  {
+    "item": {
+      "sheet": "Bloque 5",
+      "row": 8,
+      "codigo": "2001",
+      "producto": "MOGUL GOMITAS TIBURONES 30 G TIBURON",
+      "cantidad": 2,
+      "unidad": "d"
+    },
+    "info": {
+      "found": true,
+      "textSnippet": "Institucional Sobre TOKIN Términos y Usos del Sitio",
+      "buttons": [],
+      "skuSelectorButtonsCount": 0,
+      "skuSelectorButtons": [],
+      "hasAddToCart": false
+    }
+  }
+]

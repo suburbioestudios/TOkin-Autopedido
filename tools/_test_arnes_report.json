@@ -1,0 +1,10 @@
+{
+  "testDate": "2026-10-14T18:18:09.956Z",
+  "userAccount": "druettaf@gmail.com",
+  "pdfUsed": "C:\\Users\\Perfect Pixel\\Desktop\\TresD\\Extnsion Tokin\\PEDIDO ARCOR BERAZATEGUI 06 OCT.pdf",
+  "totalBlocksRequested": 3,
+  "itemsPerBlock": 19,
+  "blocks": [],
+  "finalVerdict": "ERROR",
+  "criticalError": "page.goto: Timeout 90000ms exceeded.\nCall log:\n\u001b[2m  - navigating to \"https://tokintienda.com.ar/store\", waiting until \"domcontentloaded\"\u001b[22m\n"
+}
