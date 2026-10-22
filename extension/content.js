@@ -4642,7 +4642,17 @@
   // el botón «Realizar pedido».
   async function tokSelectPaymentContraEntrega() {
     try {
-      // 1. Buscar inputs de radio o checkbox asociados a "contra entrega"
+      // 1. Si el botón de realizar pedido ya está presente y habilitado,
+      // el método de pago YA está seleccionado y los totales calculados: NO TOCAR NADA.
+      const placeBtn = document.querySelector('button[data-id="place-order-button"]')
+        || document.querySelector('[data-id="place-order-button"]')
+        || tokFindBtnByText(/realizar\s*pedido|finalizar\s*(compra|pedido)|confirmar\s*(compra|pedido)/i, true);
+      if (placeBtn && !placeBtn.disabled && placeBtn.getAttribute("aria-disabled") !== "true" && !placeBtn.classList.contains("disabled")) {
+        tokDiagPush("checkout", { msg: "método de pago ya listo: botón «Realizar pedido» ya habilitado" });
+        return true;
+      }
+
+      // 2. Buscar inputs de radio o checkbox asociados a "contra entrega" o "efectivo"
       const inputs = Array.from(document.querySelectorAll("input[type=radio], input[type=checkbox], [role=radio]"));
       for (const inp of inputs) {
         let txt = "";
@@ -4656,9 +4666,13 @@
         if (parent) txt += " " + (parent.innerText || "");
         txt += " " + (inp.value || "") + " " + (inp.name || "") + " " + (inp.getAttribute("data-id") || "");
 
-        if (/contra\s*entrega/i.test(txt)) {
+        if (/contra\s*entrega|efectivo/i.test(txt)) {
           const isSelected = inp.checked || inp.getAttribute("aria-checked") === "true";
-          tokDiagPush("checkout", { msg: "opción de pago detectada (radio/input): " + (inp.value || inp.id || "radio") + " selected=" + isSelected });
+          if (isSelected) {
+            tokDiagPush("checkout", { msg: "opción de pago ya marcada (radio/input): " + (inp.value || inp.id || "radio") });
+            return true; // Ya está seleccionada, no volver a clickear
+          }
+          tokDiagPush("checkout", { msg: "seleccionando opción de pago (radio/input): " + (inp.value || inp.id || "radio") });
           const clickable = inp.closest("label") || inp.closest("[role=radio]") || inp;
           await tokRealClick(clickable);
           try {
@@ -4668,41 +4682,46 @@
               inp.dispatchEvent(new Event("input", { bubbles: true }));
             }
           } catch (e) {}
-          await toksleep(600);
+          await toksleep(800);
           return true;
         }
       }
 
-      // 2. Buscar por texto visible en cualquier elemento interactivo / tarjeta / label
-      const allCand = Array.from(document.querySelectorAll("label, button, [role=button], div, p, span"));
-      for (const el of allCand) {
-        if (el.children.length > 3) continue;
-        const txt = (el.innerText || "").trim();
-        if (/pago\s*contra\s*entrega/i.test(txt) || (/contra\s*entrega/i.test(txt) && txt.length < 60)) {
-          const target = el.closest("label, button, [role=button], [role=radio], li, [data-id*='payment'], div[class*='card' i], div[class*='option' i]") || el;
-          tokDiagPush("checkout", { msg: "opción de pago detectada (texto): «" + txt.slice(0, 40) + "»" });
-          await tokRealClick(target);
-          await toksleep(600);
-          return true;
-        }
-      }
-
-      // 3. Buscar dentro del contenedor de sección "Método de pago"
+      // 3. Buscar dentro del contenedor o sección "Método de pago"
+      // IMPORTANTE: NO clickear la tarjeta/sección entera (eso colapsa/expande el acordeón).
+      // Clickear únicamente el elemento interactivo interno (label, input, botón o selector de opción).
       const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, div, span, p"));
       for (const h of headings) {
         if (/m[eé]todo\s*de\s*pago/i.test(h.innerText || "") && h.children.length <= 1) {
           const section = h.closest("section, div[class*='step' i], div[class*='card' i], div[class*='section' i]") || h.parentElement;
           if (section) {
-            const opt = Array.from(section.querySelectorAll("label, input, button, [role=radio], [role=button], div")).find(el =>
-              /contra\s*entrega/i.test(el.innerText || el.getAttribute("data-id") || "")
+            const secText = (section.innerText || "").toLowerCase();
+            if (secText.includes("contra entrega") && !section.querySelector("input[type=radio]")) {
+              tokDiagPush("checkout", { msg: "sección Método de Pago ya muestra Pago contra entrega" });
+              return true;
+            }
+            const opt = Array.from(section.querySelectorAll("label, input, button, [role=radio], [role=button], li")).find(el =>
+              /contra\s*entrega|efectivo/i.test(el.innerText || el.getAttribute("data-id") || "")
             );
             if (opt) {
-              tokDiagPush("checkout", { msg: "opción de pago detectada en sección Método de Pago" });
+              tokDiagPush("checkout", { msg: "click en opción de pago específica dentro de sección Método de Pago" });
               await tokRealClick(opt);
-              await toksleep(600);
+              await toksleep(800);
               return true;
             }
           }
+        }
+      }
+
+      // 4. Buscar por texto visible en elementos interactivos específicos (labels o botones, NO tarjetas enteras)
+      const specificCand = Array.from(document.querySelectorAll("label, button, [role=button], [role=radio], li[data-id*='payment']"));
+      for (const el of specificCand) {
+        const txt = (el.innerText || "").trim();
+        if (/pago\s*contra\s*entrega/i.test(txt) || (/contra\s*entrega/i.test(txt) && txt.length < 50)) {
+          tokDiagPush("checkout", { msg: "opción de pago detectada en botón/label: «" + txt.slice(0, 40) + "»" });
+          await tokRealClick(el);
+          await toksleep(800);
+          return true;
         }
       }
     } catch (err) {
@@ -4715,7 +4734,11 @@
     let st = await tokStoreGet(CHECKOUT_KEY);
     if (!st || !st.step) return false;
     const started = st.started || Date.now();
-    if (Date.now() - started > 12 * 60 * 1000) {
+    // v2.0.99: el timeout general de 12 min NO aplica al paso "confirmar": ese
+    // paso puede quedar en ESPERA INDEFINIDA de confirmación manual y debe poder
+    // superar los 12 min sin abortarse. Para el resto de los pasos, el límite
+    // sigue evitando un checkout colgado para siempre.
+    if (st.step !== "confirmar" && Date.now() - started > 12 * 60 * 1000) {
       await tokCheckoutDone(false, "checkout abandonado: timeout general (12 min) sin avanzar de «" + st.step + "»");
       return false;
     }
@@ -4807,20 +4830,20 @@
       // y envío), así que la comparación del paso final no tenía nada que
       // leer y terminaba siempre en "se sigue sin verificar". Esta página sí
       // muestra cada fila con su cantidad (input[data-id=quantity-selector-input]).
-      // v2.0.98: además de la foto, acá se CORRIGE el carrito ANTES de avanzar.
-      // Es la última ventana que lista las filas con input, así que el arreglo
-      // va antes de tocar «Siguiente»: si una fila del lote quedó con otra
-      // cantidad se escribe la correcta; si un producto está en otra unidad (la
-      // cantidad no sirve) o hay algo que no es del lote, ese ítem sale del
-      // carrito y se reporta. Después sí se confirma.
-      try {
-        const rep = await tokCorregirCarrito(st);
-        if (rep.avisos && rep.avisos.length) {
-          st._avisosCheckout = (st._avisosCheckout || []).concat(rep.avisos);
+      // v2.0.98 / v2.1.7: Corrección ANTES de avanzar, pero UNA SOLA VEZ por lote.
+      // Si ya fue corregido en este lote, no volver a escribir en los inputs para
+      // evitar re-renders en bucle y habilitaciones repetidas de edición.
+      if (!st._cartCorrected) {
+        try {
+          const rep = await tokCorregirCarrito(st);
+          st._cartCorrected = true;
+          if (rep.avisos && rep.avisos.length) {
+            st._avisosCheckout = (st._avisosCheckout || []).concat(rep.avisos);
+          }
           await tokStoreSet(CHECKOUT_KEY, st);
+        } catch (err) {
+          try { tokDiagPush("checkout", { msg: "corrección previa al checkout con error (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
         }
-      } catch (err) {
-        try { tokDiagPush("checkout", { msg: "corrección previa al checkout con error (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
       }
       try {
         const foto = tokCartReadCheckout();
@@ -4830,10 +4853,7 @@
           tokDiagPush("checkout", { msg: "foto de cantidades (post-corrección): " + foto.length + " filas" });
         }
       } catch (e) {}
-      // v2.0.98: la corrección puede haber re-renderizado la página y dejar `el`
-      // colgado (nodo viejo = click en el vacío). Re-buscar «Siguiente» recién
-      // antes del click, y esperar a que esté habilitado: el store lo deja
-      // disabled mientras recalcula totales después de un cambio de cantidad.
+      // Re-buscar «Siguiente» recién antes del click, y esperar a que esté habilitado.
       let elFinal = el;
       try {
         elFinal = await waitForTokin(() => {
@@ -4848,6 +4868,7 @@
         await waitForTokin(() => !elFinal.disabled && elFinal.getAttribute("aria-disabled") !== "true", 20000, 300);
       } catch (e) {}
       st.step = "realizar";
+      st._realizarNavRetries = (st._realizarNavRetries || 0) + 1;
       await tokStoreSet(CHECKOUT_KEY, st);
       await tokRealClick(elFinal);
       st = await tokWaitCheckUrl("realizar", st, /\/checkout\/payment/);
@@ -4856,31 +4877,34 @@
     }
 
     if (st.step === "realizar") {
-      // Si por alguna razón el navegador sigue en /checkout/cart o no llegó a payment,
-      // esperar hasta 25s a que el SPA termine la navegación antes de considerar error.
+      // Si por alguna razón el navegador sigue en /checkout/cart o no llegó a payment:
       if (!/\/checkout\/payment/.test(location.pathname)) {
-        const atPay = await waitForTokin(() => /\/checkout\/payment/.test(location.pathname), 25000, 300);
+        const atPay = await waitForTokin(() => /\/checkout\/payment/.test(location.pathname), 15000, 300);
         if (!atPay) {
+          st._realizarNavRetries = (st._realizarNavRetries || 0) + 1;
+          await tokStoreSet(CHECKOUT_KEY, st);
+          if (st._realizarNavRetries >= 2) {
+            return tokWaitManualConfirm(st, "el checkout no avanza de «Siguiente» al pago: hacé click en «Siguiente» a mano en el carrito");
+          }
           st.step = "siguiente";
           await tokStoreSet(CHECKOUT_KEY, st);
           return tokCheckoutStep();
         }
       }
+      st._realizarNavRetries = 0;
+      await tokStoreSet(CHECKOUT_KEY, st);
 
-      // Seleccionar opción de pago "Pago contra entrega" (requerido por la tienda para
-      // que se calculen los totales y se muestre/habilite «Realizar pedido»)
+      // Seleccionar opción de pago "Pago contra entrega" (si no está ya lista)
       await tokSelectPaymentContraEntrega();
 
       // «Realizar pedido» vive en /checkout/payment y tiene el data-id exacto
-      // "place-order-button" (botón React, disabled hasta que terminan los
-      // cálculos de envío/pago y métodos de entrega).
-      // Damos hasta 45s para que renderice en el DOM, reintentando seleccionar
-      // "Pago contra entrega" si no aparece o sigue disabled.
+      // "place-order-button". Esperar hasta 35s a que aparezca y esté habilitado.
       let el = null;
       let lastPayCheck = 0;
+      let payRetries = 0;
       const tStartWait = Date.now();
 
-      while (Date.now() - tStartWait < 45000) {
+      while (Date.now() - tStartWait < 35000) {
         el = document.querySelector('button[data-id="place-order-button"]')
           || document.querySelector('[data-id="place-order-button"]')
           || document.querySelector('button[data-id*="place-order"]')
@@ -4892,42 +4916,37 @@
           break;
         }
 
-        // Si no apareció o está disabled, reintentar seleccionar "Pago contra entrega" periódicamente
-        if (Date.now() - lastPayCheck > 2500) {
+        // Si no apareció o sigue disabled, reintentar seleccionar "Pago contra entrega" como máximo 2 veces
+        if (Date.now() - lastPayCheck > 3000 && payRetries < 2) {
           lastPayCheck = Date.now();
+          payRetries++;
           await tokSelectPaymentContraEntrega();
         }
 
         await toksleep(400);
       }
 
-      if (!el) return tokFail("no se encontró «Realizar pedido» en /checkout/payment (url=" + location.pathname + ")");
+      // Si no apareció o sigue deshabilitado, pasar inmediatamente a ESPERA INDEFINIDA DE CONFIRMACIÓN MANUAL
+      // para que el usuario pueda confirmar a mano con un click y el sistema continúe sin abortar por timeout.
+      const isEnabled = el && !el.disabled && el.getAttribute("aria-disabled") !== "true" && !el.classList.contains("disabled");
+      if (!el || !isEnabled) {
+        return tokWaitManualConfirm(
+          st,
+          !el
+            ? "no se encontró «Realizar pedido» en /checkout/payment: confirmalo a mano en el store"
+            : "el botón «Realizar pedido» no se habilitó automáticamente: confirmalo a mano en el store"
+        );
+      }
 
-      // v2.0.96: ÚNICA verificación de cantidades del pedido, y va acá: en la
-      // confirmación. Antes de tocar «Realizar pedido» se lee lo que muestra el
-      // carrito y se compara contra lo que el lote pidió. Es de SOLO LECTURA: no
-      // escribe en el carrito, no tipea, no navega — no puede desandar el flujo.
-      // Si no se puede leer (o no se reconoce ninguna línea del lote) se sigue
-      // igual: solo frena cuando leyó el carrito y hay una diferencia real.
+      // Verificación de cantidades de solo lectura (no bloquea, guarda avisos si los hay)
       try {
         const problema = await tokVerifyPreCheckout(st, "antes de «Realizar pedido»");
-        // v2.0.97: no bloquea — los desajustes se guardan en st._avisosCheckout
         if (problema && typeof problema === "string") {
-          // Si por alguna razón sigue devolviendo string, lo anotamos y continuamos
           try { st._avisosCheckout = (st._avisosCheckout || []).concat(problema); await tokStoreSet(CHECKOUT_KEY, st); } catch (e) {}
         }
       } catch (err) {
         try { tokDiagPush("checkout", { msg: "no se pudo comparar el carrito (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
       }
-
-      // Esperar a que quede habilitado antes de clickear (el toggle es por
-      // clase/atributo disabled mientras el store calcula envío). Damos hasta 25s extra.
-      try {
-        await waitForTokin(() => {
-          const btn = document.querySelector('button[data-id="place-order-button"]') || el;
-          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true" && !btn.classList.contains("disabled");
-        }, 25000, 300);
-      } catch (e) {}
 
       const elTarget = document.querySelector('button[data-id="place-order-button"]') || el;
       try { console.log("[Tokin] checkout realizar: click place-order-button disabled=" + !!elTarget.disabled); } catch (e) {}
@@ -4939,24 +4958,12 @@
     }
 
     if (st.step === "confirmar") {
-      // v2.0.71: SÓLO se vuelve al store cuando la compra quedó REALIZADA de
-      // verdad. Señales válidas, la más fuerte según la tienda: el carrito
-      // queda VACÍO ("el carro se vacía solo al enviar el pedido"). Si vuelve
-      // antes, el siguiente lote se apila sobre el carro del lote anterior.
-      try {
-        if (st && st.jobId) {
-          const jg = state && state.grupos;
-          if (jg && jg[st.jobId]) {
-            jg[st.jobId].checkoutConfirmed = true;
-            jg[st.jobId].confirmado = true;
-            jg[st.jobId].checkoutAt = Date.now();
-          }
-          if (job && job.grupos && job.grupos[st.jobId]) {
-            job.grupos[st.jobId].checkoutConfirmed = true;
-            job.grupos[st.jobId].confirmado = true;
-          }
-        }
-      } catch (e) {}
+      // v2.0.99: si el pedido no confirma solo, NO se corta el flujo. Se entra
+      // en MODO ESPERA INDEFINIDA: se le avisa al usuario que confirme a mano
+      // (botón «Realizar pedido») y el sistema sigue sondeando las señales de
+      // éxito. En cuanto el pedido quede realizado (aunque lo haya clickeado el
+      // usuario), se marca el lote OK y se continúa con el bloque siguiente en
+      // vez de frenar todo el pedido.
       let okDone = false;
       const deadline = Date.now() + 60000;
       while (Date.now() < deadline) {
@@ -4965,23 +4972,13 @@
           okDone = true;
           break;
         }
-        const u = location.href.toLowerCase();
-        if (/gracias|confirm|success|exito|order|thank/i.test(u)) { okDone = true; break; }
-        const bodyTxt = ((document.body && document.body.innerText) || "").normalize("NFD").replace(/[̀-ͯ]/g, "");
-        if (/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test(bodyTxt)) { okDone = true; break; }
-        // Señal de la tienda: carrito vacío (el store lo vacía al confirmar).
-        // v2.0.79: solo cuenta como éxito si el checkout empezó con el carrito
-        // CARGADO (st.hadItems). Si ya venía vacío desde antes, no es prueba
-        // de nada y caería en un segundo checkout-inqusitivo sin haber comprado.
-        try {
-          const cards = tokCartCards();
-          if (cards && cards.filter((c) => c.qty > 0).length === 0 && st.hadItems !== false) { okDone = true; break; }
-        } catch (e) {}
+        if (tokConfirmedSignal(st)) { okDone = true; break; }
         await toksleep(700);
       }
       if (!okDone) {
-        // No confirmó: quedarse acá, NO volver al store, y reportar fallo.
-        return tokFail("el pedido no se confirmó (el carrito sigue cargado): revisar el checkout del store");
+        // v2.0.99: no confirmó en 60s. Antes esto abortaba el pedido entero.
+        // Ahora se pasa a espera indefinida de confirmación manual.
+        return tokWaitManualConfirm(st, "el pedido no se confirmó solo: confirmalo a mano en el store con «Realizar pedido»");
       }
       // Esperar que la pantalla de éxito renderice y volver al store.
       try {
@@ -5017,9 +5014,78 @@
     return false;
 
     async function tokFail(reason) {
-      await tokStoreRemove(CHECKOUT_KEY);
-      return tokCheckoutDone(false, reason);
+      // v2.0.99: en vez de abortar el pedido entero y perder los bloques que
+      // faltan, se entra en ESPERA INDEFINIDA de confirmación manual. El lote
+      // queda en vuelo (no se borra el estado) y el sistema retoma solo cuando
+      // detecta el pedido realizado.
+      return tokWaitManualConfirm(st, reason);
     }
+  }
+
+  // v2.0.99: SEÑAL DE PEDIDO REALIZADO, compartida por el paso de confirmación
+  // automático y por la espera manual. Señales válidas, de más a menos fuerte:
+  // el guard del dry-run, la URL de éxito, el texto de la pantalla de éxito, y
+  // el carrito quedando VACÍO (el store lo vacía al enviar el pedido). La señal
+  // del carrito solo cuenta si el checkout empezó con el carrito CARGADO
+  // (st.hadItems !== false): si ya venía vacío no prueba nada.
+  function tokConfirmedSignal(st) {
+    try {
+      if (window.__TOKIN_DRY_GUARD__ && window.__TOKIN_DRY_BLOCKED__) return true;
+      const u = location.href.toLowerCase();
+      if (/gracias|confirm|success|exito|order|thank/i.test(u)) return true;
+      const bodyTxt = ((document.body && document.body.innerText) || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (/gracias por tu compra|pedido realizado|pedido confirmado|se genero tu pedido|compra exitosa/i.test(bodyTxt)) return true;
+      const cards = tokCartCards();
+      if (cards && cards.filter((c) => c.qty > 0).length === 0 && (!st || st.hadItems !== false)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // v2.0.99: ESPERA INDEFINIDA DE CONFIRMACIÓN MANUAL. Cuando el checkout de un
+  // lote no avanza solo (el store no habilita un botón, aparecen selectores
+  // distintos, o el usuario tiene que intervenir), NO se detiene el pedido: se
+  // avisa por toast y se queda sondeando (para siempre) las señales de éxito.
+  // En cuanto el usuario confirma a mano («Realizar pedido») y el pedido queda
+  // realizado, se marca el lote OK y se continúa con el bloque siguiente. El
+  // estado del checkout NO se borra mientras se espera: si el content script se
+  // recarga (navegación), el mensaje de espera se vuelve a mostrar.
+  async function tokWaitManualConfirm(st, reason) {
+    try { tokDiagPush("checkout", { msg: "espera manual lote " + (st && st.lote) + ": " + reason }); } catch (e) {}
+    try { console.log("[Tokin] espera manual lote " + (st && st.lote) + ": " + reason); } catch (e) {}
+    st.step = "confirmar";
+    try { await tokStoreSet(CHECKOUT_KEY, st); } catch (e) {}
+    const deadline = Date.now() + 24 * 60 * 60 * 1000; // tope de 24h: no queda colgado para siempre un estado muerto
+    let t = 0;
+    while (Date.now() < deadline) {
+      tokToastSet(
+        "Lote " + (st && st.lote) + ": confirmá el pedido a mano en el store («Realizar pedido»). " +
+          "El sistema sigue solo cuando detecte el pedido realizado — no cierres esta pestaña.",
+        "err"
+      );
+      if (tokConfirmedSignal(st)) {
+        // Pedido realizado (por el usuario o por el store): marcar el lote OK y
+        // seguir con el bloque siguiente.
+        try {
+          const jg = state && state.grupos;
+          if (jg && st && st.jobId && jg[st.jobId]) {
+            jg[st.jobId].checkoutConfirmed = true;
+            jg[st.jobId].confirmado = true;
+            jg[st.jobId].checkoutAt = Date.now();
+          }
+          if (job && job.grupos && st && st.jobId && job.grupos[st.jobId]) {
+            job.grupos[st.jobId].checkoutConfirmed = true;
+            job.grupos[st.jobId].confirmado = true;
+          }
+        } catch (e) {}
+        tokDiagPush("checkout", { msg: "pedido confirmado (manual) lote " + (st && st.lote) + ": continuando con el bloque siguiente" });
+        return tokCheckoutDone(true, "lote " + (st && st.lote) + " pedido realizado");
+      }
+      await toksleep(1500);
+      t += 1500;
+      // El toast se reescribe cada ~5s para no spamear.
+      if (t % 7500 < 1500) await toksleep(0);
+    }
+    return tokCheckoutDone(false, "espera manual vencida (24h) para el lote " + (st && st.lote));
   }
 
   // Esperar a que la URL actual cumpla el patrón del paso siguiente (el SPA

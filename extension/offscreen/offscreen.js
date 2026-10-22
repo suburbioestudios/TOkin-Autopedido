@@ -401,6 +401,20 @@ async function runCart() {
       setStatus("canceled", "Carga del carrito cancelada.", 3);
     } else {
       state.error = String((e && e.message) || e);
+      // v2.0.99: el bloque no se pudo ni despachar (store caído / mensaje sin
+      // respuesta). Antes esto dejaba el estado en "error" y las líneas de ESTE
+      // bloque ya no volvían a la cola (nextOrig ya había avanzado), así que
+      // «Enviar a carrito» seguía con el bloque siguiente y este se perdía.
+      // Ahora se retrocede nextOrig para REENCOLAR el bloque: al reenviar se
+      // carga como si fuera la primera vez, con sus títulos/ítems intactos.
+      try {
+        if (state.cartApi && !state.cartIsManual && Number.isFinite(batchStartAbs)) {
+          state.cartApi.nextOrig = Math.min(state.cartApi.nextOrig, batchStartAbs);
+        } else if (state.cartApi && state.cartIsManual && Array.isArray(batchIdx) && batchIdx.length) {
+          // Tanda manual: devolver a la cola las líneas del bloque fallido.
+          state.cartApi.retryIdx = batchIdx.concat(state.cartApi.retryIdx || []);
+        }
+      } catch (e2) {}
       setStatus("error", state.error, 3);
     }
   } finally {
@@ -736,17 +750,23 @@ function continueAfterCheckout(lote, _note, degraded) {
   // v2.0.71: si el checkout del lote NO confirmó (el carrito sigue cargado en
   // el store), NO lanzar el siguiente lote: cargaría líneas encima del lote
   // sin comprar y arruinaría la compra siguiente. Frenar con error claro.
+  // v2.0.99: si el checkout del lote NO confirmó, antes se frenaba TODO el
+  // pedido. Ahora se marca el lote como no confirmado y se CONTINÚA con el
+  // bloque siguiente: el content script ya no aborta el checkout por su cuenta
+  // (espera indefinida a la confirmación manual), así que llegar acá en
+  // "degraded" es la red de seguridad del temporizador. Se sigue igual para no
+  // dejar sin procesar los bloques que faltan.
   if (degraded) {
     setStatus(
-      "error",
-      "No se pudo confirmar la compra del lote " + loteLabel + " en el store (el carrito sigue cargado). " +
-        "Revisá la pestaña de tokintienda y confirmá el pedido a mano; después tocá «Terminar».",
+      "loading_cart",
+      "El lote " + loteLabel + " quedó sin confirmar automáticamente; se continúa con el resto. " +
+        "Revisá el store y confirmá a mano ese lote si hace falta.",
       3
     );
     playBeep(false);
     persist();
     emitState();
-    return;
+    // Continúa con el siguiente bloque (o cierra el pedido si no queda nada).
   }
   const isAdded = (r) => !!(r && r.ok && String(r.message || "").indexOf("agregado") === 0);
   const done = api.results.filter(Boolean);
