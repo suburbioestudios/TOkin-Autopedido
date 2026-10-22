@@ -3992,10 +3992,18 @@
         sendResponse({ ok: true });
         break;
       case "ADD_TO_CART":
+        // v2.1.8: tokCartStart es ASÍNCRONO (carga lote a lote con navegación por
+        // búsqueda). Antes se hacía `break` sin `return true`, así que el canal de
+        // mensajes se cerraba ANTES de que llegara la respuesta: el background
+        // recibía "A listener indicated an asynchronous response by returning
+        // true, but the message channel closed before a response was received",
+        // lo propagaba como fallo del bloque (status=error) y la cadena de lotes
+        // se cortaba tras `volver` (el lote 2 nunca arrancaba). Con `return true`
+        // el canal queda abierto hasta el sendResponse real.
         tokCartStart(msg.items || [], msg.tabId, msg.filename, { batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch })
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
-        break;
+        return true;
       case "TOKIN_KILL":
         // v2.0.66: el background mató este job (Terminar/Reanudar). Marcar el
         // token para que NADA más de este job se vuelva a escribir, y soltar

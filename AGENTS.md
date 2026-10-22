@@ -1,5 +1,9 @@
 # AGENTS.md
 
+> **ANTES DE EMPEZAR: leé `MEMORY.md`.** Es la bitácora de trabajo (qué se hizo,
+> versión, estado y próximo paso). Al terminar una tanda, actualizala y
+> commiteala junto con el cambio. Mantené las entradas nuevas arriba.
+
 Guía para agentes que trabajan en **Tokin AutoPedido**, la extensión de Chrome
 (MV3) que carga pedidos de Excel/PDF/DOCX en el carrito de
 `https://tokintienda.com.ar/store`. 100% local: los datos del pedido nunca salen
