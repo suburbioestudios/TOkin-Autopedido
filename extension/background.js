@@ -244,6 +244,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       return true;
     }
+    if (msg.type === "RESET_CART_SESSION") {
+      // v2.1.9: documento nuevo = pedido nuevo. Descarta el lote de la sesión
+      // ANTERIOR (otra cuenta de la tienda u otro pedido) SIN tocar la sesión
+      // del offscreen: a diferencia de CLEAR_PERSIST, NO borra tokin_session
+      // (el offscreen acaba de empezar a parsear el documento nuevo). Se mata
+      // por TOKEN para que ninguna re-escritura del content script lo reviva.
+      chrome.storage.local.get([CART_JOB_KEY], (d) => {
+        const job = d ? d[CART_JOB_KEY] : null;
+        const killToken = job && job.token ? String(job.token) : "";
+        const avisarPestanas = () => {
+          try {
+            chrome.tabs.query({}, (tabs) => {
+              for (const t of tabs || []) {
+                if (!t.id || !t.url || t.url.indexOf("tokintienda.com.ar/store") === -1) continue;
+                try {
+                  chrome.tabs.sendMessage(t.id, { type: "TOKIN_KILL", token: killToken }, () => { void chrome.runtime.lastError; });
+                } catch (e) {}
+              }
+            });
+          } catch (e) {}
+          sendResponse({ ok: true });
+        };
+        const limpiar = () => {
+          chrome.storage.local.remove(
+            [CART_JOB_KEY, CART_RUNNING_TAB_KEY, "tokinCartReport", "tokinCheckout"],
+            () => {
+              void chrome.runtime.lastError;
+              // Las pestañas se avisan DESPUÉS de borrar: si alguna recarga en
+              // el medio, resumeCart ya no encuentra job que reanudar.
+              avisarPestanas();
+            }
+          );
+        };
+        if (!killToken) return limpiar();
+        // Matar por TOKEN y marcar la interrupción ANTES de borrar: si el content
+        // script reescribe el job en el medio (tokStoreSet en vuelo), el guard
+        // de token ya lo descarta y resumeCart lo tira.
+        chrome.storage.local.set(
+          { [CART_JOB_KEY + "Killed"]: killToken, [CART_CANCEL_KEY]: "stop" },
+          () => {
+            void chrome.runtime.lastError;
+            limpiar();
+          }
+        );
+      });
+      return true;
+    }
     if (msg.type === "ADD_TO_CART") {
       chrome.tabs.query({}, (tabs) => {
         const store = tabs.find(
@@ -254,7 +301,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         chrome.storage.local.set({ [CART_RUNNING_TAB_KEY]: store.id }, () => { void chrome.runtime.lastError; });
-        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [], filename: msg.filename || "", batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch }, (res) => {
+        chrome.tabs.sendMessage(store.id, { type: "ADD_TO_CART", tabId: store.id, items: msg.items || [], filename: msg.filename || "", batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch, runToken: msg.runToken }, (res) => {
           if (chrome.runtime.lastError) {
             const errMsg = chrome.runtime.lastError.message || "";
             if (errMsg.indexOf("Receiving end does not exist") !== -1 || errMsg.indexOf("Could not establish connection") !== -1) {

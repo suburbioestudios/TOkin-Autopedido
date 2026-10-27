@@ -794,9 +794,18 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     // vive, su STATE block_done/done es más rico y manda).
     const report = res["tokinCartReport"];
     const st = ui.sessionState;
+    // v2.1.9: "parsing"/"parsed" también son sesión viva: el pedido nuevo recién
+    // ingerido manda, y el reporte persistido (del pedido anterior tras un
+    // cambio de cuenta) no debe sintetizar «pedido cargado».
     const realSessionLive = !ui.synthFromJob && st &&
-      (st.status === "block_done" || st.status === "done" || st.status === "loading_cart" || st.status === "paused");
-    if (!realSessionLive && report && Array.isArray(report.results) && (report.results.length || report.batch)) {
+      (st.status === "block_done" || st.status === "done" || st.status === "loading_cart" ||
+       st.status === "paused" || st.status === "parsing" || st.status === "parsed");
+    // v2.1.9: y el reporte tiene que ser del PEDIDO de la sesión viva (mismo
+    // runToken). Tras un cambio de cuenta el reporte viejo no puede sintetizar
+    // «pedido cargado» en la cuenta nueva.
+    const repOwned = !(report && report.runToken && st && st.cartRunToken) ||
+      String(report.runToken) === String(st.cartRunToken);
+    if (!realSessionLive && repOwned && report && Array.isArray(report.results) && (report.results.length || report.batch)) {
       ui.synthFromJob = true;
       applyState(reportToState(report));
       return true;
@@ -874,7 +883,22 @@ import { parseDocument, mapFields, summarize } from "../core/agent.js";
     let hadSaved = false;
     try {
       const saved = await new Promise((r) => chrome.storage.local.get("tokinCartReport", (x) => r(x && x.tokinCartReport)));
-      if (saved && (Array.isArray(saved.allResults) || Array.isArray(saved.results) || Array.isArray(saved.allLineItems))) {
+      // v2.1.9: cambio de cuenta / documento nuevo. El reporte persistido puede
+      // ser del pedido ANTERIOR. Si la sesión viva del offscreen ya es de un
+      // pedido NUEVO (recién parseado) o de otra sesión de carrito (runToken
+      // distinto), ese reporte NO se aplica: ni a la UI ni como «tarea
+      // recuperada». Era el síntoma de la segunda cuenta: el popup mostraba
+      // «30 de 38 en el carrito» y los lotes ya realizados de la cuenta
+      // anterior, con el carrito de la cuenta nueva vacío.
+      let owned = true;
+      try {
+        const sess = await new Promise((r) => chrome.storage.session.get("tokin_session", (x) => r(x && x.tokin_session)));
+        const stt = sess && sess.status;
+        if (stt === "parsing" || stt === "parsed") owned = false;
+        else if (sess && sess.cartRunToken && saved && saved.runToken &&
+          String(sess.cartRunToken) !== String(saved.runToken)) owned = false;
+      } catch (e) {}
+      if (owned && saved && (Array.isArray(saved.allResults) || Array.isArray(saved.results) || Array.isArray(saved.allLineItems))) {
         hadSaved = true;
         // Aplicar backup silencioso antes de decidir.
         ui.cart = ui.cart || {};

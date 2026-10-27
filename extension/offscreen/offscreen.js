@@ -50,6 +50,14 @@ const state = {
   // numéricos del pedido ya están comprados y nunca deben volver a comprarse).
   cartIsManual: false,
   manualRun: 0,
+  // v2.1.9: identidad de la SESIÓN de carrito (un pedido = un token). Viaja en
+  // todos los mensajes del content script (ADD_TO_CART, CART_PROGRESS,
+  // CART_DONE, CART_STOP, CHECKOUT_BATCH/CHECKOUT_DONE) para poder descartar
+  // un lote del pedido ANTERIOR que llegue tarde: al cambiar de cuenta en la
+  // tienda sin cerrar el navegador, los mensajes del pedido viejo compartían
+  // batchIdx con el nuevo (ambos arrancan en 0..18) y no había forma de
+  // distinguirlos.
+  cartRunToken: "",
 };
 
 function sessionView() {
@@ -70,6 +78,9 @@ function sessionView() {
     grupos: (state.cartApi && state.cartApi.grupos) || {},
     cartIsManual: state.cartIsManual,
     manualRun: state.manualRun,
+    // v2.1.9: sin esto, un offscreen recreado a mitad del lote no podría
+    // reconocer como propios los mensajes de su propio lote (ver staleRun).
+    cartRunToken: state.cartRunToken,
     // v2.0.96: el lote cuyo checkout está en vuelo. Sin esto, si Chrome recrea
     // este documento a mitad del lote (o se reinicia), el checkout perdedor se
     // quedaba esperando un CHECKOUT_DONE que quizá nunca llegaba, el temporizador
@@ -151,6 +162,13 @@ function resetState() {
   state.lotChecks = {};
   state.cartIsManual = false;
   state.manualRun = 0;
+  // v2.1.9: el CLEAR también descarta la identidad del pedido y el checkout en
+  // vuelo; si no, quedaría un lote "en curso" apuntando a una sesión borrada.
+  state.cartRunToken = "";
+  state.checkoutLote = 0;
+  state.allAttempted = false;
+  clearTimeout(state.checkoutTimer || 0);
+  state.checkoutTimer = 0;
 }
 
 // Los mensajes de chrome.runtime se serializan como JSON: los binarios deben
@@ -186,14 +204,48 @@ function summarizeMsg(doc) {
   return (doc.error ? "Con advertencias: " + doc.error + " · " : "") + base;
 }
 
+// v2.1.9: documento nuevo = PEDIDO NUEVO. La sesión de carrito (snapshot del
+// pedido, resultados por línea, lotes confirmados, grupos del informe, lote con
+// el checkout en vuelo) pertenece al pedido ANTERIOR. Al cambiar de cuenta de
+// usuario en la tienda y volver a usar la herramienta sin cerrar el navegador,
+// ese estado sobrevivía en chrome.storage.session y runCart() encontraba
+// nextOrig >= orderTotal: llamaba a finPedido() al instante, el popup mostraba
+// «Todas las líneas ya fueron procesadas (30 de 38)» —el pedido de la OTRA
+// cuenta— con el carrito de la cuenta nueva VACÍO y sin disparar un solo
+// checkout (ni una línea `item=`). Se limpia en la ingesta, que es el único
+// punto donde empieza un pedido distinto sin reiniciar el navegador.
+function resetCartSession() {
+  clearTimeout(state.checkoutTimer || 0);
+  state.checkoutTimer = 0;
+  state.cart = null;
+  state.cartProgress = null;
+  state.cartApi = null;
+  state.lotChecks = {};
+  state.cartIsManual = false;
+  state.manualRun = 0;
+  state.checkoutLote = 0;
+  state.allAttempted = false;
+  state.cancellingCart = false;
+  state.cartCanceled = false;
+  state.cartRunToken = "";
+  // El job que quedó vivo en el content script (otra cuenta / otro pedido) y el
+  // reporte persistido en storage.local también son del pedido anterior: se
+  // matan por TOKEN para que ninguna re-escritura los reviva (resumeCart los
+  // descarta) y para que el popup no muestre el pedido viejo como cargado.
+  sendSw({ type: "RESET_CART_SESSION" });
+}
+
+function newCartRunToken() {
+  return Date.now() + "-" + Math.floor(Math.random() * 1e9);
+}
+
 async function runParse(filename, data) {
   // Entrar un documento nuevo frena cualquier automatización de carrito que
-  // haya quedado corriendo de una tarea anterior.
-  if (state.status === "loading_cart") {
+  // haya quedado corriendo de una tarea anterior y descarta su sesión.
+  if (state.status === "loading_cart" || state.status === "paused") {
     sendSw({ type: "CANCEL_CART" });
-    state.cart = null;
-    state.cartProgress = null;
   }
+  resetCartSession();
   state.cancelRequested = false;
   state.filename = filename;
   state.error = "";
@@ -377,6 +429,9 @@ async function runCart() {
   // Persistir ANTES de mandar el mensaje: si el offscreen se recrea a mitad del
   // lote, la sesión restaurada conoce el bloque (batchIdx) y al volver el
   // CART_DONE matchea los resultados a las líneas correctas.
+  // v2.1.9: identidad de la sesión de carrito (ver staleRun). Se crea al
+  // despachar el primer bloque del pedido y NO cambia entre lotes.
+  if (!state.cartRunToken) state.cartRunToken = newCartRunToken();
   setStatus(
     "loading_cart",
     (state.cartIsManual ? "Cargando ajustes manuales" : "Cargando carrito") +
@@ -390,11 +445,35 @@ async function runCart() {
     // que el content script persista su reporte con la identidad del bloque
     // (recuperable si este offscreen se cierra a mitad de lote).
     const lastBatch = state.cartApi.nextOrig >= state.cartApi.orderTotal;
-    const out = await sendSw({
-      type: "ADD_TO_CART", items: batch, filename: state.filename || "",
-      batchIdx, orderTotal: state.cartApi.orderTotal, lastBatch,
-      manual: state.cartIsManual,
-    });
+    let out = null;
+    // v2.1.9: al terminar el checkout el content script vuelve a /store/home y,
+    // con la tienda lenta, el script tarda en re-inyectarse. Antes el lote
+    // siguiente se despachaba en esa ventana, el background respondía
+    // «Presioná F5…» (Receiving end does not exist), runCart lo tomaba como
+    // error y la CADENA SE DETENÍA con los bloques restantes sin cargar. Ahora
+    // se reintenta el envío hasta ~30 s (solo cuando el fallo es de conexión:
+    // pestaña ausente o error real del store NO se reintentan).
+    for (let intento = 1; intento <= 10; intento++) {
+      out = await sendSw({
+        type: "ADD_TO_CART", items: batch, filename: state.filename || "",
+        batchIdx, orderTotal: state.cartApi.orderTotal, lastBatch,
+        manual: state.cartIsManual,
+        // v2.1.9: el content script la guarda en el job y la devuelve en cada
+        // mensaje de este pedido.
+        runToken: state.cartRunToken,
+      });
+      if (out && out.ok) break;
+      const em = String((out && out.message) || "");
+      // El lote YA está corriendo en el content script (se perdió la respuesta
+      // del primer intento, pero el job quedó vivo): no es un fallo.
+      if (em.indexOf("Ya hay una carga de carrito") !== -1) { out = { ok: true, already: true }; break; }
+      const conexion = /Receiving end does not exist|Could not establish connection|message channel closed|message port closed|Presion/i.test(em);
+      if (!conexion || state.cancellingCart || state.status !== "loading_cart") break;
+      state.progress = "Esperando que la pestaña del store termine de cargar para el bloque… (intento " + intento + "/10)";
+      persist();
+      emitState();
+      await new Promise((r) => setTimeout(r, 3000));
+    }
     if (!out || !out.ok) throw new Error((out && out.message) || "El store no respondió.");
   } catch (e) {
     if (state.cancellingCart) {
@@ -511,7 +590,22 @@ async function startManualBatch(msg) {
   };
 }
 
+// v2.1.9: ¿este mensaje lo mandó la sesión de carrito ANTERIOR? El content
+// script devuelve el `runToken` que recibió al arrancar el lote. Si no coincide
+// con el de la sesión viva, el mensaje es de otro pedido (otra cuenta u otro
+// documento) y no puede tocar el carrito ni los lotes del pedido actual: es la
+// carrera que dejaba a la segunda cuenta sin cargar nada y con el pedido viejo
+// marcado como realizado.
+function staleRun(msg) {
+  const t = msg && msg.runToken ? String(msg.runToken) : "";
+  return !!(t && t !== String(state.cartRunToken || ""));
+}
+
 function applyCartDone(msg) {
+  if (staleRun(msg)) {
+    try { console.log("[Tokin] CART_DONE de un pedido anterior descartado (runToken distinto)"); } catch (e) {}
+    return;
+  }
   if (state.status !== "loading_cart" && state.status !== "paused") return;
   const results = (msg && msg.results) || [];
   // "Agregado" = lo que REALMENTE quedó en el carrito (message empieza con
@@ -726,7 +820,7 @@ function applyCartDone(msg) {
         want: Number(r.added) || 0,
         unit: String(r.usedUnit || "").trim(),
       }));
-    sendSw({ type: "CHECKOUT_BATCH", lote, expect: checkoutExpect }).catch(() => {});
+    sendSw({ type: "CHECKOUT_BATCH", lote, expect: checkoutExpect, runToken: state.cartRunToken }).catch(() => {});
     // Red de seguridad: si el content script no confirma en ~3 min (página de
     // checkout caída o botones distintos), continuar igual y no clavar el flujo.
     armCheckoutTimer();
@@ -915,6 +1009,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true, state: sessionView() });
       break;
     case "CART_PROGRESS":
+      // v2.1.9: el progreso de un lote del pedido anterior no puede pisar el
+      // mensaje del pedido que está cargándose ahora.
+      if (staleRun(msg)) { sendResponse({ ok: true }); break; }
       if (state.status === "loading_cart" || msg.message) {
         state.progress = msg.message || state.progress;
         if (typeof msg.index === "number") {
@@ -930,6 +1027,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       break;
     case "CART_STOP":
+      // v2.1.9: un lote huérfano del pedido ANTERIOR no debe vaciar la sesión
+      // del pedido nuevo (dejaba la carga nueva en idle y sin snapshot).
+      if (staleRun(msg)) { sendResponse({ ok: true }); break; }
       // El lote quedó huérfano (pestaña o sesión cerrada): vuelve al paso de
       // líneas capturadas. La tarea no terminó con confirmación del usuario,
       // así que NO se marca "canceled" y NO se limpia la sesión. La tanda de
@@ -946,6 +1046,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       break;
     case "CART_PAUSE":
+      // v2.1.9: pausar el pedido actual por un corte de red detectado en un
+      // lote del pedido anterior clavaría la tarea nueva en "paused".
+      if (staleRun(msg)) { sendResponse({ ok: true }); break; }
       // v2.0.23: pausa por interrupción (internet). NO limpia nada:
       // conserva line_items, cart y cartResults para que el usuario
       // pueda reanudar desde donde se quedó.
@@ -963,6 +1066,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       break;
     case "CHECKOUT_DONE": {
+      // v2.1.9: si el checkout que termina es del pedido ANTERIOR, marcarlo
+      // como confirmado saltearía el checkout del mismo número de lote en el
+      // pedido nuevo (lotChecks[1]=true) y esas líneas quedarían en el carrito
+      // SIN comprar. Se descarta.
+      if (staleRun(msg)) {
+        try { console.log("[Tokin] CHECKOUT_DONE de un pedido anterior descartado (runToken distinto)"); } catch (e) {}
+        sendResponse({ ok: true });
+        return false;
+      }
       // v2.0.67: el content script terminó el checkout del lote (o falló). Se
       // continúa con el siguiente bloque o se cierra el pedido completo.
       const lote = state.checkoutLote || 1;
@@ -992,7 +1104,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         chrome.storage.local.get(["tokinCartReport"], (d) => {
           const rep = d && d.tokinCartReport;
-          if (rep) {
+          // v2.1.9: no anotar lotes del pedido nuevo en el reporte de otro
+          // pedido (otra cuenta / otro documento).
+          if (rep && (!rep.runToken || String(rep.runToken) === String(state.cartRunToken || ""))) {
             rep.lotChecks = state.lotChecks;
             // v2.0.82: los grupos con su foto del carrito viajan al reporte
             // persistido para que el Excel se arme igual aunque el offscreen
@@ -1052,6 +1166,9 @@ function tryRecoverReport() {
       if (state.status !== "loading_cart" && state.status !== "paused") return;
       var rep = d && d.tokinCartReport;
       if (!rep || !Array.isArray(rep.results) || !rep.results.length) return;
+      // v2.1.9: el reporte de un pedido ANTERIOR (otra cuenta u otro documento)
+      // no puede reactivar la sesión nueva, aunque el batchIdx coincida.
+      if (rep.runToken && String(rep.runToken) !== String(state.cartRunToken || "")) return;
       var api = state.cartApi;
       if (!api || !api.started || !Array.isArray(api.batchIdx)) return;
       var rb = rep.batchIdx || [];
@@ -1088,7 +1205,10 @@ function restoreSession() {
           // el MISMO batchIdx que la sesión restaurada, ese bloque todavía puede
           // tener el checkout sin disparar. En ese caso NO se borra la sesión:
           // tryRecoverReport() reprocesa el CART_DONE perdido (idempotente).
-          var repMatches = !!(rep && Array.isArray(rep.results) && rep.results.length &&
+          // v2.1.9: el reporte de OTRO pedido no cuenta como propio aunque el
+          // batchIdx coincida (ambos pedidos empiezan en 0..18).
+          var repOwned = !!(rep && (!rep.runToken || String(rep.runToken) === String(s.cartRunToken || "")));
+          var repMatches = !!(rep && repOwned && Array.isArray(rep.results) && rep.results.length &&
             Array.isArray(rep.batchIdx) && s.cartApi && Array.isArray(s.cartApi.batchIdx) &&
             rep.batchIdx.length === s.cartApi.batchIdx.length &&
             rep.batchIdx.every(function(x, i) { return Number(x) === Number(s.cartApi.batchIdx[i]); }));
@@ -1108,8 +1228,11 @@ function restoreSession() {
             // con clave numérica de lote (ya confirmada) → checkout salteado.
             state.cartIsManual = !!s.cartIsManual;
             state.manualRun = Number(s.manualRun) || 0;
+            // v2.1.9: misma identidad de sesión para reconocer como propios los
+            // mensajes del lote que estaba en vuelo cuando el offscreen murió.
+            state.cartRunToken = s.cartRunToken || "";
             state.lotChecks = (s && s.lotChecks) || state.lotChecks || {};
-            if (rep && rep.lotChecks) state.lotChecks = Object.assign({}, state.lotChecks, rep.lotChecks);
+            if (rep && repOwned && rep.lotChecks) state.lotChecks = Object.assign({}, state.lotChecks, rep.lotChecks);
             // v2.0.96: recuperar el lote con el checkout en vuelo y volver a armar
             // su temporizador de seguridad. Si no, el offscreen recreado se
             // quedaba esperando un CHECKOUT_DONE que no iba a llegar y el lote no
@@ -1135,6 +1258,7 @@ function restoreSession() {
             state.cart = null;
             state.cartProgress = null;
             state.cartApi = null;
+            state.cartRunToken = "";
           }
           persist();
           emitState();
@@ -1153,6 +1277,7 @@ function restoreSession() {
       state.cartApi = s.cartApi || null;
       state.cartIsManual = !!s.cartIsManual;
       state.manualRun = Number(s.manualRun) || 0;
+      state.cartRunToken = s.cartRunToken || "";
       state.lotChecks = s.lotChecks || {};
       persist();
       emitState();

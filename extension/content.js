@@ -1454,10 +1454,13 @@
     } catch (e) {}
   }
 
-  function tokProgress(message, index, total, ok, batchStart) {
+  function tokProgress(message, index, total, ok, batchStart, runToken) {
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CART_PROGRESS", message: String(message || ""), index, total, ok: !!ok, batchStart: typeof batchStart === "number" ? batchStart : 0 },
+        // v2.1.9: runToken identifica el PEDIDO (sesión de carrito). El
+        // offscreen descarta los mensajes de un pedido anterior (cambio de
+        // cuenta de la tienda sin cerrar el navegador).
+        { target: "offscreen", type: "CART_PROGRESS", message: String(message || ""), index, total, ok: !!ok, batchStart: typeof batchStart === "number" ? batchStart : 0, runToken: runToken ? String(runToken) : "" },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
@@ -1842,6 +1845,10 @@
       started: Date.now(),
       // Nombre del documento ingestado, para el informe de cierre de la tarea.
       docName: String(filename || ""),
+      // v2.1.9: identidad de la sesión de carrito del offscreen (un pedido = un
+      // runToken). Viaja de vuelta en todos los mensajes del lote/checkout para
+      // que el offscreen descarte los de un pedido anterior.
+      runToken: opts.runToken ? String(opts.runToken) : "",
       // Identidad del bloque dentro del pedido (v2.0.60): batchIdx = índices de
       // las líneas en el pedido ORIGINAL (para que el reporte por bloque se
       // pueda alinear aunque el offscreen esté cerrado/recreado), orderTotal =
@@ -3146,7 +3153,9 @@
       ok,
       // v2.0.76: el job sabe su lugar en el pedido completo (batchIdx[0]); sin
       // él el popup no puede titular "Bloque N" — sin esto todo parecía Bloque 1.
-      Array.isArray(job.batchIdx) && job.batchIdx.length ? job.batchIdx[0] : 0
+      Array.isArray(job.batchIdx) && job.batchIdx.length ? job.batchIdx[0] : 0,
+      // v2.1.9: identidad del pedido para que un lote viejo no pise el nuevo.
+      job.runToken
     );
     job.index++;
     job.qIdx = 0;
@@ -3537,6 +3546,8 @@
     const report = {
       savedAt: Date.now(),
       token: job.token,
+      // v2.1.9: identidad del PEDIDO dueño del reporte (ver staleRun).
+      runToken: job.runToken || "",
       done: false,
       docName,
       results,
@@ -3621,6 +3632,8 @@
           target: "offscreen", type: "CART_DONE", ok: true, total: job.total, results, docName,
           sinStock, notFound, notConfirmed, prodAdded: prodAddedReal, totalProducts,
           carrito: fotoCarrito,
+          // v2.1.9: identidad del pedido (el offscreen descarta lotes viejos).
+          runToken: job.runToken || "",
         },
         () => { void chrome.runtime.lastError; }
       );
@@ -3710,7 +3723,8 @@
     tokToastSet("Sin conexión — tarea pausada en línea " + (job.index + 1) + "/" + job.total + ". Se reanuda sola cuando vuelva la señal.", "warn");
     try {
       chrome.runtime.sendMessage(
-        { target: "offscreen", type: "CART_PAUSE" },
+        // v2.1.9: runToken para que el offscreen sepa de qué pedido es la pausa.
+        { target: "offscreen", type: "CART_PAUSE", runToken: (job && job.runToken) || "" },
         () => { void chrome.runtime.lastError; }
       );
     } catch (e) {}
@@ -3765,13 +3779,15 @@
       // "canceled": la tarea no terminó con confirmación del usuario.
       chrome.runtime.sendMessage(
         interrupted
-          ? { target: "offscreen", type: "CART_STOP" }
+          ? { target: "offscreen", type: "CART_STOP", runToken: (job && job.runToken) || "" }
           : {
               target: "offscreen",
               type: "CART_DONE",
               canceled: true,
               total: (job && job.total) || 0,
               results: (job && job.results) || [],
+              // v2.1.9: identidad del pedido (el offscreen descarta lotes viejos).
+              runToken: (job && job.runToken) || "",
             },
         () => { void chrome.runtime.lastError; }
       );
@@ -4000,7 +4016,7 @@
         // lo propagaba como fallo del bloque (status=error) y la cadena de lotes
         // se cortaba tras `volver` (el lote 2 nunca arrancaba). Con `return true`
         // el canal queda abierto hasta el sendResponse real.
-        tokCartStart(msg.items || [], msg.tabId, msg.filename, { batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch })
+        tokCartStart(msg.items || [], msg.tabId, msg.filename, { batchIdx: msg.batchIdx, orderTotal: msg.orderTotal, lastBatch: msg.lastBatch, runToken: msg.runToken })
           .then((out) => sendResponse({ ok: true, ...out }))
           .catch((err) => sendResponse({ ok: false, message: String(err) }));
         return true;
@@ -4038,7 +4054,7 @@
         // «Siguiente» → «Realizar pedido». El flujo es un LOTE ENTERO por el
         // usuario: pulsa «Enviar a carrito» una sola vez y todo el pedido se
         // procesa como compras reales lote a lote.
-        tokCheckoutStart(msg.lote || 1, msg.expect);
+        tokCheckoutStart(msg.lote || 1, msg.expect, msg.runToken);
         sendResponse({ ok: true });
         break;
       case "SHOW_PICKER":
@@ -4140,9 +4156,21 @@
     } catch (e) {}
   }
 
-  async function tokCheckoutDone(ok, note, avisos) {
+  async function tokCheckoutDone(ok, note, avisos, runTokenOverride) {
     tokDiagPush("checkout", { msg: "lote checkout ok=" + ok + (note ? " · " + note : "") });
     tokToastSet(note || "", ok ? "ok" : "err");
+    // v2.1.9: el checkout pertenece a un PEDIDO (runToken). Se lee del estado
+    // del checkout antes de borrarlo; si el paso que falló ya lo había borrado,
+    // el llamador lo pasa explícito. Sin esta identidad, el offscreen de una
+    // cuenta nueva tomaba el CHECKOUT_DONE del pedido viejo como propio y
+    // marcaba el lote como confirmado (compras salteadas en la cuenta nueva).
+    let runToken = runTokenOverride ? String(runTokenOverride) : "";
+    if (!runToken) {
+      try {
+        const stc = await tokStoreGet(CHECKOUT_KEY);
+        runToken = (stc && stc.runToken) || "";
+      } catch (e) {}
+    }
     try {
       chrome.runtime.sendMessage(
         {
@@ -4150,6 +4178,7 @@
           type: "CHECKOUT_DONE",
           ok: !!ok,
           message: note || "",
+          runToken: runToken,
           // v2.0.97: los desajustes detectados por la verificación viajan en el
           // CHECKOUT_DONE para que terminen en el REPORTE FINAL, no en una
           // alerta que frene el pedido.
@@ -4524,8 +4553,32 @@
     // líneas del pedido en una sola fila (mismo producto, misma unidad) o dejar
     // dos filas del mismo producto. Lo que tiene que empatar es la cantidad
     // PEDIDA contra la que muestra el carrito, no fila por fila.
+    // v2.1.9: el match por NOMBRE (sin ARC) es la fuente de los AVISOS falsos:
+    // con dos caramelos parecidos en el carrito («RELLENOS MIEL 675 G» y «MIEL
+    // Y MENTA 335 G») la línea que no se encontraba por código caía en la fila
+    // del OTRO producto y el grupo sumaba 2 contra 1. Medido en la corrida A→B
+    // (lote 2, #22: pedía 1 Bulto y el carrito mostraba 1, el AVISO decía 2).
+    // Regla nueva: si la línea TIENE código ARC y ninguna fila lo muestra, no se
+    // acepta una fila que tenga OTRO código. Sólo se busca por nombre entre las
+    // filas SIN código (la foto no siempre trae el código de todas) o cuando la
+    // foto no trae ningún código. Si no, la línea cuenta como «no aparece».
     const filasDe = (exp) => {
       const code = tokArcCode(String(exp.storeText || ""));
+      const porNombre = (candidatas) => {
+        const un = tokUnitTok(exp.unit);
+        let best = 0;
+        const elegidas = [];
+        for (const c of candidatas) {
+          const t = String(c.name || "");
+          const n = tokNorm(t);
+          const sinNombre = un.length > 0 && n.indexOf("x " + un) === 0;
+          const s = tokSim(String(exp.storeText || exp.producto || ""), t) + (sinNombre ? 0.5 : 0);
+          if (s <= 0) continue;
+          if (s > best) { best = s; elegidas.length = 0; elegidas.push(c); }
+          else if (s === best) elegidas.push(c);
+        }
+        return elegidas;
+      };
       if (code) {
         const porCode = filas.filter((c) => c.code && (c.code === code || c.code.endsWith(code) || code.endsWith(c.code)));
         if (porCode.length) {
@@ -4536,22 +4589,14 @@
           }
           return porCode;
         }
+        // El código no está en la foto: sólo puede empatar una fila cuyo código
+        // no se pudo leer (o la foto sin códigos). Nunca la fila de otro ARC.
+        const sinCodigo = filas.filter((c) => !c.code);
+        return sinCodigo.length ? porNombre(sinCodigo) : [];
       }
-      // Sin ARC: por nombre, como tokCartFindProduct (con el bonus de la fila
-      // sin nombre de producto: "x Bulto (216 Uds)").
-      const un = tokUnitTok(exp.unit);
-      let best = 0;
-      const elegidas = [];
-      for (const c of filas) {
-        const t = String(c.name || "");
-        const n = tokNorm(t);
-        const sinNombre = un.length > 0 && n.indexOf("x " + un) === 0;
-        const s = tokSim(String(exp.storeText || exp.producto || ""), t) + (sinNombre ? 0.5 : 0);
-        if (s <= 0) continue;
-        if (s > best) { best = s; elegidas.length = 0; elegidas.push(c); }
-        else if (s === best) elegidas.push(c);
-      }
-      return elegidas;
+      // Sin ARC en la línea: por nombre, como tokCartFindProduct (con el bonus de
+      // la fila sin nombre de producto: "x Bulto (216 Uds)").
+      return porNombre(filas);
     };
     const qtyDe = (c, exp) => {
       if (c.hasInput) return c.qty;
@@ -4635,13 +4680,17 @@
       return await tokCheckoutStepReal();
     } catch (err) {
       const msg = "el checkout se cortó por un error interno: " + String((err && err.message) || err);
+      // v2.1.9: rescatar el runToken ANTES de borrar el estado, para que el
+      // CHECKOUT_DONE de este pedido no se confunda con el de una sesión nueva.
+      let errRunToken = "";
       try {
         const stErr = await tokStoreGet(CHECKOUT_KEY);
         if (stErr && stErr.step) msg += " (el paso que quedó pendiente era «" + stErr.step + "» en " + location.pathname + ")";
+        errRunToken = (stErr && stErr.runToken) || "";
       } catch (e) {}
       try { tokDiagPush("checkout", { msg: msg }); } catch (e) {}
       try { await tokStoreRemove(CHECKOUT_KEY); } catch (e) {}
-      try { return tokCheckoutDone(false, msg); } catch (e) { return false; }
+      try { return tokCheckoutDone(false, msg, null, errRunToken); } catch (e) { return false; }
     }
   }
 
@@ -4747,7 +4796,7 @@
     // superar los 12 min sin abortarse. Para el resto de los pasos, el límite
     // sigue evitando un checkout colgado para siempre.
     if (st.step !== "confirmar" && Date.now() - started > 12 * 60 * 1000) {
-      await tokCheckoutDone(false, "checkout abandonado: timeout general (12 min) sin avanzar de «" + st.step + "»");
+      await tokCheckoutDone(false, "checkout abandonado: timeout general (12 min) sin avanzar de «" + st.step + "»", null, st.runToken);
       return false;
     }
     try { tokToastSet("Checkout lote " + st.lote + " · paso " + st.step, ""); } catch (e) {}
@@ -4838,27 +4887,19 @@
       // y envío), así que la comparación del paso final no tenía nada que
       // leer y terminaba siempre en "se sigue sin verificar". Esta página sí
       // muestra cada fila con su cantidad (input[data-id=quantity-selector-input]).
-      // v2.0.98 / v2.1.7: Corrección ANTES de avanzar, pero UNA SOLA VEZ por lote.
-      // Si ya fue corregido en este lote, no volver a escribir en los inputs para
-      // evitar re-renders en bucle y habilitaciones repetidas de edición.
-      if (!st._cartCorrected) {
-        try {
-          const rep = await tokCorregirCarrito(st);
-          st._cartCorrected = true;
-          if (rep.avisos && rep.avisos.length) {
-            st._avisosCheckout = (st._avisosCheckout || []).concat(rep.avisos);
-          }
-          await tokStoreSet(CHECKOUT_KEY, st);
-        } catch (err) {
-          try { tokDiagPush("checkout", { msg: "corrección previa al checkout con error (" + String((err && err.message) || err) + "): se sigue con la confirmación" }); } catch (e) {}
-        }
-      }
+      // v2.1.9: DESHABILITADA la reescritura de cantidades (tokCorregirCarrito)
+      // antes del checkout. La carga del carrito ya confirma cada cantidad contra
+      // el servidor (tokCartSetQty espera el debounce + respuesta); reescribir
+      // aquí los números genera re-renders del store que resetean cantidades a 1,
+      // quitan items a cero y hacen caer el total al final del checkout.
+      // tokVerifyPreCheckout (solo lectura) compara contra la foto del carrito /
+      // estado sincronizado con el server, que es la fuente de verdad.
       try {
         const foto = tokCartReadCheckout();
         if (foto.length) {
           st.snapshot = foto;
           await tokStoreSet(CHECKOUT_KEY, st);
-          tokDiagPush("checkout", { msg: "foto de cantidades (post-corrección): " + foto.length + " filas" });
+          tokDiagPush("checkout", { msg: "foto de cantidades (solo lectura, sin reescritura): " + foto.length + " filas" });
         }
       } catch (e) {}
       // Re-buscar «Siguiente» recién antes del click, y esperar a que esté habilitado.
@@ -5012,13 +5053,13 @@
     }
     if (st.step === "volver") {
       if (location.pathname.indexOf("/store") === 0) {
-        return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado");
+        return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado", null, st.runToken);
       }
       try { location.href = location.origin + "/store"; } catch (e) {}
       await toksleep(800);
-      return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado (retorno forzado)");
+      return tokCheckoutDone(true, "lote " + st.lote + " pedido realizado (retorno forzado)", null, st.runToken);
     }
-    await tokCheckoutDone(false, "checkout en paso desconocido: " + st.step);
+    await tokCheckoutDone(false, "checkout en paso desconocido: " + st.step, null, st.runToken);
     return false;
 
     async function tokFail(reason) {
@@ -5086,14 +5127,14 @@
           }
         } catch (e) {}
         tokDiagPush("checkout", { msg: "pedido confirmado (manual) lote " + (st && st.lote) + ": continuando con el bloque siguiente" });
-        return tokCheckoutDone(true, "lote " + (st && st.lote) + " pedido realizado");
+        return tokCheckoutDone(true, "lote " + (st && st.lote) + " pedido realizado", null, (st && st.runToken) || "");
       }
       await toksleep(1500);
       t += 1500;
       // El toast se reescribe cada ~5s para no spamear.
       if (t % 7500 < 1500) await toksleep(0);
     }
-    return tokCheckoutDone(false, "espera manual vencida (24h) para el lote " + (st && st.lote));
+    return tokCheckoutDone(false, "espera manual vencida (24h) para el lote " + (st && st.lote), null, (st && st.runToken) || "");
   }
 
   // Esperar a que la URL actual cumpla el patrón del paso siguiente (el SPA
@@ -5133,7 +5174,7 @@
     return null;
   }
 
-  function tokCheckoutStart(lote, expect) {
+  function tokCheckoutStart(lote, expect, runToken) {
     // v2.0.79: GUARDIA CONTRA CHECKOUT DOBLE. Si ya hay un checkout EN CURSO
     // para este mismo lote (p. ej. porque el offscreen se recreó y re-envió el
     // CHECKOUT_BATCH por el tryRecoverReport), NO se inicia uno nuevo: el
@@ -5156,7 +5197,7 @@
       // carrito (las manda el offscreen con los resultados del bloque). Viaja en
       // el estado del checkout porque cada click navega y destruye este script:
       // al cargar la página siguiente se reanuda con la lista a verificar.
-      tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now(), expect: Array.isArray(expect) ? expect : [] })
+      tokStoreSet(CHECKOUT_KEY, { step: "revisar", lote: lote || 1, started: Date.now(), expect: Array.isArray(expect) ? expect : [], runToken: runToken ? String(runToken) : "" })
         .then((stx) => {
           try {
             if (stx && stx.jobId && state && state.grupos && state.grupos[stx.jobId]) {

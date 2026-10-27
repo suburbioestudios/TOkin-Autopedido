@@ -20,6 +20,15 @@
 //   --parse-only      Solo reconoce el PDF y lista las líneas. No toca el store.
 //   --blocks N        Usa solo los primeros N lotes (19 líneas por lote).
 //   --limit N         Usa solo las primeras N líneas para la selección.
+//                     En --full también acota el pedido a N líneas antes de
+//                     cargar (para "N bloques por sesión" exacto).
+//   --email=x --pass=y          cuenta con la que se entra (def. druettaf).
+//   --sesion2=mail:clave        v2.1.9: modo cambio de cuenta. Corre una sesión
+//                     con --email, cierra la sesión de la TIENDA (no toca el
+//                     storage de la extensión), entra con esta cuenta y repite.
+//   --vuelta          v2.1.9: después de --sesion2, volver a --email y repetir.
+//   --logout          v2.1.9: al cambiar de cuenta, cerrar la sesión del store.
+//   --keep-profile    v2.1.9: no borrar el perfil al arrancar (conserva storage).
 //   --checkout-only   No parsea ni selecciona: solo login + checkout seco del
 //                     carrito que ya esté cargado en la cuenta.
 //   --full            MODO REAL: la extensión hace el flujo COMPLETO (carga el
@@ -49,15 +58,28 @@ const STORE = "https://tokintienda.com.ar/store";
 const LOGIN = STORE + "/login";
 const CART_URL = STORE + "/cart";
 
-const EMAIL = "druettaf@gmail.com";
-const PASS = "Tresd650";
-
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
 const val = (f, d) => {
   const i = argv.indexOf(f);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : d;
 };
+
+// v2.1.9 (diagnóstico de cambio de cuenta): la cuenta de prueba es
+// parametrizable para poder entrar como otra usuaria sin editar el archivo.
+// --email / --pass (o TOKIN_EMAIL / TOKIN_PASS) pisan el default. Aceptan las
+// dos formas: "--email x" y "--email=x".
+const valEq = (name, d) => {
+  const pre = name + "=";
+  const hit = process.argv.find((a) => a.startsWith(pre));
+  return hit ? hit.slice(pre.length) : val(name, d);
+};
+const EMAIL = valEq("--email", process.env.TOKIN_EMAIL || "druettaf@gmail.com");
+const PASS = valEq("--pass", process.env.TOKIN_PASS || "Tresd650");
+
+// Segunda cuenta con la que se cambia de sesión a mitad del diagnóstico
+// (formato "--sesion2=mail:clave"). vacío = corrida normal de una sola cuenta.
+const SESION2 = valEq("--sesion2", "");
 const OPTS = {
   parseOnly: has("--parse-only"),
   checkoutOnly: has("--checkout-only"),
@@ -75,7 +97,27 @@ const OPTS = {
   blocks: Number(val("--blocks", 0)) || 0,
   pdf: val("--pdf", PDF),
   profile: val("--profile", path.join(os.tmpdir(), "tokin-dry-profile")),
+  // v2.1.9 (diagnóstico): conservar el perfil y NO borrarlo entre corridas.
+  keepProfile: has("--keep-profile"),
+  // v2.1.9 (diagnóstico): cerrar la sesión del store antes de loguear (cambiar
+  // de usuaria sin cerrar el navegador, como hace el cliente en la tienda).
+  logout: has("--logout"),
+  // v2.1.9 (diagnóstico): después de la 2ª cuenta, volver a la 1ª y repetir.
+  vuelta: has("--vuelta"),
 };
+
+// v2.1.9 (diagnóstico de cambio de cuenta): secuencia de sesiones a correr en
+// EL MISMO navegador (mismo offscreen, mismo chrome.storage). Así se reproduce
+// lo que hace el cliente: entrar con una cuenta, cargar, cambiar de cuenta en
+// la tienda y volver a cargar con la herramienta.
+const CUENTAS = [];
+if (SESION2) {
+  const i = SESION2.lastIndexOf(":");
+  CUENTAS.push({ email: EMAIL, pass: PASS });
+  CUENTAS.push({ email: SESION2.slice(0, i), pass: SESION2.slice(i + 1) });
+  if (OPTS.vuelta) CUENTAS.push({ email: EMAIL, pass: PASS });
+}
+const MULTI = CUENTAS.length > 1;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log("[dry]", ...a);
@@ -123,12 +165,27 @@ function scriptFor(fn) {
 }
 
 // ---------------------------------------------------------------- login
-async function login(page) {
-  log("login:", EMAIL);
-  await page.goto(STORE, { waitUntil: "domcontentloaded", timeout: 90000 });
+async function login(page, email = EMAIL, pass = PASS) {
+  log("login:", email);
+  // v2.1.9 (diagnóstico de cambio de cuenta): el atajo «ya hay sesión» miraba
+  // el TEXTO de la home y daba falso positivo con la tienda deslogueada (la
+  // página contiene «usuario»/«mi cuenta» también sin sesión). Consecuencia
+  // medida en la corrida A→B→A: la sesión 2 no logueó, la tienda mandó cada
+  // búsqueda a /store/pre-home-ingreso y las 19 líneas del lote se abandonaron
+  // («tope de búsquedas alcanzado»), con la sensación de que la extensión se
+  // había roto. Ahora la única prueba de sesión válida es la URL /store/home,
+  // que es a donde la tienda manda después de loguear (y a donde NO manda si
+  // estás deslogueado: te deja en /store o en /pre-home-ingreso).
+  const enHome = () => /\/store\/home(\/|[?#]|$)/i.test(page.url());
+  const enLogin = () => /\/login|\/pre-home-ingreso/i.test(page.url());
+  await page.goto(STORE, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {});
   await sleep(5000);
+  if (enHome()) {
+    log("login: la tienda ya tiene sesión abierta ->", page.url());
+    return;
+  }
   if (!(await page.locator("input[type=password]").count())) {
-    await page.goto(LOGIN, { waitUntil: "domcontentloaded", timeout: 90000 });
+    await page.goto(LOGIN, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {});
     await sleep(4000);
   }
   const passMode = page.locator('button:has-text("mail y contraseña"), [data-id=login-with-password]');
@@ -136,10 +193,30 @@ async function login(page) {
     await passMode.first().click().catch(() => {});
     await sleep(3000);
   }
-  const emailIn = page.locator("input[type=email], input[name*=email i], input[placeholder*=mail i]").first();
+  // v2.1.9 (diagnóstico): la tienda a veces sirve /store/login sin hidratar el
+  // formulario (o redirige a /home a mitad de carga). Antes se miraba UNA vez y
+  // la corrida moría con "No encontré el campo de email". Ahora se espera y se
+  // recarga el login un par de veces.
+  let emailIn = page.locator("input[type=email], input[name*=email i], input[placeholder*=mail i]").first();
+  for (let t = 0; t < 30 && !(await emailIn.count()); t++) {
+    await sleep(1000);
+    // Si la tienda redirige al home es que la sesión ya estaba abierta y no hay
+    // formulario que llenar.
+    if (enHome()) {
+      log("login: la tienda ya tiene sesión abierta ->", page.url());
+      return;
+    }
+    if (t === 8 || t === 18) {
+      await page.goto(LOGIN, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+      await sleep(3000);
+      const pm = page.locator('button:has-text("mail y contraseña"), [data-id=login-with-password]');
+      if (await pm.count()) { await pm.first().click().catch(() => {}); await sleep(2000); }
+      emailIn = page.locator("input[type=email], input[name*=email i], input[placeholder*=mail i]").first();
+    }
+  }
   if (!(await emailIn.count())) throw new Error("No encontré el campo de email del login.");
   await emailIn.fill("");
-  await emailIn.type(EMAIL, { delay: 40 });
+  await emailIn.type(email, { delay: 40 });
   await sleep(400);
   const emailNext = page.locator("[data-id=email-next-buton]").first();
   for (let t = 0; t < 40; t++) {
@@ -150,9 +227,32 @@ async function login(page) {
   await sleep(3000);
 
   const passIn = page.locator("input[type=password]").first();
+  // v2.1.9 (diagnóstico): la tienda a veces tarda en mostrar el paso de
+  // contraseña (5-30 s). Antes se miraba UNA sola vez a los 3 s y la corrida
+  // moría con "No apareció el campo de contraseña". Ahora se espera y, si el
+  // paso de email quedó a medio hidratar, se reintenta ese paso.
+  for (let t = 0; t < 40; t++) {
+    if (await passIn.count()) break;
+    await sleep(1000);
+    if (t === 6 || t === 14 || t === 24) {
+      const em = page.locator("input[type=email], input[name*=email i], input[placeholder*=mail i]").first();
+      if (await em.count()) {
+        const cur = await em.inputValue().catch(() => "");
+        if (!String(cur || "").trim()) await em.type(email, { delay: 40 }).catch(() => {});
+        const nx = page.locator("[data-id=email-next-buton]").first();
+        if (await nx.count()) {
+          for (let k = 0; k < 20; k++) {
+            if (!(await nx.isDisabled().catch(() => true))) break;
+            await sleep(400);
+          }
+          await nx.click({ timeout: 8000 }).catch(() => {});
+        }
+      }
+    }
+  }
   if (!(await passIn.count())) throw new Error("No apareció el campo de contraseña.");
   await passIn.fill("");
-  await passIn.type(PASS, { delay: 40 });
+  await passIn.type(pass, { delay: 40 });
   await sleep(400);
   const submit = page.locator("[data-id=password-next-button]").first();
   if (await submit.count()) {
@@ -166,8 +266,11 @@ async function login(page) {
   }
   await sleep(7000);
 
-  const logged = async () =>
-    page.evaluate(() => /salir|cerrar sesion|mi cuenta|mis pedidos|usuario/i.test(document.body.innerText || ""));
+  // v2.1.9: la confirmación del login también miraba sólo el texto libre y
+  // daba por buena una sesión que no existía. La tienda manda a /store/home
+  // cuando el login salió bien; si quedó en /login o en /pre-home-ingreso (o en
+  // /store pelado) NO hay sesión, por más que el texto diga «mi cuenta».
+  const logged = async () => !enLogin() && enHome();
   let okNow = await logged();
   // v2.0.96: hasta 4 intentos. Con muchas corridas seguidas la tienda tarda o
   // rechaza el login unos segundos; un solo reintento dejaba tirada la corrida
@@ -178,7 +281,7 @@ async function login(page) {
     const pass = page.locator("input[type=password]");
     if (await pass.count()) {
       await pass.first().fill("");
-      await pass.first().type(PASS, { delay: 60 });
+      await pass.first().type(pass, { delay: 60 });
       const again = page.locator("[data-id=password-next-button]").first();
       if (await again.count()) {
         for (let t = 0; t < 40; t++) {
@@ -198,7 +301,7 @@ async function login(page) {
       const em = page.locator("input[type=email], input[name*=email i], input[placeholder*=mail i]").first();
       if (await em.count()) {
         await em.fill("");
-        await em.type(EMAIL, { delay: 60 });
+        await em.type(email, { delay: 60 });
         const nx = page.locator("[data-id=email-next-buton]").first();
         if (await nx.count()) {
           for (let t = 0; t < 40; t++) {
@@ -211,7 +314,7 @@ async function login(page) {
         const pw = page.locator("input[type=password]").first();
         if (await pw.count()) {
           await pw.fill("");
-          await pw.type(PASS, { delay: 60 });
+          await pw.type(pass, { delay: 60 });
           const sub = page.locator("[data-id=password-next-button]").first();
           if (await sub.count()) {
             for (let t = 0; t < 40; t++) {
@@ -228,6 +331,28 @@ async function login(page) {
   }
   if (!okNow) throw new Error("No se pudo iniciar sesión con la cuenta de prueba en 4 intentos; la corrida no sirve.");
   log("login OK ->", page.url());
+}
+
+// v2.1.9 (diagnóstico de cambio de cuenta): cierra la sesión del store SIN
+// tocar el storage de la extensión. Reproduce lo que hace el cliente: la
+// tienda cambia de usuaria pero el estado de la extensión (job, carrito,
+// lotes confirmados) sigue siendo el de la sesión anterior.
+async function cerrarSesion(page, context) {
+  log("cerrando la sesión del store (para entrar con otra cuenta)…");
+  await context.clearCookies().catch(() => {});
+  // La JWT/sesión también puede vivir en el storage del sitio: borrarlo.
+  await page.goto(STORE, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {});
+  await sleep(1200);
+  await page
+    .evaluate(() => {
+      try { localStorage.clear(); } catch (e) {}
+      try { sessionStorage.clear(); } catch (e) {}
+      try { window.__TOKIN_DRY_BLOCKED__ = 0; } catch (e) {}
+    })
+    .catch(() => {});
+  await context.clearCookies().catch(() => {});
+  await sleep(1500);
+  log("sesión del store cerrada (el storage de la extensión NO se toca).");
 }
 
 // ---------------------------------------------------------------- parseo
@@ -553,7 +678,30 @@ async function clearStoreCart(page, log) {
   log("vaciando el carrito del store…");
   // v2.0.96: el store NO tiene botón de "vaciar carrito": hay que quitar cada
   // fila con su botón Eliminar. Se repite hasta que no quede ninguna.
-  await page.goto(STORE + "/checkout/cart", { waitUntil: "domcontentloaded", timeout: 90000 });
+  // v2.1.9 (diagnóstico): la tienda a veces cuelga el DOMContentLoaded de
+  // /store/checkout/cart (timeout de 90 s) y la corrida entera se caía antes de
+  // empezar. Se reintenta con timeout más corto y, como último recurso, con
+  // waitUntil "commit" (la SPA termina de pintar sola).
+  let navOk = false;
+  for (let intento = 1; intento <= 2 && !navOk; intento++) {
+    try {
+      await page.goto(STORE + "/checkout/cart", { waitUntil: "domcontentloaded", timeout: 45000 });
+      navOk = true;
+    } catch (e) {
+      log("carrito: la página no respondió (intento " + intento + "/2): " + String((e && e.message) || e).slice(0, 90));
+      await sleep(3000);
+    }
+  }
+  if (!navOk) {
+    try {
+      await page.goto(STORE + "/checkout/cart", { waitUntil: "commit", timeout: 45000 });
+      await page.waitForSelector('[data-id="minicart-remove-button"]', { timeout: 25000 }).catch(() => {});
+      navOk = true;
+      log("carrito: abierto con waitUntil=commit.");
+    } catch (e) {
+      log("carrito: no se pudo abrir la página; revisar a mano el carrito de esta cuenta.");
+    }
+  }
   await sleep(6000);
   for (let round = 1; round <= 60; round++) {
     const rm = page.locator('[data-id="minicart-remove-button"]');
@@ -622,6 +770,25 @@ async function fullFlowRun(page, context, extId, opts) {
   }
   log("parse OK:", (state.line_items || []).length, "líneas. Tocando «Enviar a carrito»…");
 
+  // v2.1.9 (diagnóstico): acotar el pedido a N líneas ANTES de cargar, para que
+  // "2 bloques por sesión" sea exacto (19 líneas por bloque) y la corrida no
+  // siga hasta el final del pedido. Se usa el mismo canal que el popup
+  // (UPDATE_LINE_ITEMS) para no inventar una vía distinta a la real.
+  if (opts.limit && Array.isArray(state.line_items) && state.line_items.length > opts.limit) {
+    const keep = state.line_items.slice(0, opts.limit);
+    await popup
+      .evaluate(
+        (items) =>
+          new Promise((res) => {
+            chrome.runtime.sendMessage({ target: "offscreen", type: "UPDATE_LINE_ITEMS", items }, (r) => res(r || {}));
+          }),
+        keep
+      )
+      .catch(() => null);
+    await sleep(1500);
+    log("--limit " + opts.limit + ": pedido acotado a " + keep.length + " líneas (≈" + Math.ceil(keep.length / 19) + " bloques).");
+  }
+
   // El botón real del popup (según la extensión): el que dispara la carga.
   const startBtn = popup.locator('#btn-cart, [data-id="btn-cart"], button:has-text("Enviar al carrito")').first();
   if (!(await startBtn.count())) throw new Error("no encontré el botón de envío del popup");
@@ -686,7 +853,10 @@ async function fullFlowRun(page, context, extId, opts) {
       for (let i = ultimoDiag; i < dia.length; i++) {
         const m = dia[i];
         const txt = typeof m === "string" ? m : String((m && (m.msg || m.text)) || "");
-        if (txt) console.log("   [diag] " + txt.slice(0, 170));
+        // v2.1.9 (diagnóstico): el AVISO de cantidades salía cortado a 170
+        // caracteres y no se veía QUÉ líneas se agrupaban en cada grupo. Con
+        // 1200 entra el aviso completo (varias líneas) para poder auditarlo.
+        if (txt) console.log("   [diag] " + txt.slice(0, 1200));
       }
       if (dia.length < ultimoDiag) ultimoDiag = 0;
       ultimoDiag = dia.length;
@@ -735,7 +905,11 @@ async function fullFlowRun(page, context, extId, opts) {
 // ---------------------------------------------------------------- main
 (async () => {
   requirePdf();
-  try { fs.rmSync(OPTS.profile, { recursive: true, force: true }); } catch (e) {}
+// v2.1.9 (diagnóstico): con --keep-profile NO se borra el perfil, así el
+// chrome.storage de la extensión sobrevive entre corridas/sesiones.
+  if (!OPTS.keepProfile) {
+    try { fs.rmSync(OPTS.profile, { recursive: true, force: true }); } catch (e) {}
+  }
 
   log("Chrome + extensión desde:", EXT);
   const context = await chromium.launchPersistentContext(OPTS.profile, {
@@ -765,7 +939,7 @@ async function fullFlowRun(page, context, extId, opts) {
 
   let report = { generatedAt: new Date().toISOString(), items: 0, results: [], summary: null, checkout: null };
   try {
-    await login(page);
+    if (!MULTI) await login(page);
     if (!OPTS.parseOnly && !OPTS.vaciar && !OPTS.leerCarrito) {
       // v2.0.96: el guard se instala para TODOS los modos que pueden llegar al
       // checkout (--full y también la carga completa por bloques). Al mandar
@@ -797,9 +971,44 @@ async function fullFlowRun(page, context, extId, opts) {
         const t = m.text();
         if (t.includes("[Tokin]")) console.log("   [ext]", t.slice(0, 180));
       });
-      report.full = await fullFlowRun(page, context, extId, OPTS);
-      const c = await page.evaluate(() => window.__TOKIN_DRY_BLOCKED__ || 0).catch(() => 0);
-      log("clicks sobre «Realizar pedido» bloqueados por el guard:", c, "(0 = no se intentó confirmar).");
+      if (MULTI) {
+        // v2.1.9 (diagnóstico): N sesiones en el MISMO navegador. Entre una y
+        // otra sólo se cierra la sesión de la TIENDA (cookies + storage del
+        // sitio): el storage de la extensión queda intacto, igual que en el
+        // uso real cuando alguien cambia de cuenta.
+        report.sesiones = [];
+        for (let i = 0; i < CUENTAS.length; i++) {
+          const c = CUENTAS[i];
+          // v2.1.9: también en la 1ª sesión, para que el perfil conservado no
+          // arranque logueado con la cuenta de la corrida anterior.
+          if (OPTS.logout) await cerrarSesion(page, context);
+          await login(page, c.email, c.pass);
+          await page.addInitScript(scriptFor(DRY_GUARD));
+          await page.evaluate(scriptFor(DRY_GUARD)).catch(() => {});
+          await page.evaluate(() => { try { window.__TOKIN_DRY_BLOCKED__ = 0; } catch (e) {} }).catch(() => {});
+          log("");
+          log("════════ SESIÓN " + (i + 1) + "/" + CUENTAS.length + " · cuenta " + c.email + " ════════");
+          const r = await fullFlowRun(page, context, extId, OPTS);
+          const cB = await page.evaluate(() => window.__TOKIN_DRY_BLOCKED__ || 0).catch(() => 0);
+          const st = (r && r.state) || null;
+          report.sesiones.push({
+            cuenta: c.email,
+            guardBloqueos: cB,
+            estado: st ? { status: st.status, progress: st.progress } : null,
+            lotChecks: st ? st.lotChecks : null,
+            nextOrig: st && st.cartApi ? st.cartApi.nextOrig : null,
+            orderTotal: st && st.cartApi ? st.cartApi.orderTotal : null,
+          });
+          log("sesión " + (i + 1) + " (" + c.email + "): guard=" + cB + " · estado=" + (st && st.status) +
+            " · nextOrig=" + (st && st.cartApi ? st.cartApi.nextOrig : "?") +
+            "/" + (st && st.cartApi ? st.cartApi.orderTotal : "?") +
+            " · lotChecks=" + JSON.stringify(st && st.lotChecks));
+        }
+      } else {
+        report.full = await fullFlowRun(page, context, extId, OPTS);
+        const c = await page.evaluate(() => window.__TOKIN_DRY_BLOCKED__ || 0).catch(() => 0);
+        log("clicks sobre «Realizar pedido» bloqueados por el guard:", c, "(0 = no se intentó confirmar).");
+      }
     } else if (OPTS.checkoutOnly) {
       report.checkout = await dryCheckout(page);
     } else {
