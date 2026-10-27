@@ -98,9 +98,10 @@ tienda y convenciones: ver `AGENTS.md`. Este archivo es solo la **bitácora**.
   Web Page Blocked / Attack ID 20000051` del WAF con Playwright headless). No se
   puede re-validar hasta que vuelva; los probes `tools/_store_anon_probe.mjs` y
   `tools/_waf_probe.mjs` quedan para chequearlo.
-- **Estado:** los tres cambios (content.js, dry_run.mjs, MEMORY) **sin commit**;
-  `extension/manifest.json` sigue en `2.1.8`. `node --check` OK en
-  `extension/content.js` y `tools/dry_run.mjs`.
+- **Estado:** v2.1.9 **commiteado y pusheado** (`c250923`, `main -> origin/main`);
+  `extension/manifest.json` en `2.1.9`. Los cambios (content.js, dry_run.mjs,
+  MEMORY.md, offscreen.js, background.js, popup.js) ya están en el repositorio.
+  `node --check` OK en todos los archivos de extensión y en `tools/dry_run.mjs`.
 
 ### 2026-10-26 — v2.1.9: segunda cuenta de la tienda no cargaba nada (sesión de carrito vieja)
 
@@ -180,8 +181,7 @@ tienda y convenciones: ver `AGENTS.md`. Este archivo es solo la **bitácora**.
   antes de la 1ª sesión**, para no arrancar con la cuenta de la corrida anterior.
 - **Archivos:** `extension/offscreen/offscreen.js`, `extension/background.js`,
   `extension/content.js`, `extension/popup/popup.js`, `tools/dry_run.mjs`.
-  `extension/manifest.json` **sigue en 2.1.8** (no se bumpea hasta que el
-  usuario lo pida).
+  `extension/manifest.json` en `2.1.9` (bumpeado con la tanda v2.1.9).
 
 ### 2026-10-22 — v2.1.8: arreglo del corte de la cadena de lotes (message channel closed)
 
@@ -233,13 +233,10 @@ tienda y convenciones: ver `AGENTS.md`. Este archivo es solo la **bitácora**.
 
 ## Próximo paso / pendientes
 
-- **v2.1.9 (cambio de cuenta):** validación final A→B→A con el retry en curso
-  (`diag_sesiones_retry.log`, perfil `tokin-sesion-3x-retry`). Tiene que dar las
-  3 sesiones `done` con `lotChecks={"1":true,"2":true}` y 2 checkouts cada una.
+- **v2.1.9 (cambio de cuenta):** validación final A→B→A en ejecución con el
+  código nuevo (`diag_sesiones_retry_v3.log`, perfil `tokin-sesion-3x-retry-v3`).
+  Tiene que dar las 3 sesiones `done` con `lotChecks={"1":true,"2":true}` y
+  2 checkouts cada una. Sin `tokCorregirCarrito` antes del checkout ya no debe
+  haber líneas que vayan a cero ni caída del total.
 - Vaciar los carritos de prueba por cuenta con `--vaciar` (el de serhiy quedó con
   ~28 líneas y el de druettaf con ~25 tras las corridas de 3 sesiones).
-- Commitear/pushear la tanda cuando el usuario lo pida (incluye `MEMORY.md`);
-  decidir ahí si el manifest pasa a 2.1.9.
-- Repasar si quedan otros puntos de mensajería offscreen↔sw↔content con
-  `sendResponse` diferido sin `return true` (auditoría rápida ya hecha: no había
-  más en el listener del content).
